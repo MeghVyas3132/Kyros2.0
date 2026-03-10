@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-main: #e2e8f0;
+  --bg-surface: #f8fafc;
+  --bg-panel: #ffffff;
+  --fg-primary: #0f172a;
+  --fg-secondary: #334155;
+  --border-muted: #cbd5e1;
+}
+
+body {
+  background:
+    radial-gradient(circle at 0% -10%, #cbd5e1 0%, transparent 35%),
+    radial-gradient(circle at 100% 0%, #e2e8f0 0%, transparent 30%),
+    linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+  color: var(--fg-primary);
+}
+
+::selection {
+  background: #cbd5e1;
+  color: #020617;
+}

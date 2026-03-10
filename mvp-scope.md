@@ -1553,7 +1553,7 @@ Layout:
 │                           │                                 │
 │  ALLOCATION TABLE         │   EXPLAINABILITY PANEL          │
 │                           │                                 │
-│  Store | Rec | Final | ✓  │  (shows when row is selected)  │
+│  Store | Rec | Final | Sel │  (shows when row is selected)  │
 │  ─────────────────────    │                                 │
 │  HSR   |  18 |  [18] | □  │  Store: HSR Layout (Grade A)   │
 │  Korm  |  14 |  [14] | □  │  Attribute ROS: 2.8/day        │
@@ -1561,7 +1561,7 @@ Layout:
 │  ...                      │  Current cover: 1.4 weeks      │
 │                           │  Capacity available: 6 styles  │
 │  [Scenario: 18 ▲▼]       │                                 │
-│  Cover: 6.4 weeks ✓       │  Confidence: HIGH (847 obs)    │
+│  Cover: 6.4 weeks OK      │  Confidence: HIGH (847 obs)    │
 │  Sellthrough: ~82%        │                                 │
 └───────────────────────────┴─────────────────────────────────┘
 ```

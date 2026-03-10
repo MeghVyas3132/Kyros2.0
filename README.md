@@ -119,15 +119,15 @@ US-based, cloud-native, well-marketed. But:
 
 | Capability | Increff | Toolio | **Kyros** |
 |---|---|---|---|
-| End-to-end merchandising loop | ✅ | Partial | ✅ |
-| Open REST API | ❌ | ❌ | ✅ |
-| Lost sales correction in forecasting | ❌ | ❌ | ✅ |
-| Transparent self-serve pricing | ❌ | ❌ | ✅ |
-| Planogram-aware allocation | Partial | ❌ | ✅ |
-| Workflow enforcement (not optional) | ❌ | ❌ | ✅ |
-| Season-to-season learning loop | Partial | ❌ | ✅ |
-| Multi-country support | Limited | ❌ | ✅ |
-| Self-serve onboarding | ❌ | ❌ | ✅ |
+| End-to-end merchandising loop | Yes | Partial | Yes |
+| Open REST API | No | No | Yes |
+| Lost sales correction in forecasting | No | No | Yes |
+| Transparent self-serve pricing | No | No | Yes |
+| Planogram-aware allocation | Partial | No | Yes |
+| Workflow enforcement (not optional) | No | No | Yes |
+| Season-to-season learning loop | Partial | No | Yes |
+| Multi-country support | Limited | No | Yes |
+| Self-serve onboarding | No | No | Yes |
 
 ---
 
@@ -240,7 +240,7 @@ No competitor closes this loop architecturally. Increff surfaces post-season rep
 
 ## 7. Core Capabilities
 
-### Phase 1 — Foundation ✅ Complete
+### Phase 1 — Foundation Complete
 
 The operational backbone. Authentication, season lifecycle management, organizational structure (clusters, locations), data ingestion via CSV, and a baseline analytics dashboard.
 
@@ -882,7 +882,7 @@ Events: `season.*`, `po.*`, `grn.*`, `allocation.*`, `transfer.*`, `markdown.*`,
 
 ## 15. Roadmap
 
-### Phase 1 — Foundation ✅ Complete (10 weeks)
+### Phase 1 — Foundation Complete (10 weeks)
 Authentication, season lifecycle, cluster/location management, CSV data ingestion, PO/GRN tracking, analytics dashboard.
 
 ### Phase 2 — OTB and Range Planning (8–10 weeks)
