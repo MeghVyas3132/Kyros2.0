@@ -35,6 +35,11 @@ def classify_style_status(
     return "HEALTHY"
 
 
+def _chunked(rows: list[dict], size: int = 1000):
+    for idx in range(0, len(rows), size):
+        yield rows[idx : idx + size]
+
+
 async def build_performance_snapshots(brand_id: UUID, snapshot_date: date, db: AsyncSession) -> int:
     season = await db.scalar(
         select(Season)
@@ -97,23 +102,24 @@ async def build_performance_snapshots(brand_id: UUID, snapshot_date: date, db: A
         )
 
     if rows:
-        stmt = insert(PerformanceSnapshot).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            constraint="uq_perf_snapshot_brand_date_store_sku",
-            set_={
-                "units_sold_today": stmt.excluded.units_sold_today,
-                "units_sold_7d": stmt.excluded.units_sold_7d,
-                "units_sold_28d": stmt.excluded.units_sold_28d,
-                "units_on_hand": stmt.excluded.units_on_hand,
-                "sell_through_pct": stmt.excluded.sell_through_pct,
-                "ros_7d": stmt.excluded.ros_7d,
-                "stock_cover_days": stmt.excluded.stock_cover_days,
-                "days_since_grn": stmt.excluded.days_since_grn,
-                "style_status": stmt.excluded.style_status,
-                "is_stockout": stmt.excluded.is_stockout,
-                "lost_sales_estimate": stmt.excluded.lost_sales_estimate,
-            },
-        )
-        await db.execute(stmt)
+        for batch in _chunked(rows):
+            stmt = insert(PerformanceSnapshot).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_perf_snapshot_brand_date_store_sku",
+                set_={
+                    "units_sold_today": stmt.excluded.units_sold_today,
+                    "units_sold_7d": stmt.excluded.units_sold_7d,
+                    "units_sold_28d": stmt.excluded.units_sold_28d,
+                    "units_on_hand": stmt.excluded.units_on_hand,
+                    "sell_through_pct": stmt.excluded.sell_through_pct,
+                    "ros_7d": stmt.excluded.ros_7d,
+                    "stock_cover_days": stmt.excluded.stock_cover_days,
+                    "days_since_grn": stmt.excluded.days_since_grn,
+                    "style_status": stmt.excluded.style_status,
+                    "is_stockout": stmt.excluded.is_stockout,
+                    "lost_sales_estimate": stmt.excluded.lost_sales_estimate,
+                },
+            )
+            await db.execute(stmt)
 
     return len(rows)

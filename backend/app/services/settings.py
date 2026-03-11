@@ -21,7 +21,7 @@ def deep_merge(base: dict, patch: dict) -> dict:
 async def get_or_create_brand_settings(db: AsyncSession, brand_id: UUID) -> BrandSettings:
     settings = await db.scalar(select(BrandSettings).where(BrandSettings.brand_id == brand_id))
     if settings is None:
-        settings = BrandSettings(brand_id=brand_id, config={})
+        settings = BrandSettings(brand_id=brand_id, config={"simple_mode": True})
         db.add(settings)
         await db.flush()
     return settings

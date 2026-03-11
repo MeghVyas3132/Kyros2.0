@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
 
 import { PageHeader } from "@/components/shared/PageHeader";
+import { SetupTabs } from "@/components/shared/SetupTabs";
 import { Button } from "@/components/ui/Button";
 import { apiRequest } from "@/lib/api";
 
@@ -162,6 +163,7 @@ export default function SetupOnboardingPage() {
         title="Setup · Onboarding Configuration"
         subtitle="Persist mappings and allocation configuration per brand"
       />
+      <SetupTabs />
 
       {message ? (
         <div className="rounded-md border border-slate-300 bg-slate-50 px-3 py-2 text-sm text-slate-700">

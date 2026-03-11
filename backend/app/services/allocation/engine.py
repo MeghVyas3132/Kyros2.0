@@ -28,6 +28,10 @@ from app.models import (
     StyleStoreList,
 )
 from app.utils.date_utils import utcnow
+from app.services.allocation.size_curve import (
+    calculate_size_distribution,
+    load_historical_size_ratios,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +159,24 @@ class AllocationEngine:
             constrained = await self.apply_constraints(sized, available_units, grn_line, db)
 
             for store_id, qty in constrained.items():
+                store_grade = scores[store_id].store_grade
+                size_split = await calculate_size_distribution(
+                    brand_id=brand_id,
+                    product_category=sku.category,
+                    store_id=store_id,
+                    store_grade=store_grade,
+                    total_units=qty,
+                    db=db,
+                )
+                size_distribution_source = None
+                if size_split:
+                    historical = await load_historical_size_ratios(
+                        brand_id=brand_id,
+                        product_category=sku.category,
+                        store_id=store_id,
+                        db=db,
+                    )
+                    size_distribution_source = "historical" if historical else "size_guide"
                 reasoning = await self.generate_reasoning(
                     store_id=store_id,
                     sku=sku,
@@ -167,6 +189,17 @@ class AllocationEngine:
                     score_data=scores[store_id],
                     brand_settings=brand_settings,
                 )
+                projections = {
+                    "weeks_cover": reasoning["weeks_cover_at_recommended"],
+                    "projected_sellthrough": min(
+                        1.0,
+                        reasoning["weeks_cover_at_recommended"]
+                        / max(reasoning["season_weeks_remaining"], 1),
+                    ),
+                }
+                if size_split:
+                    projections["size_split"] = size_split
+                    projections["size_distribution_source"] = size_distribution_source
                 allocation_lines.append(
                     AllocationLine(
                         session_id=session.id,
@@ -176,14 +209,7 @@ class AllocationEngine:
                         ai_recommended_qty=qty,
                         ai_confidence=confidence,
                         ai_reasoning=reasoning,
-                        ai_projections={
-                            "weeks_cover": reasoning["weeks_cover_at_recommended"],
-                            "projected_sellthrough": min(
-                                1.0,
-                                reasoning["weeks_cover_at_recommended"]
-                                / max(reasoning["season_weeks_remaining"], 1),
-                            ),
-                        },
+                        ai_projections=projections,
                     )
                 )
                 total_units += qty

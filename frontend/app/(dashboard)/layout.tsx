@@ -3,15 +3,19 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
+import useSWR from "swr";
 
 import { useAlertCount } from "@/lib/hooks/useAlerts";
+import { apiRequest } from "@/lib/api";
 
-const NAV_ITEMS = [
+const CORE_NAV_ITEMS = [
   { href: "/dashboard", label: "Dashboard" },
   { href: "/grn", label: "GRN" },
   { href: "/performance/styles", label: "Performance Styles" },
   { href: "/performance/stores", label: "Performance Stores" },
   { href: "/ingestion", label: "Upload Hub" },
+];
+const ADMIN_NAV_ITEMS = [
   { href: "/setup/onboarding", label: "Onboarding" },
   { href: "/setup/stores", label: "Setup" },
 ];
@@ -20,6 +24,12 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   const router = useRouter();
   const pathname = usePathname();
   const { data: alertCount } = useAlertCount();
+  const { data: onboarding } = useSWR<{ config?: Record<string, unknown> }>(
+    "/api/v1/onboarding/settings",
+    (path: string) => apiRequest<{ config?: Record<string, unknown> }>(path)
+  );
+  const simpleMode = (onboarding?.config as Record<string, unknown> | undefined)?.simple_mode ?? true;
+  const navItems = simpleMode ? CORE_NAV_ITEMS : [...CORE_NAV_ITEMS, ...ADMIN_NAV_ITEMS];
 
   useEffect(() => {
     const token = localStorage.getItem("kyros_access_token");
@@ -35,7 +45,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             <p className="text-sm font-semibold uppercase tracking-[0.2em] text-slate-300">Kyros</p>
           </div>
           <nav className="flex items-center gap-1 text-sm">
-            {NAV_ITEMS.map((item) => (
+            {navItems.map((item) => (
               <Link
                 key={item.href}
                 href={item.href}

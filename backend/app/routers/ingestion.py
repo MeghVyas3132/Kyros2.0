@@ -28,7 +28,7 @@ from app.services.ingestion.understanding import (
     suggest_mapping_with_confidence,
 )
 from app.services.settings import get_brand_config, patch_brand_config
-from app.tasks.uploads import process_upload_task
+from app.tasks.uploads import process_upload_with_fallback
 from app.utils.csv_parser import dataframe_to_csv_bytes, dataframes_from_upload
 from app.utils.s3 import save_upload_file
 
@@ -124,7 +124,7 @@ async def upload_csv(
     db.add(row)
     await db.commit()
     await db.refresh(row)
-    process_upload_task.delay(str(row.id))
+    await process_upload_with_fallback(str(row.id), str(current_user.brand_id))
     return envelope({"upload_id": str(row.id), "status": "PENDING"})
 
 
@@ -339,7 +339,7 @@ async def smart_upload(
     queued: list[dict[str, str]] = []
     for row in created_rows:
         await db.refresh(row)
-        process_upload_task.delay(str(row.id))
+        await process_upload_with_fallback(str(row.id), str(current_user.brand_id))
         queued.append(
             {
                 "upload_id": str(row.id),

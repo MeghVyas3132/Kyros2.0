@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date
+from datetime import date, timedelta
 import hashlib
 from pathlib import Path
 import re
@@ -17,8 +17,11 @@ from app.models import (
     BuyPlanFile,
     BuyPlanLine,
     BrandSettings,
+    Season,
+    SeasonStatus,
     GRN,
     GRNLine,
+    GRNLineReservation,
     InventoryReservationType,
     InventoryState,
     SKU,
@@ -32,6 +35,10 @@ from app.models import (
 from app.config import get_settings
 from app.services.ingestion.normalizer import normalize
 from app.services.ingestion.validator import RowError, UploadValidator
+from app.services.settings import get_brand_config
+from app.services.inventory.snapshot import build_snapshot_for_brand, seed_warehouse_inventory
+from app.services.performance.calculator import build_performance_snapshots
+from app.services.alerts.generator import generate_alerts
 from app.utils.csv_parser import dataframe_from_bytes
 from app.utils.date_utils import utcnow
 from app.utils.s3 import read_upload_file
@@ -97,6 +104,64 @@ def _sales_category(row: pd.Series) -> str:
 
 def _sales_size(row: pd.Series) -> str | None:
     return _clean_str(row.get("size")) or _clean_str(row.get("SIZE_FINAL"))
+
+
+def _derive_season_name(upload: Upload, df: pd.DataFrame) -> str:
+    if "buy_plan_name" in df.columns and not df.empty:
+        raw_name = df["buy_plan_name"].iloc[0]
+        if raw_name is not None and not pd.isna(raw_name):
+            candidate = str(raw_name).strip()
+            if candidate:
+                return candidate[:100]
+    stem = Path(upload.filename).stem
+    if "__" in stem:
+        stem = stem.split("__")[0]
+    stem = stem.strip()
+    return stem[:100] if stem else "Season 1"
+
+
+async def _ensure_simple_mode_season(
+    db: AsyncSession, brand_id: UUID, upload: Upload, df: pd.DataFrame
+) -> Season | None:
+    config = await get_brand_config(db, brand_id)
+    if not config.get("simple_mode", True):
+        return None
+
+    active = await db.scalar(
+        select(Season)
+        .where(Season.brand_id == brand_id, Season.status == SeasonStatus.ACTIVE)
+        .order_by(Season.start_date.desc())
+    )
+    if active is not None:
+        return active
+
+    latest = await db.scalar(
+        select(Season).where(Season.brand_id == brand_id).order_by(Season.start_date.desc())
+    )
+    if latest is not None:
+        latest.status = SeasonStatus.ACTIVE
+        await db.flush()
+        return latest
+
+    today = date.today()
+    season = Season(
+        brand_id=brand_id,
+        name=_derive_season_name(upload, df) or "Season 1",
+        start_date=today - timedelta(days=30),
+        end_date=today + timedelta(days=180),
+        categories=[],
+        status=SeasonStatus.ACTIVE,
+    )
+    db.add(season)
+    await db.flush()
+    return season
+
+
+async def _run_simple_mode_jobs(db: AsyncSession, brand_id: UUID) -> None:
+    today = date.today()
+    await build_snapshot_for_brand(brand_id, today, db)
+    await build_performance_snapshots(brand_id, today, db)
+    await generate_alerts(brand_id, today, db)
 
 
 async def _resolve_maps(
@@ -533,29 +598,32 @@ async def _upsert_grn(db: AsyncSession, brand_id: UUID, user_id: UUID, df: pd.Da
     return total_rows
 
 
-def _normalise_grade(raw_value: object) -> str:
-    if raw_value is None:
-        return "C"
+async def _normalise_grade(raw_value: object, brand_id: UUID, db: AsyncSession) -> str | None:
+    if raw_value is None or pd.isna(raw_value):
+        return None
     raw = str(raw_value).strip()
     if raw == "":
-        return "C"
-    compact = raw.replace("Stores", "").replace("Store", "").strip().upper()
+        return None
 
-    mapping = {
-        "A+": "A+",
-        "A": "A",
-        "B": "B",
-        "C": "C",
-        "GRADE 1": "A+",
-        "GRADE 2": "A",
-        "GRADE 3": "B",
-        "GRADE 4": "C",
-        "TIER 1": "A+",
-        "TIER 2": "A",
-        "TIER 3": "B",
-        "TIER 4": "C",
-    }
-    return mapping.get(compact, compact if compact in {"A+", "A", "B", "C"} else "C")
+    settings = await db.scalar(select(BrandSettings.config).where(BrandSettings.brand_id == brand_id))
+    config = settings if isinstance(settings, dict) else {}
+    grade_mapping = config.get("grade_mapping", {})
+    if isinstance(grade_mapping, dict):
+        if raw in grade_mapping:
+            return str(grade_mapping[raw]).strip()
+        raw_norm = raw.lower().strip()
+        for key, value in grade_mapping.items():
+            if str(key).lower().strip() == raw_norm:
+                return str(value).strip()
+
+    normalised = raw.strip()
+    normalised = normalised.replace(" Stores", "").replace(" stores", "")
+    normalised = normalised.replace("Grade ", "").replace("Tier ", "")
+    if normalised in {"A+", "A", "B", "C"}:
+        return normalised
+
+    logger.warning("Cannot normalise grade: %s for brand %s", raw_value, brand_id)
+    return None
 
 
 def _normalise_bool(value: object, default: bool = False) -> bool:
@@ -588,13 +656,21 @@ async def _upsert_store_grades(db: AsyncSession, brand_id: UUID, df: pd.DataFram
         store_id = store_name_map.get(store_name)
         if store_id is None:
             continue
+        grade = await _normalise_grade(row.get("grade"), brand_id, db)
+        if grade is None:
+            logger.warning(
+                "Skipping store grade row: unable to normalise grade '%s' for store '%s'",
+                row.get("grade"),
+                store_name,
+            )
+            continue
         rows.append(
             {
                 "brand_id": brand_id,
                 "store_id": store_id,
                 "product_category": str(row["product_category"]).strip(),
                 "price_band": row.get("price_band"),
-                "grade": _normalise_grade(row.get("grade")),
+                "grade": grade,
             }
         )
 
@@ -798,10 +874,34 @@ async def _upsert_buy_file(db: AsyncSession, upload: Upload, df: pd.DataFrame) -
         db.add(buy_plan_file)
         await db.flush()
 
+    season = await db.scalar(
+        select(Season)
+        .where(
+            Season.brand_id == brand_id,
+            Season.status == SeasonStatus.ACTIVE,
+        )
+        .order_by(Season.start_date.desc())
+    )
+    if season is None:
+        season = Season(
+            brand_id=brand_id,
+            name="SS26",
+            start_date=date(2026, 3, 1),
+            end_date=date(2026, 9, 30),
+            status=SeasonStatus.ACTIVE,
+        )
+        db.add(season)
+        await db.flush()
+
+    buy_plan_file.season_id = season.id
+
     sku_rows = await db.execute(select(SKU).where(SKU.brand_id == brand_id))
     sku_map = {sku.sku_code.upper(): sku.id for sku in sku_rows.scalars().all()}
 
     plan_line_map: dict[tuple[UUID, str | None], dict] = {}
+    reservation_by_key: dict[tuple[UUID, str | None], dict[str, int]] = {}
+    has_ecom = "ecom_reserved_qty" in df.columns
+    has_ars = "ars_reserved_qty" in df.columns
     for _, row in df.iterrows():
         base_style = _clean_str(row.get("sku_code"))
         size_value = _clean_str(row.get("size"))
@@ -814,6 +914,12 @@ async def _upsert_buy_file(db: AsyncSession, upload: Upload, df: pd.DataFrame) -
             continue
         store_group = row.get("store_group_rule")
         key = (sku_id, store_group)
+        if key not in reservation_by_key:
+            reservation_by_key[key] = {"ecom": 0, "ars": 0}
+        if has_ecom:
+            reservation_by_key[key]["ecom"] += _safe_int(row.get("ecom_reserved_qty"), 0)
+        if has_ars:
+            reservation_by_key[key]["ars"] += _safe_int(row.get("ars_reserved_qty"), 0)
         if key not in plan_line_map:
             plan_line_map[key] = {
                 "buy_plan_file_id": buy_plan_file.id,
@@ -846,6 +952,97 @@ async def _upsert_buy_file(db: AsyncSession, upload: Upload, df: pd.DataFrame) -
                 },
             )
             await db.execute(stmt)
+
+    buy_plan_lines = (
+        await db.execute(
+            select(BuyPlanLine).where(
+                BuyPlanLine.buy_plan_file_id == buy_plan_file.id,
+                BuyPlanLine.brand_id == brand_id,
+            )
+        )
+    ).scalars().all()
+
+    existing_grn = await db.scalar(
+        select(GRN).where(GRN.brand_id == brand_id, GRN.grn_code == "SS26-INITIAL-STOCK")
+    )
+    if existing_grn is not None:
+        existing_lines = (
+            await db.execute(select(GRNLine).where(GRNLine.grn_id == existing_grn.id))
+        ).scalars().all()
+        if existing_lines:
+            line_ids = [line.id for line in existing_lines]
+            await db.execute(
+                GRNLineReservation.__table__.delete().where(GRNLineReservation.grn_line_id.in_(line_ids))
+            )
+            await db.execute(GRNLine.__table__.delete().where(GRNLine.id.in_(line_ids)))
+        await db.delete(existing_grn)
+        await db.flush()
+
+    total_units = 0
+    unique_skus = {line.sku_id for line in buy_plan_lines}
+    for line in buy_plan_lines:
+        reserved = reservation_by_key.get((line.sku_id, line.store_group_rule), {"ecom": 0, "ars": 0})
+        units_received = int(line.total_buy_qty or 0)
+        available = units_received - reserved.get("ecom", 0) - reserved.get("ars", 0)
+        if available <= 0:
+            available = units_received
+        total_units += available
+
+    grn = GRN(
+        brand_id=brand_id,
+        grn_code="SS26-INITIAL-STOCK",
+        grn_date=date.today(),
+        supplier_name="Buy Plan Import",
+        status="RECEIVED",
+        total_units=total_units,
+        total_skus=len(unique_skus),
+        season_id=buy_plan_file.season_id,
+    )
+    db.add(grn)
+    await db.flush()
+
+    reservation_types = (
+        await db.execute(
+            select(InventoryReservationType).where(InventoryReservationType.brand_id == brand_id)
+        )
+    ).scalars().all()
+
+    grn_lines: list[GRNLine] = []
+    for line in buy_plan_lines:
+        reserved = reservation_by_key.get((line.sku_id, line.store_group_rule), {"ecom": 0, "ars": 0})
+        grn_line = GRNLine(
+            grn_id=grn.id,
+            brand_id=brand_id,
+            sku_id=line.sku_id,
+            units_received=int(line.total_buy_qty or 0),
+            total_buy_qty=int(line.total_buy_qty or 0),
+            ecom_reserved_qty=int(reserved.get("ecom", 0)),
+            ars_reserved_qty=int(reserved.get("ars", 0)),
+            buy_plan_line_id=line.id,
+        )
+        db.add(grn_line)
+        grn_lines.append(grn_line)
+
+    await db.flush()
+
+    if reservation_types:
+        for grn_line in grn_lines:
+            for reservation_type in reservation_types:
+                reserved_qty = 0
+                if reservation_type.code.upper() == "ECOM":
+                    reserved_qty = int(grn_line.ecom_reserved_qty or 0)
+                elif reservation_type.code.upper() == "ARS":
+                    reserved_qty = int(grn_line.ars_reserved_qty or 0)
+                db.add(
+                    GRNLineReservation(
+                        grn_line_id=grn_line.id,
+                        brand_id=brand_id,
+                        reservation_type_id=reservation_type.id,
+                        reserved_qty=reserved_qty,
+                    )
+                )
+
+    await seed_warehouse_inventory(grn.id, brand_id, db)
 
     return len(rows)
 
@@ -917,6 +1114,11 @@ async def process_upload(db: AsyncSession, upload: Upload) -> Upload:
         upload.status = UploadStatus.PARTIAL
     else:
         upload.status = UploadStatus.FAILED
+
+    if upload.status in {UploadStatus.COMPLETED, UploadStatus.PARTIAL} and successes > 0:
+        await _ensure_simple_mode_season(db, upload.brand_id, upload, valid_df)
+        if upload.upload_type.value in {"SALES", "INVENTORY", "GRN"}:
+            await _run_simple_mode_jobs(db, upload.brand_id)
 
     error_report_path: str | None = None
     if all_errors:

@@ -8,13 +8,27 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import GRN, GRNLine, InventoryState, SalesData, SKU, Store
+from app.models import (
+    GRN,
+    GRNLine,
+    GRNLineReservation,
+    InventoryReservationType,
+    InventoryState,
+    SalesData,
+    SKU,
+    Store,
+)
 
 
 def _safe_div(numerator: float, denominator: float) -> float | None:
     if denominator <= 0:
         return None
     return numerator / denominator
+
+
+def _chunked(rows: list[dict], size: int = 1000):
+    for idx in range(0, len(rows), size):
+        yield rows[idx : idx + size]
 
 
 async def build_snapshot_for_brand(brand_id: UUID, snapshot_date: date, db: AsyncSession) -> int:
@@ -167,7 +181,125 @@ async def build_snapshot_for_brand(brand_id: UUID, snapshot_date: date, db: Asyn
         )
 
     if upsert_rows:
-        stmt = insert(InventoryState).values(upsert_rows)
+        for batch in _chunked(upsert_rows):
+            stmt = insert(InventoryState).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_inventory_state_unique",
+                set_={
+                    "units_on_hand": stmt.excluded.units_on_hand,
+                    "units_in_transit": stmt.excluded.units_in_transit,
+                    "units_sold_7d": stmt.excluded.units_sold_7d,
+                    "units_sold_28d": stmt.excluded.units_sold_28d,
+                    "ros_7d": stmt.excluded.ros_7d,
+                    "ros_28d": stmt.excluded.ros_28d,
+                    "stock_cover_days": stmt.excluded.stock_cover_days,
+                    "days_since_grn": stmt.excluded.days_since_grn,
+                    "days_since_first_sale": stmt.excluded.days_since_first_sale,
+                    "sell_through_pct": stmt.excluded.sell_through_pct,
+                    "is_stockout": stmt.excluded.is_stockout,
+                    "is_new_arrival": stmt.excluded.is_new_arrival,
+                },
+            )
+            await db.execute(stmt)
+
+    return len(upsert_rows)
+
+
+async def get_available_for_first_allocation(grn_line_id: UUID, db: AsyncSession) -> int:
+    grn_line = await db.get(GRNLine, grn_line_id)
+    if grn_line is None:
+        return 0
+
+    totals = await db.execute(
+        select(
+            func.coalesce(func.sum(GRNLineReservation.reserved_qty), 0).label("reserved_sum"),
+            func.count(GRNLineReservation.id).label("reservation_count"),
+        )
+        .join(
+            InventoryReservationType,
+            and_(
+                InventoryReservationType.id == GRNLineReservation.reservation_type_id,
+                InventoryReservationType.is_active.is_(True),
+                InventoryReservationType.deducts_from_first_allocation.is_(True),
+            ),
+        )
+        .where(GRNLineReservation.grn_line_id == grn_line_id)
+    )
+    row = totals.one()
+    reserved_sum = int(row.reserved_sum or 0)
+    reservation_count = int(row.reservation_count or 0)
+
+    if reservation_count == 0:
+        reserved_sum = int(grn_line.ecom_reserved_qty or 0) + int(grn_line.ars_reserved_qty or 0)
+
+    available = int(grn_line.units_received or 0) - reserved_sum
+    return max(0, available)
+
+
+async def seed_warehouse_inventory(grn_id: UUID, brand_id: UUID, db: AsyncSession) -> int:
+    grn_lines = (
+        await db.execute(
+            select(GRNLine).where(GRNLine.grn_id == grn_id, GRNLine.brand_id == brand_id)
+        )
+    ).scalars().all()
+    if not grn_lines:
+        return 0
+
+    stores = (await db.execute(select(Store).where(Store.brand_id == brand_id))).scalars().all()
+    snapshot_date = date.today()
+
+    rows: list[dict] = []
+    for grn_line in grn_lines:
+        available = await get_available_for_first_allocation(grn_line.id, db)
+        rows.append(
+            {
+                "brand_id": brand_id,
+                "snapshot_date": snapshot_date,
+                "location_id": "WAREHOUSE-MAIN",
+                "location_type": "WAREHOUSE",
+                "sku_id": grn_line.sku_id,
+                "units_on_hand": int(available),
+                "units_in_transit": 0,
+                "units_sold_7d": 0,
+                "units_sold_28d": 0,
+                "ros_7d": None,
+                "ros_28d": None,
+                "stock_cover_days": None,
+                "days_since_grn": None,
+                "days_since_first_sale": None,
+                "sell_through_pct": None,
+                "is_stockout": False,
+                "is_new_arrival": False,
+            }
+        )
+        for store in stores:
+            rows.append(
+                {
+                    "brand_id": brand_id,
+                    "snapshot_date": snapshot_date,
+                    "location_id": str(store.id),
+                    "location_type": "STORE",
+                    "sku_id": grn_line.sku_id,
+                    "units_on_hand": 0,
+                    "units_in_transit": 0,
+                    "units_sold_7d": 0,
+                    "units_sold_28d": 0,
+                    "ros_7d": None,
+                    "ros_28d": None,
+                    "stock_cover_days": None,
+                    "days_since_grn": None,
+                    "days_since_first_sale": None,
+                    "sell_through_pct": None,
+                    "is_stockout": False,
+                    "is_new_arrival": False,
+                }
+            )
+
+    if not rows:
+        return 0
+
+    for batch in _chunked(rows):
+        stmt = insert(InventoryState).values(batch)
         stmt = stmt.on_conflict_do_update(
             constraint="uq_inventory_state_unique",
             set_={
@@ -187,4 +319,4 @@ async def build_snapshot_for_brand(brand_id: UUID, snapshot_date: date, db: Asyn
         )
         await db.execute(stmt)
 
-    return len(upsert_rows)
+    return len(rows)
