@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+# Ingestion flow map:
+# 1) Upload task marks file PROCESSING and loads bytes from storage.
+# 2) File is normalized/validated, then lookups (stores/SKUs) are preloaded once.
+# 3) Records are converted to dicts and bulk-upserted in batches with retry + commit cadence.
+# 4) Progress is emitted per phase (parsing, dimensions, sales/buy/size/grades, complete/error).
+# 5) Upload row is finalized with counters and optional post-ingestion jobs.
+
+import json
+import logging
 from collections import defaultdict
 from datetime import date, timedelta
 import hashlib
+import os
 from pathlib import Path
 import re
-from typing import Iterable
+from typing import Awaitable, Callable, Iterable
 from uuid import UUID
 
+logger = logging.getLogger(__name__)
+
 import pandas as pd
-from sqlalchemy import and_, select
+import redis.asyncio as redis
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +46,8 @@ from app.models import (
     UploadStatus,
 )
 from app.config import get_settings
+from app.services.ingestion.bulk import execute_with_batching
+from app.services.ingestion.lookup import build_lookup_maps, normalize_key
 from app.services.ingestion.normalizer import normalize
 from app.services.ingestion.validator import RowError, UploadValidator
 from app.services.settings import get_brand_config
@@ -47,6 +62,66 @@ settings = get_settings()
 ERROR_DIR = Path(settings.local_storage_path) / "errors"
 ERROR_DIR.mkdir(parents=True, exist_ok=True)
 UPSERT_BATCH_SIZE = 1000
+
+ProgressReporter = Callable[[str, int, int, str], Awaitable[None]]
+
+
+def _build_progress_reporter(task_id: str | None, upload_id: str) -> ProgressReporter:
+    redis_url = os.getenv("REDIS_URL") or settings.redis_url
+    redis_client: redis.Redis | None = None
+    if redis_url:
+        try:
+            redis_client = redis.from_url(redis_url, decode_responses=True)
+        except Exception:
+            redis_client = None
+
+    progress_task_id = task_id or upload_id
+    key = f"ingestion_progress:{progress_task_id}"
+
+    async def _report(stage: str, processed: int, total: int, message: str) -> None:
+        if redis_client is None:
+            return
+
+        status = "PROCESSING"
+        if stage == "complete":
+            status = "COMPLETED"
+        elif stage == "error":
+            status = "FAILED"
+
+        payload = {
+            "task_id": progress_task_id,
+            "upload_id": upload_id,
+            "stage": stage,
+            "processed": processed,
+            "total": total,
+            "message": message,
+            "status": status,
+        }
+
+        try:
+            await redis_client.setex(key, 3600, json.dumps(payload))
+        except Exception:
+            logger.debug("Skipping progress update for task %s", progress_task_id)
+
+    return _report
+
+
+def _require_columns(df: pd.DataFrame, required: list[str], sheet_name: str) -> None:
+    missing = [column for column in required if column not in df.columns]
+    if not missing:
+        return
+    raise ValueError(
+        f"Column(s) {missing} not found in sheet '{sheet_name}'. Found columns: {list(df.columns)}"
+    )
+
+
+async def _load_grade_mapping(db: AsyncSession, brand_id: UUID) -> dict[str, str]:
+    settings_row = await db.scalar(select(BrandSettings.config).where(BrandSettings.brand_id == brand_id))
+    config = settings_row if isinstance(settings_row, dict) else {}
+    grade_mapping = config.get("grade_mapping", {})
+    if not isinstance(grade_mapping, dict):
+        return {}
+    return {str(key).strip().lower(): str(value).strip() for key, value in grade_mapping.items()}
 
 
 def _errors_to_df(errors: list[RowError]) -> pd.DataFrame:
@@ -299,28 +374,40 @@ async def _bootstrap_dimensions_for_upload(
         await _bootstrap_sales_dimensions(db, upload.brand_id, df)
 
 
-async def _upsert_sales(db: AsyncSession, brand_id: UUID, upload_id: UUID, df: pd.DataFrame) -> int:
-    result = await db.execute(select(Store).where(Store.brand_id == brand_id))
-    stores = result.scalars().all()
-    store_code_map = {store.store_code.upper(): store.id for store in stores}
-    store_name_map = {_canonical_store_name(store.store_name): store.id for store in stores}
+async def _upsert_sales(
+    db: AsyncSession,
+    brand_id: UUID,
+    upload_id: UUID,
+    df: pd.DataFrame,
+    progress: ProgressReporter,
+) -> tuple[int, dict[str, int]]:
+    _require_columns(df, ["store_code", "sku_code", "units_sold"], "SS25 SALES HISTORY")
 
-    result = await db.execute(select(SKU).where(SKU.brand_id == brand_id))
-    skus = result.scalars().all()
-    sku_code_map = {sku.sku_code.upper(): sku.id for sku in skus}
-    sku_style_map = {sku.style_code.upper(): sku.id for sku in skus}
-
+    store_map, store_name_map, sku_map = await build_lookup_maps(db, brand_id)
     default_week_start = utcnow().date()
     aggregated_rows: dict[tuple[UUID, UUID, date], dict] = {}
-    for _, row in df.iterrows():
-        store_raw = str(row.get("store_code", "")).strip().upper()
-        store_id = store_code_map.get(store_raw) or store_name_map.get(_canonical_store_name(store_raw))
+
+    skipped_store_rows = 0
+    skipped_sku_rows = 0
+    zero_qty_rows = 0
+
+    await progress("sales", 0, len(df), "Preparing sales records...")
+    for idx, row in enumerate(df.to_dict(orient="records"), start=1):
+        store_raw = normalize_key(row.get("store_code"))
+        store_id = store_map.get(store_raw) or store_name_map.get(store_raw)
         if store_id is None:
+            skipped_store_rows += 1
             continue
 
-        sku_raw = str(row.get("sku_code", "")).strip().upper()
-        sku_id = sku_code_map.get(sku_raw) or sku_style_map.get(sku_raw)
+        sku_raw = normalize_key(row.get("sku_code"))
+        sku_id = sku_map.get(sku_raw)
         if sku_id is None:
+            skipped_sku_rows += 1
+            continue
+
+        units_sold = _safe_int(row.get("units_sold"), 0)
+        if units_sold <= 0:
+            zero_qty_rows += 1
             continue
 
         week_value = row.get("week_start_date")
@@ -343,7 +430,7 @@ async def _upsert_sales(db: AsyncSession, brand_id: UUID, upload_id: UUID, df: p
             }
 
         record = aggregated_rows[key]
-        record["units_sold"] += _safe_int(row.get("units_sold"), 0)
+        record["units_sold"] += units_sold
 
         revenue_raw = row.get("revenue")
         if revenue_raw is not None and not pd.isna(revenue_raw):
@@ -359,6 +446,9 @@ async def _upsert_sales(db: AsyncSession, brand_id: UUID, upload_id: UUID, df: p
         record["was_in_stock"] = record["was_in_stock"] and _normalise_bool(
             row.get("was_in_stock"), True
         )
+
+        if idx % 10000 == 0:
+            await progress("sales", idx, len(df), f"Preparing sales records: {idx:,}/{len(df):,}")
 
     rows: list[dict] = []
     for record in aggregated_rows.values():
@@ -377,12 +467,20 @@ async def _upsert_sales(db: AsyncSession, brand_id: UUID, upload_id: UUID, df: p
         )
 
     if not rows:
-        return 0
+        return 0, {
+            "skipped_store_rows": skipped_store_rows,
+            "skipped_sku_rows": skipped_sku_rows,
+            "zero_qty_rows": zero_qty_rows,
+            "failed_batches_rows": 0,
+        }
 
-    inserted = 0
-    for batch in _chunked(rows):
+    async def _sales_progress(done: int, total: int) -> None:
+        if done % 10000 == 0 or done == total:
+            await progress("sales", done, total, f"Importing sales history: {done:,} of {total:,} rows")
+
+    def _statement_factory(batch: list[dict]) -> object:
         stmt = insert(SalesData).values(batch)
-        stmt = stmt.on_conflict_do_update(
+        return stmt.on_conflict_do_update(
             constraint="uq_sales_brand_store_sku_week",
             set_={
                 "units_sold": stmt.excluded.units_sold,
@@ -392,9 +490,21 @@ async def _upsert_sales(db: AsyncSession, brand_id: UUID, upload_id: UUID, df: p
                 "updated_at": utcnow(),
             },
         )
-        await db.execute(stmt)
-        inserted += len(batch)
-    return inserted
+
+    inserted, failed_rows = await execute_with_batching(
+        db=db,
+        records=rows,
+        statement_factory=_statement_factory,
+        progress_callback=_sales_progress,
+        label="sales_upsert",
+    )
+
+    return inserted, {
+        "skipped_store_rows": skipped_store_rows,
+        "skipped_sku_rows": skipped_sku_rows,
+        "zero_qty_rows": zero_qty_rows,
+        "failed_batches_rows": failed_rows,
+    }
 
 
 async def _upsert_store_master(db: AsyncSession, brand_id: UUID, df: pd.DataFrame) -> int:
@@ -548,36 +658,93 @@ async def _upsert_inventory(db: AsyncSession, brand_id: UUID, df: pd.DataFrame) 
     return inserted
 
 
-async def _upsert_grn(db: AsyncSession, brand_id: UUID, user_id: UUID, df: pd.DataFrame) -> int:
-    _, sku_map = await _resolve_maps(db, brand_id, df)
-    grouped: dict[str, list[dict]] = defaultdict(list)
-    for _, row in df.iterrows():
-        grouped[str(row["grn_code"])].append(row.to_dict())
+async def _upsert_grn(
+    db: AsyncSession,
+    brand_id: UUID,
+    user_id: UUID,
+    df: pd.DataFrame,
+    progress: ProgressReporter | None = None,
+) -> int:
+    _require_columns(df, ["grn_code", "grn_date", "sku_code", "units_received"], "GRN")
 
-    total_rows = 0
+    _, _, sku_map = await build_lookup_maps(db, brand_id)
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in df.to_dict(orient="records"):
+        grouped[normalize_key(row.get("grn_code"))].append(row)
+
+    if progress is not None:
+        await progress("grn", 0, len(df), "Preparing GRN records...")
+
+    grn_codes = [code for code in grouped.keys() if code]
+    existing_grns = (
+        await db.execute(
+            select(GRN).where(GRN.brand_id == brand_id, GRN.grn_code.in_(grn_codes))
+        )
+    ).scalars().all()
+    grn_by_code = {normalize_key(grn.grn_code): grn for grn in existing_grns}
+
+    grn_rows: list[dict] = []
     for grn_code, lines in grouped.items():
-        grn_date = lines[0]["grn_date"]
-        result = await db.execute(select(GRN).where(and_(GRN.brand_id == brand_id, GRN.grn_code == grn_code)))
-        grn = result.scalar_one_or_none()
-        if grn is None:
-            grn = GRN(
-                brand_id=brand_id,
-                grn_code=grn_code,
-                grn_date=grn_date,
-                warehouse_id=lines[0].get("warehouse_id"),
-                supplier_name=lines[0].get("supplier_name"),
-                status="RECEIVED",
-                created_by=user_id,
+        if not grn_code:
+            continue
+        first = lines[0]
+        grn_rows.append(
+            {
+                "brand_id": brand_id,
+                "grn_code": grn_code,
+                "grn_date": first.get("grn_date"),
+                "warehouse_id": first.get("warehouse_id"),
+                "supplier_name": first.get("supplier_name"),
+                "status": "RECEIVED",
+                "created_by": user_id,
+            }
+        )
+
+    if grn_rows:
+        def _grn_stmt(batch: list[dict]) -> object:
+            stmt = insert(GRN).values(batch)
+            return stmt.on_conflict_do_update(
+                constraint="uq_grns_brand_grn_code",
+                set_={
+                    "grn_date": stmt.excluded.grn_date,
+                    "warehouse_id": stmt.excluded.warehouse_id,
+                    "supplier_name": stmt.excluded.supplier_name,
+                    "status": stmt.excluded.status,
+                    "updated_at": utcnow(),
+                },
             )
-            db.add(grn)
-            await db.flush()
+
+        await execute_with_batching(
+            db=db,
+            records=grn_rows,
+            statement_factory=_grn_stmt,
+            label="grn_upsert",
+        )
+
+    refreshed_grns = (
+        await db.execute(
+            select(GRN).where(GRN.brand_id == brand_id, GRN.grn_code.in_(grn_codes))
+        )
+    ).scalars().all()
+    grn_by_code = {normalize_key(grn.grn_code): grn for grn in refreshed_grns}
+
+    grn_line_rows: list[dict] = []
+    total_processed = 0
+    for grn_code, lines in grouped.items():
+        grn = grn_by_code.get(grn_code)
+        if grn is None:
+            continue
 
         units_sum = 0
+        sku_ids_seen: set[UUID] = set()
         for line in lines:
-            sku_id = sku_map[str(line["sku_code"]).upper()]
-            units = int(line["units_received"])
+            sku_id = sku_map.get(normalize_key(line.get("sku_code")))
+            if sku_id is None:
+                continue
+            units = _safe_int(line.get("units_received"), 0)
             units_sum += units
-            stmt = insert(GRNLine).values(
+            sku_ids_seen.add(sku_id)
+            grn_line_rows.append(
                 {
                     "grn_id": grn.id,
                     "brand_id": brand_id,
@@ -585,36 +752,43 @@ async def _upsert_grn(db: AsyncSession, brand_id: UUID, user_id: UUID, df: pd.Da
                     "units_received": units,
                 }
             )
-            stmt = stmt.on_conflict_do_update(
+            total_processed += 1
+
+        grn.total_units = units_sum
+        grn.total_skus = len(sku_ids_seen)
+
+    if grn_line_rows:
+        async def _grn_lines_progress(done: int, total: int) -> None:
+            if progress is not None:
+                await progress("grn", done, total, f"Importing GRN lines: {done:,}/{total:,}")
+
+        def _grn_line_stmt(batch: list[dict]) -> object:
+            stmt = insert(GRNLine).values(batch)
+            return stmt.on_conflict_do_update(
                 constraint="uq_grn_lines_grn_sku",
                 set_={"units_received": stmt.excluded.units_received, "updated_at": utcnow()},
             )
-            await db.execute(stmt)
-            total_rows += 1
 
-        grn.total_units = units_sum
-        grn.total_skus = len(lines)
+        await execute_with_batching(
+            db=db,
+            records=grn_line_rows,
+            statement_factory=_grn_line_stmt,
+            progress_callback=_grn_lines_progress,
+            label="grn_line_upsert",
+        )
 
-    return total_rows
+    return total_processed
 
 
-async def _normalise_grade(raw_value: object, brand_id: UUID, db: AsyncSession) -> str | None:
+def _normalise_grade(raw_value: object, grade_mapping: dict[str, str]) -> str | None:
     if raw_value is None or pd.isna(raw_value):
         return None
     raw = str(raw_value).strip()
     if raw == "":
         return None
 
-    settings = await db.scalar(select(BrandSettings.config).where(BrandSettings.brand_id == brand_id))
-    config = settings if isinstance(settings, dict) else {}
-    grade_mapping = config.get("grade_mapping", {})
-    if isinstance(grade_mapping, dict):
-        if raw in grade_mapping:
-            return str(grade_mapping[raw]).strip()
-        raw_norm = raw.lower().strip()
-        for key, value in grade_mapping.items():
-            if str(key).lower().strip() == raw_norm:
-                return str(value).strip()
+    if raw.lower().strip() in grade_mapping:
+        return grade_mapping[raw.lower().strip()]
 
     normalised = raw.strip()
     normalised = normalised.replace(" Stores", "").replace(" stores", "")
@@ -622,7 +796,7 @@ async def _normalise_grade(raw_value: object, brand_id: UUID, db: AsyncSession) 
     if normalised in {"A+", "A", "B", "C"}:
         return normalised
 
-    logger.warning("Cannot normalise grade: %s for brand %s", raw_value, brand_id)
+    logger.warning("Cannot normalise grade: %s", raw_value)
     return None
 
 
@@ -648,15 +822,25 @@ def _safe_int(value: object, default: int = 0) -> int:
         return default
 
 
-async def _upsert_store_grades(db: AsyncSession, brand_id: UUID, df: pd.DataFrame) -> int:
+async def _upsert_store_grades(
+    db: AsyncSession,
+    brand_id: UUID,
+    df: pd.DataFrame,
+    progress: ProgressReporter,
+) -> tuple[int, int]:
+    _require_columns(df, ["store_name", "product_category", "grade"], "Store_Grading")
+
     store_name_map = await _resolve_store_name_map(db, brand_id)
+    grade_mapping = await _load_grade_mapping(db, brand_id)
     rows = []
+    skipped_store_rows = 0
     for _, row in df.iterrows():
         store_name = _canonical_store_name(row.get("store_name"))
         store_id = store_name_map.get(store_name)
         if store_id is None:
+            skipped_store_rows += 1
             continue
-        grade = await _normalise_grade(row.get("grade"), brand_id, db)
+        grade = _normalise_grade(row.get("grade"), grade_mapping)
         if grade is None:
             logger.warning(
                 "Skipping store grade row: unable to normalise grade '%s' for store '%s'",
@@ -675,24 +859,38 @@ async def _upsert_store_grades(db: AsyncSession, brand_id: UUID, df: pd.DataFram
         )
 
     if not rows:
-        return 0
+        return 0, skipped_store_rows
 
-    inserted = 0
-    for batch in _chunked(rows):
+    async def _grades_progress(done: int, total: int) -> None:
+        await progress("stores", done, total, f"Importing store grades: {done:,}/{total:,}")
+
+    def _statement_factory(batch: list[dict]) -> object:
         stmt = insert(StoreProductGrade).values(batch)
-        stmt = stmt.on_conflict_do_update(
+        return stmt.on_conflict_do_update(
             constraint="uq_store_product_grades_unique",
             set_={
                 "grade": stmt.excluded.grade,
                 "updated_at": utcnow(),
             },
         )
-        await db.execute(stmt)
-        inserted += len(batch)
-    return inserted
+
+    inserted, _ = await execute_with_batching(
+        db=db,
+        records=rows,
+        statement_factory=_statement_factory,
+        progress_callback=_grades_progress,
+        label="store_grade_upsert",
+    )
+    return inserted, skipped_store_rows
 
 
-async def _upsert_size_guide(db: AsyncSession, brand_id: UUID, df: pd.DataFrame) -> int:
+async def _upsert_size_guide(
+    db: AsyncSession,
+    brand_id: UUID,
+    df: pd.DataFrame,
+    progress: ProgressReporter,
+) -> int:
+    _require_columns(df, ["product_category", "size", "min_max_ratio"], "SIZE GUIDE")
     rows = []
     for _, row in df.iterrows():
         size = str(row.get("size", "")).strip()
@@ -712,10 +910,12 @@ async def _upsert_size_guide(db: AsyncSession, brand_id: UUID, df: pd.DataFrame)
     if not rows:
         return 0
 
-    inserted = 0
-    for batch in _chunked(rows):
+    async def _size_progress(done: int, total: int) -> None:
+        await progress("size_guide", done, total, f"Importing size guide: {done:,}/{total:,}")
+
+    def _statement_factory(batch: list[dict]) -> object:
         stmt = insert(SizeGuide).values(batch)
-        stmt = stmt.on_conflict_do_update(
+        return stmt.on_conflict_do_update(
             constraint="uq_size_guides_unique",
             set_={
                 "size_type": stmt.excluded.size_type,
@@ -726,8 +926,14 @@ async def _upsert_size_guide(db: AsyncSession, brand_id: UUID, df: pd.DataFrame)
                 "updated_at": utcnow(),
             },
         )
-        await db.execute(stmt)
-        inserted += len(batch)
+
+    inserted, _ = await execute_with_batching(
+        db=db,
+        records=rows,
+        statement_factory=_statement_factory,
+        progress_callback=_size_progress,
+        label="size_guide_upsert",
+    )
     return inserted
 
 
@@ -768,7 +974,13 @@ async def _upsert_reservation_types(db: AsyncSession, brand_id: UUID, df: pd.Dat
     return inserted
 
 
-async def _upsert_buy_file(db: AsyncSession, upload: Upload, df: pd.DataFrame) -> int:
+async def _upsert_buy_file(
+    db: AsyncSession,
+    upload: Upload,
+    df: pd.DataFrame,
+    progress: ProgressReporter,
+) -> int:
+    _require_columns(df, ["sku_code"], "SS26 BUY FILE")
     brand_id = upload.brand_id
     raw_config = await db.scalar(select(BrandSettings.config).where(BrandSettings.brand_id == brand_id))
     config = raw_config if isinstance(raw_config, dict) else {}
@@ -786,6 +998,7 @@ async def _upsert_buy_file(db: AsyncSession, upload: Upload, df: pd.DataFrame) -
     normalized_risk_group_mapping = {str(key).strip().lower(): value for key, value in risk_group_mapping.items()}
 
     rows_by_sku: dict[str, dict] = {}
+    await progress("skus", 0, len(df), "Preparing SKU records from buy file...")
     for _, row in df.iterrows():
         base_style = _clean_str(row.get("sku_code"))
         size_value = _clean_str(row.get("size"))
@@ -827,9 +1040,13 @@ async def _upsert_buy_file(db: AsyncSession, upload: Upload, df: pd.DataFrame) -
         }
 
     rows = list(rows_by_sku.values())
-    for batch in _chunked(rows):
+
+    async def _sku_progress(done: int, total: int) -> None:
+        await progress("skus", done, total, f"Ensuring SKUs: {done:,}/{total:,}")
+
+    def _sku_stmt(batch: list[dict]) -> object:
         stmt = insert(SKU).values(batch)
-        stmt = stmt.on_conflict_do_update(
+        return stmt.on_conflict_do_update(
             constraint="uq_skus_brand_sku_code",
             set_={
                 "style_code": stmt.excluded.style_code,
@@ -852,7 +1069,14 @@ async def _upsert_buy_file(db: AsyncSession, upload: Upload, df: pd.DataFrame) -
                 "updated_at": utcnow(),
             },
         )
-        await db.execute(stmt)
+
+    await execute_with_batching(
+        db=db,
+        records=rows,
+        statement_factory=_sku_stmt,
+        progress_callback=_sku_progress,
+        label="buy_sku_upsert",
+    )
 
     plan_name = upload.filename
     if "buy_plan_name" in df.columns and not df.empty:
@@ -895,8 +1119,7 @@ async def _upsert_buy_file(db: AsyncSession, upload: Upload, df: pd.DataFrame) -
 
     buy_plan_file.season_id = season.id
 
-    sku_rows = await db.execute(select(SKU).where(SKU.brand_id == brand_id))
-    sku_map = {sku.sku_code.upper(): sku.id for sku in sku_rows.scalars().all()}
+    _, _, sku_map = await build_lookup_maps(db, brand_id)
 
     plan_line_map: dict[tuple[UUID, str | None], dict] = {}
     reservation_by_key: dict[tuple[UUID, str | None], dict[str, int]] = {}
@@ -940,9 +1163,12 @@ async def _upsert_buy_file(db: AsyncSession, upload: Upload, df: pd.DataFrame) -
 
     plan_line_rows = list(plan_line_map.values())
     if plan_line_rows:
-        for batch in _chunked(plan_line_rows):
+        async def _buy_progress(done: int, total: int) -> None:
+            await progress("buy_file", done, total, f"Importing buy lines: {done:,}/{total:,}")
+
+        def _buy_stmt(batch: list[dict]) -> object:
             stmt = insert(BuyPlanLine).values(batch)
-            stmt = stmt.on_conflict_do_update(
+            return stmt.on_conflict_do_update(
                 constraint="uq_buy_plan_lines_file_sku_group",
                 set_={
                     "style_risk_group": stmt.excluded.style_risk_group,
@@ -951,7 +1177,14 @@ async def _upsert_buy_file(db: AsyncSession, upload: Upload, df: pd.DataFrame) -
                     "updated_at": utcnow(),
                 },
             )
-            await db.execute(stmt)
+
+        await execute_with_batching(
+            db=db,
+            records=plan_line_rows,
+            statement_factory=_buy_stmt,
+            progress_callback=_buy_progress,
+            label="buy_plan_line_upsert",
+        )
 
     buy_plan_lines = (
         await db.execute(
@@ -1007,48 +1240,93 @@ async def _upsert_buy_file(db: AsyncSession, upload: Upload, df: pd.DataFrame) -
         )
     ).scalars().all()
 
-    grn_lines: list[GRNLine] = []
+    grn_line_rows: list[dict] = []
     for line in buy_plan_lines:
         reserved = reservation_by_key.get((line.sku_id, line.store_group_rule), {"ecom": 0, "ars": 0})
-        grn_line = GRNLine(
-            grn_id=grn.id,
-            brand_id=brand_id,
-            sku_id=line.sku_id,
-            units_received=int(line.total_buy_qty or 0),
-            total_buy_qty=int(line.total_buy_qty or 0),
-            ecom_reserved_qty=int(reserved.get("ecom", 0)),
-            ars_reserved_qty=int(reserved.get("ars", 0)),
-            buy_plan_line_id=line.id,
+        grn_line_rows.append(
+            {
+                "grn_id": grn.id,
+                "brand_id": brand_id,
+                "sku_id": line.sku_id,
+                "units_received": int(line.total_buy_qty or 0),
+                "total_buy_qty": int(line.total_buy_qty or 0),
+                "ecom_reserved_qty": int(reserved.get("ecom", 0)),
+                "ars_reserved_qty": int(reserved.get("ars", 0)),
+                "buy_plan_line_id": line.id,
+            }
         )
-        db.add(grn_line)
-        grn_lines.append(grn_line)
 
-    await db.flush()
+    if grn_line_rows:
+        def _grn_line_stmt(batch: list[dict]) -> object:
+            stmt = insert(GRNLine).values(batch)
+            return stmt.on_conflict_do_update(
+                constraint="uq_grn_lines_grn_sku",
+                set_={
+                    "units_received": stmt.excluded.units_received,
+                    "total_buy_qty": stmt.excluded.total_buy_qty,
+                    "ecom_reserved_qty": stmt.excluded.ecom_reserved_qty,
+                    "ars_reserved_qty": stmt.excluded.ars_reserved_qty,
+                    "buy_plan_line_id": stmt.excluded.buy_plan_line_id,
+                    "updated_at": utcnow(),
+                },
+            )
+
+        await execute_with_batching(
+            db=db,
+            records=grn_line_rows,
+            statement_factory=_grn_line_stmt,
+            label="grn_line_upsert",
+        )
 
     if reservation_types:
-        for grn_line in grn_lines:
+        fresh_grn_lines = (
+            await db.execute(select(GRNLine).where(GRNLine.grn_id == grn.id, GRNLine.brand_id == brand_id))
+        ).scalars().all()
+        reservation_rows: list[dict] = []
+        for grn_line in fresh_grn_lines:
             for reservation_type in reservation_types:
                 reserved_qty = 0
                 if reservation_type.code.upper() == "ECOM":
                     reserved_qty = int(grn_line.ecom_reserved_qty or 0)
                 elif reservation_type.code.upper() == "ARS":
                     reserved_qty = int(grn_line.ars_reserved_qty or 0)
-                db.add(
-                    GRNLineReservation(
-                        grn_line_id=grn_line.id,
-                        brand_id=brand_id,
-                        reservation_type_id=reservation_type.id,
-                        reserved_qty=reserved_qty,
-                    )
+                reservation_rows.append(
+                    {
+                        "grn_line_id": grn_line.id,
+                        "brand_id": brand_id,
+                        "reservation_type_id": reservation_type.id,
+                        "reserved_qty": reserved_qty,
+                    }
                 )
+
+        if reservation_rows:
+            def _reservation_stmt(batch: list[dict]) -> object:
+                stmt = insert(GRNLineReservation).values(batch)
+                return stmt.on_conflict_do_update(
+                    constraint="uq_grn_line_reservations_unique",
+                    set_={
+                        "reserved_qty": stmt.excluded.reserved_qty,
+                        "updated_at": utcnow(),
+                    },
+                )
+
+            await execute_with_batching(
+                db=db,
+                records=reservation_rows,
+                statement_factory=_reservation_stmt,
+                label="grn_line_reservation_upsert",
+            )
 
     await seed_warehouse_inventory(grn.id, brand_id, db)
 
     return len(rows)
 
 
-async def process_upload(db: AsyncSession, upload: Upload) -> Upload:
+async def process_upload(db: AsyncSession, upload: Upload, task_id: str | None = None) -> Upload:
     validator = UploadValidator()
+    progress = _build_progress_reporter(task_id=task_id, upload_id=str(upload.id))
+
+    await progress("init", 0, 1, "Preparing upload processing...")
     upload.status = UploadStatus.PROCESSING
     upload.processing_started_at = utcnow()
     await db.flush()
@@ -1064,8 +1342,15 @@ async def process_upload(db: AsyncSession, upload: Upload) -> Upload:
         upload.failed_rows = len(normalized_df)
         upload.total_rows = len(normalized_df)
         upload.processing_completed_at = utcnow()
+        await progress(
+            "error",
+            upload.failed_rows,
+            upload.total_rows,
+            "Upload failed due to schema errors",
+        )
         return upload
 
+    await progress("bootstrap", 0, 1, "Bootstrapping master data...")
     await _bootstrap_dimensions_for_upload(db, upload, normalized_df)
 
     reference_errors = await validator.validate_references(
@@ -1076,16 +1361,19 @@ async def process_upload(db: AsyncSession, upload: Upload) -> Upload:
     all_errors = schema_errors + reference_errors + business_errors
     error_rows = _error_row_set(all_errors)
 
+    await progress("validate", 0, len(normalized_df), "Validating rows...")
     valid_rows = []
     for idx, row in normalized_df.iterrows():
         row_num = idx + 2
         if row_num not in error_rows:
             valid_rows.append(row)
+        if (idx + 1) % 10000 == 0:
+            await progress("validate", idx + 1, len(normalized_df), f"Validating rows: {idx + 1:,}/{len(normalized_df):,}")
     valid_df = pd.DataFrame(valid_rows, columns=normalized_df.columns)
 
     successes = 0
     if upload.upload_type.value == "SALES":
-        successes = await _upsert_sales(db, upload.brand_id, upload.id, valid_df)
+        successes, _ = await _upsert_sales(db, upload.brand_id, upload.id, valid_df, progress)
     elif upload.upload_type.value == "STORE_MASTER":
         successes = await _upsert_store_master(db, upload.brand_id, valid_df)
     elif upload.upload_type.value == "SKU_MASTER":
@@ -1093,15 +1381,15 @@ async def process_upload(db: AsyncSession, upload: Upload) -> Upload:
     elif upload.upload_type.value == "INVENTORY":
         successes = await _upsert_inventory(db, upload.brand_id, valid_df)
     elif upload.upload_type.value == "GRN":
-        successes = await _upsert_grn(db, upload.brand_id, upload.uploaded_by, valid_df)
+        successes = await _upsert_grn(db, upload.brand_id, upload.uploaded_by, valid_df, progress)
     elif upload.upload_type.value == "STORE_GRADES":
-        successes = await _upsert_store_grades(db, upload.brand_id, valid_df)
+        successes, _ = await _upsert_store_grades(db, upload.brand_id, valid_df, progress)
     elif upload.upload_type.value == "SIZE_GUIDE":
-        successes = await _upsert_size_guide(db, upload.brand_id, valid_df)
+        successes = await _upsert_size_guide(db, upload.brand_id, valid_df, progress)
     elif upload.upload_type.value == "RESERVATION_TYPES":
         successes = await _upsert_reservation_types(db, upload.brand_id, valid_df)
     elif upload.upload_type.value == "BUY_FILE":
-        successes = await _upsert_buy_file(db, upload, valid_df)
+        successes = await _upsert_buy_file(db, upload, valid_df, progress)
 
     failures = len(error_rows)
     upload.total_rows = len(normalized_df)
@@ -1131,4 +1419,5 @@ async def process_upload(db: AsyncSession, upload: Upload) -> Upload:
         "error_report_path": error_report_path,
     }
     upload.processing_completed_at = utcnow()
+    await progress("complete", upload.total_rows or 0, upload.total_rows or 0, f"Upload {upload.status.value.lower()}")
     return upload

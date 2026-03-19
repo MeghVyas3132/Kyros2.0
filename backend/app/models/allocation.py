@@ -10,6 +10,7 @@ from app.database import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 class AllocationStatus(str, enum.Enum):
     DRAFT = "DRAFT"
+    GENERATING = "GENERATING"
     UNDER_REVIEW = "UNDER_REVIEW"
     APPROVED = "APPROVED"
     DISPATCHED = "DISPATCHED"

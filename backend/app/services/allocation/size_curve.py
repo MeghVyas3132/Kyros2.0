@@ -7,7 +7,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import SalesData, SizeGuide, SKU, Store
+from app.models import SalesData, SizeGuide, SKU, Store, StoreProductGrade
 
 logger = logging.getLogger(__name__)
 
@@ -195,12 +195,16 @@ def _size_allowed_for_grade(applies_to_grades: str, store_grade: str) -> bool:
 
 
 async def calculate_size_distribution(
-    brand_id: UUID,
-    product_category: str,
-    store_id: UUID,
-    store_grade: str,
-    total_units: int,
     db: AsyncSession,
+    brand_id: UUID,
+    sku: SKU | None = None,
+    store: Store | None = None,
+    total_qty: int | None = None,
+    *,
+    product_category: str | None = None,
+    store_id: UUID | None = None,
+    store_grade: str | None = None,
+    total_units: int | None = None,
 ) -> dict[str, int]:
     """
     Generic size distribution:
@@ -209,38 +213,56 @@ async def calculate_size_distribution(
     3. Use historical size ratios to adjust guide weights when available
     4. Reconcile to exact total_units
     """
-    if total_units <= 0:
+    resolved_category = product_category or (sku.category if sku is not None else None)
+    resolved_store_id = store_id or (store.id if store is not None else None)
+    resolved_total_units = total_units if total_units is not None else total_qty
+
+    if resolved_category is None or resolved_store_id is None or resolved_total_units is None:
         return {}
 
-    guides = await load_size_guide(brand_id, product_category, db)
+    if resolved_total_units <= 0:
+        return {}
+
+    resolved_store_grade = store_grade
+    if not resolved_store_grade:
+        resolved_store_grade = await db.scalar(
+            select(StoreProductGrade.grade).where(
+                StoreProductGrade.brand_id == brand_id,
+                StoreProductGrade.store_id == resolved_store_id,
+                StoreProductGrade.product_category == resolved_category,
+            )
+        )
+    resolved_store_grade = (resolved_store_grade or "C").upper()
+
+    guides = await load_size_guide(brand_id, resolved_category, db)
     if not guides:
         return {}
 
     eligible = [
         guide
         for guide in guides
-        if guide.min_max_ratio > 0 and _size_allowed_for_grade(guide.applies_to_grades, store_grade)
+        if guide.min_max_ratio > 0 and _size_allowed_for_grade(guide.applies_to_grades, resolved_store_grade)
     ]
     if not eligible:
         return {}
 
     if len(eligible) == 1 and eligible[0].size.upper() in {"FS", "FREE SIZE", "ONE SIZE"}:
-        return {eligible[0].size: total_units}
+        return {eligible[0].size: resolved_total_units}
 
     if any(guide.is_size_set for guide in eligible):
         return await distribute_size_sets(
             brand_id=brand_id,
-            product_category=product_category,
-            store_id=store_id,
-            total_units=total_units,
+            product_category=resolved_category,
+            store_id=resolved_store_id,
+            total_units=resolved_total_units,
             eligible_guides=eligible,
             db=db,
         )
 
     historical = await load_historical_size_ratios(
         brand_id=brand_id,
-        product_category=product_category,
-        store_id=store_id,
+        product_category=resolved_category,
+        store_id=resolved_store_id,
         db=db,
     )
     base_weights = {guide.size: float(guide.min_max_ratio) for guide in eligible}
@@ -256,4 +278,4 @@ async def calculate_size_distribution(
         else:
             adjusted[size] = base
 
-    return reconcile_weighted_quantities(adjusted, total_units)
+    return reconcile_weighted_quantities(adjusted, resolved_total_units)

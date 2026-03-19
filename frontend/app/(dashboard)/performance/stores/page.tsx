@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
 
-import { PageHeader } from "@/components/shared/PageHeader";
 import { StorePerformanceTable } from "@/components/performance/StorePerformanceTable";
 import { Input } from "@/components/ui/Input";
 import { apiRequest } from "@/lib/api";
@@ -55,29 +54,39 @@ export default function PerformanceStoresPage() {
   };
 
   return (
-    <div className="space-y-4">
-      <PageHeader title="Performance · Stores" subtitle="Store-level sell-through and cover" />
-      <div className="grid grid-cols-3 gap-2">
+    <div className="space-y-6">
+      {/* Header */}
+      <div>
+        <h1 className="text-2xl font-semibold text-slate-900">Store Health</h1>
+        <p className="mt-1 text-sm text-slate-500">
+          Monitor sell-through and weeks of cover at each store to spot issues early.
+        </p>
+      </div>
+
+      {/* Filters */}
+      <div className="grid grid-cols-3 gap-3">
         <select
-          className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm outline-none focus:border-slate-600"
+          className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-slate-400 focus:ring-1 focus:ring-slate-400"
           value={seasonId}
           onChange={(e) => setSeasonId(e.target.value)}
         >
-          <option value="">Select season</option>
+          <option value="">All Seasons</option>
           {(seasons ?? []).map((season) => (
             <option key={season.id} value={season.id}>
               {season.name}
             </option>
           ))}
         </select>
-        <Input placeholder="Cluster ID" value={clusterId} onChange={(e) => setClusterId(e.target.value)} />
+        <Input placeholder="Filter by cluster…" value={clusterId} onChange={(e) => setClusterId(e.target.value)} />
         <button
           onClick={handleExport}
-          className="inline-flex items-center justify-center rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-900 hover:bg-slate-50"
+          className="inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
         >
+          <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clipRule="evenodd" /></svg>
           Export CSV
         </button>
       </div>
+
       <StorePerformanceTable rows={(data as Array<Record<string, unknown>>) ?? []} />
     </div>
   );

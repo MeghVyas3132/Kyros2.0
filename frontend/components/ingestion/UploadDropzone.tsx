@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/Button";
 import { ApiError, apiRequest } from "@/lib/api";
@@ -26,12 +26,54 @@ interface MappingRequiredDetails {
   mappable_fields: string[];
 }
 
+interface UploadResponse {
+  upload_id: string;
+  status: string;
+  task_id: string | null;
+  mode: string | null;
+}
+
+interface UploadProgress {
+  task_id: string;
+  status: string;
+  stage: string;
+  processed: number;
+  total: number;
+  message: string;
+}
+
 export function UploadDropzone({ uploadType, onUploaded }: Props) {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [mappingRequired, setMappingRequired] = useState<MappingRequiredDetails | null>(null);
   const [manualMapping, setManualMapping] = useState<Record<string, string>>({});
+  const [taskId, setTaskId] = useState<string | null>(null);
+  const [progress, setProgress] = useState<UploadProgress | null>(null);
+
+  useEffect(() => {
+    if (!taskId) return;
+
+    const poll = async () => {
+      try {
+        const payload = await apiRequest<UploadProgress>(`/api/v1/ingestion/uploads/${taskId}/progress`);
+        setProgress(payload);
+        const status = String(payload.status || "").toUpperCase();
+        if (["COMPLETED", "PARTIAL", "FAILED"].includes(status)) {
+          setTaskId(null);
+          onUploaded();
+        }
+      } catch {
+        // Intentionally ignore transient polling errors.
+      }
+    };
+
+    void poll();
+    const interval = window.setInterval(() => {
+      void poll();
+    }, 1500);
+    return () => window.clearInterval(interval);
+  }, [taskId, onUploaded]);
 
   const onFile = async (file: File, mapping: Record<string, string> | null = null) => {
     setLoading(true);
@@ -43,11 +85,24 @@ export function UploadDropzone({ uploadType, onUploaded }: Props) {
       if (mapping && Object.keys(mapping).length > 0) {
         formData.append("column_mapping_json", JSON.stringify(mapping));
       }
-      await apiRequest<{ upload_id: string; status: string }>("/api/v1/ingestion/upload", {
+      const queued = await apiRequest<UploadResponse>("/api/v1/ingestion/upload", {
         method: "POST",
         body: formData,
       });
       setMessage("Upload queued");
+      setTaskId(queued.task_id);
+      setProgress(
+        queued.task_id
+          ? {
+              task_id: queued.task_id,
+              status: "PENDING",
+              stage: "queued",
+              processed: 0,
+              total: 0,
+              message: "Queued for processing",
+            }
+          : null
+      );
       setMappingRequired(null);
       setManualMapping({});
       setSelectedFile(null);
@@ -77,17 +132,39 @@ export function UploadDropzone({ uploadType, onUploaded }: Props) {
         <input
           className="hidden"
           type="file"
-          accept=".csv"
+          accept=".csv,.xlsx,.xlsm"
           onChange={(event) => {
             const file = event.target.files?.[0];
             if (file) void onFile(file);
           }}
         />
         <span className="rounded-md bg-slate-900 px-3 py-2 font-medium text-white">
-          {loading ? "Uploading..." : `Upload ${uploadType} CSV`}
+          {loading ? "Uploading..." : `Upload ${uploadType} file`}
         </span>
       </label>
       {message ? <p className="mt-2 text-xs text-slate-600">{message}</p> : null}
+
+      {progress ? (
+        <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3">
+          <div className="flex items-center justify-between text-xs text-slate-700">
+            <span className="font-medium">{progress.message || "Processing upload..."}</span>
+            <span>
+              {progress.total > 0 ? `${progress.processed}/${progress.total}` : progress.stage}
+            </span>
+          </div>
+          <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-200">
+            <div
+              className="h-full rounded-full bg-slate-900 transition-all"
+              style={{
+                width:
+                  progress.total > 0
+                    ? `${Math.max(2, Math.min(100, (progress.processed / progress.total) * 100))}%`
+                    : "8%",
+              }}
+            />
+          </div>
+        </div>
+      ) : null}
 
       {mappingRequired ? (
         <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 p-3">

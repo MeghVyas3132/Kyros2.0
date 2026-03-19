@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/Button";
 import { ApiError, apiRequest } from "@/lib/api";
@@ -30,8 +30,18 @@ interface SmartUploadResponse {
     upload_type: string;
     filename: string;
     status: string;
+    task_id?: string;
   }>;
   sheets: Array<Record<string, unknown>>;
+}
+
+interface UploadProgress {
+  task_id: string;
+  status: string;
+  stage: string;
+  processed: number;
+  total: number;
+  message: string;
 }
 
 interface SheetDecision {
@@ -50,6 +60,46 @@ export function SmartUploadCard({ onUploaded }: Props) {
   const [message, setMessage] = useState<string | null>(null);
   const [pending, setPending] = useState<MappingRequiredDetails | null>(null);
   const [decisions, setDecisions] = useState<Record<string, SheetDecision>>({});
+  const [taskIds, setTaskIds] = useState<string[]>([]);
+  const [taskProgress, setTaskProgress] = useState<Record<string, UploadProgress>>({});
+
+  useEffect(() => {
+    if (taskIds.length === 0) return;
+
+    const poll = async () => {
+      const updates: Record<string, UploadProgress> = {};
+      await Promise.all(
+        taskIds.map(async (taskId) => {
+          try {
+            updates[taskId] = await apiRequest<UploadProgress>(
+              `/api/v1/ingestion/uploads/${taskId}/progress`
+            );
+          } catch {
+            // Ignore polling failures and retry on next tick.
+          }
+        })
+      );
+
+      if (Object.keys(updates).length === 0) return;
+
+      setTaskProgress((prev) => ({ ...prev, ...updates }));
+      const unfinished = taskIds.filter((taskId) => {
+        const status = String((updates[taskId] || taskProgress[taskId])?.status || "").toUpperCase();
+        return !["COMPLETED", "PARTIAL", "FAILED"].includes(status);
+      });
+
+      if (unfinished.length !== taskIds.length) {
+        setTaskIds(unfinished);
+        onUploaded();
+      }
+    };
+
+    void poll();
+    const interval = window.setInterval(() => {
+      void poll();
+    }, 1500);
+    return () => window.clearInterval(interval);
+  }, [taskIds, taskProgress, onUploaded]);
 
   const queueSummary = useMemo(() => {
     if (!pending) return null;
@@ -97,6 +147,10 @@ export function SmartUploadCard({ onUploaded }: Props) {
       setDecisions({});
       setSelectedFile(null);
       const queuedCount = response.queued_uploads.length;
+      const queuedTaskIds = response.queued_uploads
+        .map((item) => item.task_id)
+        .filter((value): value is string => Boolean(value));
+      setTaskIds(queuedTaskIds);
       setMessage(`Smart upload queued ${queuedCount} ingestion job${queuedCount === 1 ? "" : "s"}.`);
       onUploaded();
     } catch (error) {
@@ -147,6 +201,34 @@ export function SmartUploadCard({ onUploaded }: Props) {
         <p className="mt-2 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-700">
           {message}
         </p>
+      ) : null}
+
+      {Object.keys(taskProgress).length > 0 ? (
+        <div className="mt-3 space-y-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
+          {Object.entries(taskProgress).map(([id, progressItem]) => (
+            <div key={id}>
+              <div className="flex items-center justify-between text-xs text-slate-700">
+                <span className="font-medium">{progressItem.message || "Processing upload..."}</span>
+                <span>
+                  {progressItem.total > 0
+                    ? `${progressItem.processed}/${progressItem.total}`
+                    : progressItem.stage}
+                </span>
+              </div>
+              <div className="mt-1 h-2 overflow-hidden rounded-full bg-slate-200">
+                <div
+                  className="h-full rounded-full bg-slate-900 transition-all"
+                  style={{
+                    width:
+                      progressItem.total > 0
+                        ? `${Math.max(2, Math.min(100, (progressItem.processed / progressItem.total) * 100))}%`
+                        : "8%",
+                  }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
       ) : null}
 
       {pending ? (

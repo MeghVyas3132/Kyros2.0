@@ -137,13 +137,14 @@ export interface AllocationSession {
   id: string;
   brand_id: string;
   grn_id: string;
-  status: "DRAFT" | "UNDER_REVIEW" | "APPROVED" | "DISPATCHED" | "CANCELLED";
+  status: "DRAFT" | "GENERATING" | "UNDER_REVIEW" | "APPROVED" | "DISPATCHED" | "CANCELLED";
   total_stores: number;
   total_skus: number;
   total_units_recommended: number;
   total_units_approved: number;
   approved_by: string | null;
   approved_at: string | null;
+  generated_at: string | null;
   created_at: string;
   updated_at: string;
 }

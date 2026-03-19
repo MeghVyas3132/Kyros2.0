@@ -1,10 +1,13 @@
+import asyncio
 import json
+import os
 from pathlib import Path
 from uuid import UUID
 
 from io import BytesIO
 
 import pandas as pd
+import redis
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import select
@@ -35,6 +38,27 @@ from app.utils.s3 import save_upload_file
 router = APIRouter(prefix="/api/v1/ingestion", tags=["ingestion"])
 
 
+def _progress_redis_client() -> redis.Redis | None:
+    url = os.getenv("REDIS_URL")
+    host = os.getenv("REDIS_HOST")
+    if not url and not host:
+        return None
+
+    try:
+        if url:
+            return redis.Redis.from_url(url, decode_responses=True)
+        return redis.Redis(
+            host=host or "redis",
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            db=int(os.getenv("REDIS_DB", "0")),
+            decode_responses=True,
+            socket_timeout=1.0,
+            socket_connect_timeout=1.0,
+        )
+    except Exception:
+        return None
+
+
 @router.post("/upload")
 async def upload_csv(
     file: UploadFile = File(...),
@@ -48,13 +72,18 @@ async def upload_csv(
 
     if upload_type_key in UPLOAD_FIELD_ALIASES:
         try:
-            incoming_df = pd.read_csv(BytesIO(content))
+            fname = (file.filename or "").lower()
+            if fname.endswith((".xlsx", ".xlsm")):
+                sheets = pd.read_excel(BytesIO(content), sheet_name=None)
+                incoming_df = next(iter(sheets.values()))
+            else:
+                incoming_df = pd.read_csv(BytesIO(content))
         except Exception as exc:
             raise HTTPException(
                 status_code=400,
                 detail={
                     "code": "VALIDATION_ERROR",
-                    "message": "Unable to parse CSV file",
+                    "message": "Unable to parse file. Please upload CSV or XLSX.",
                     "details": str(exc),
                 },
             ) from exc
@@ -124,8 +153,15 @@ async def upload_csv(
     db.add(row)
     await db.commit()
     await db.refresh(row)
-    await process_upload_with_fallback(str(row.id), str(current_user.brand_id))
-    return envelope({"upload_id": str(row.id), "status": "PENDING"})
+    task_info = await process_upload_with_fallback(str(row.id), str(current_user.brand_id))
+    return envelope(
+        {
+            "upload_id": str(row.id),
+            "status": "PENDING",
+            "task_id": task_info.get("task_id"),
+            "mode": task_info.get("mode"),
+        }
+    )
 
 
 @router.post("/smart-upload")
@@ -336,16 +372,26 @@ async def smart_upload(
 
     await db.commit()
 
-    queued: list[dict[str, str]] = []
     for row in created_rows:
         await db.refresh(row)
-        await process_upload_with_fallback(str(row.id), str(current_user.brand_id))
+
+    task_infos = await asyncio.gather(
+        *[
+            process_upload_with_fallback(str(row.id), str(current_user.brand_id))
+            for row in created_rows
+        ]
+    )
+
+    queued: list[dict[str, str]] = []
+    for row, task_info in zip(created_rows, task_infos, strict=True):
         queued.append(
             {
                 "upload_id": str(row.id),
                 "upload_type": row.upload_type.value,
                 "filename": row.filename,
                 "status": row.status.value,
+                "task_id": task_info.get("task_id") or "",
+                "mode": task_info.get("mode") or "",
             }
         )
 
@@ -366,6 +412,53 @@ async def list_uploads(
         await db.execute(select(Upload).where(Upload.brand_id == current_user.brand_id).order_by(Upload.created_at.desc()))
     ).scalars().all()
     return envelope(rows)
+
+
+@router.get("/uploads/{task_id}/progress")
+async def get_upload_progress(
+    task_id: str,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    del current_user
+    client = _progress_redis_client()
+    if client is None:
+        return envelope(
+            {
+                "task_id": task_id,
+                "status": "PENDING",
+                "stage": "queued",
+                "processed": 0,
+                "total": 0,
+                "message": "Progress backend unavailable",
+            }
+        )
+
+    raw_payload = client.get(f"ingestion_progress:{task_id}")
+    if not raw_payload:
+        return envelope(
+            {
+                "task_id": task_id,
+                "status": "PENDING",
+                "stage": "queued",
+                "processed": 0,
+                "total": 0,
+                "message": "Queued for processing",
+            }
+        )
+
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError:
+        payload = {
+            "task_id": task_id,
+            "status": "PENDING",
+            "stage": "queued",
+            "processed": 0,
+            "total": 0,
+            "message": "Invalid progress payload",
+        }
+
+    return envelope(payload)
 
 
 @router.get("/uploads/{upload_id}")

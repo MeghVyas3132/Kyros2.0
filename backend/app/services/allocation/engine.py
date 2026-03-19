@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import date
@@ -13,6 +14,7 @@ from app.models import (
     AllocationSession,
     AllocationStatus,
     BrandSettings,
+    BuyPlanLine,
     GRN,
     GRNLine,
     GRNLineReservation,
@@ -27,11 +29,19 @@ from app.models import (
     StoreProductGrade,
     StyleStoreList,
 )
-from app.utils.date_utils import utcnow
-from app.services.allocation.size_curve import (
-    calculate_size_distribution,
-    load_historical_size_ratios,
+from app.services.allocation.cap import apply_inventory_cap
+from app.services.allocation.demand import (
+    DemandSignal,
+    calculate_store_demand_details,
+    get_min_presentation_qty,
+    get_previous_season_id,
+    get_season_weeks_remaining,
+    load_grade_map,
+    load_grade_ros_averages,
+    load_sales_history,
 )
+from app.utils.date_utils import utcnow
+from app.services.allocation.size_curve import calculate_size_distribution
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +83,14 @@ class AllocationEngine:
     def __init__(self) -> None:
         self._store_cache: dict[UUID, Store] = {}
         self._store_list_cache: dict[UUID, StyleStoreList | None] = {}
+        self._grade_cache: dict[tuple[UUID, str, str | None], str] | None = None
 
     async def generate(self, grn_id: UUID, brand_id: UUID, db: AsyncSession) -> AllocationSession:
+        # Reset caches per generation run
+        self._store_cache = {}
+        self._store_list_cache = {}
+        self._grade_cache = None
+
         grn = await db.scalar(select(GRN).where(GRN.id == grn_id, GRN.brand_id == brand_id))
         if grn is None:
             raise ValueError(f"GRN {grn_id} not found for brand {brand_id}")
@@ -98,10 +114,6 @@ class AllocationEngine:
         ).scalars().all()
         self._store_cache = {store.id: store for store in stores}
 
-        inventory = await self._load_latest_inventory(brand_id, db)
-        ros_data = await self._load_ros_by_attribute(brand_id, db)
-        brand_settings = await self._load_brand_settings(brand_id, db)
-
         if session is None:
             session = AllocationSession(
                 brand_id=brand_id,
@@ -114,15 +126,14 @@ class AllocationEngine:
             db.add(session)
             await db.flush()
         else:
-            session.status = AllocationStatus.DRAFT
+            # Keep GENERATING status if it was set by the Celery dispatch,
+            # so the polling frontend doesn't see an intermediate DRAFT.
+            if session.status != AllocationStatus.GENERATING:
+                session.status = AllocationStatus.DRAFT
             session.generated_at = utcnow()
             session.total_stores = len(stores)
-            existing_lines = (
-                await db.execute(select(AllocationLine).where(AllocationLine.session_id == session.id))
-            ).scalars().all()
-            for line in existing_lines:
-                await db.delete(line)
-            await db.flush()
+
+        await db.flush()
 
         grn_lines = (
             await db.execute(
@@ -133,93 +144,292 @@ class AllocationEngine:
             )
         ).scalars().all()
 
-        allocation_lines: list[AllocationLine] = []
+        sku_ids = list({gl.sku_id for gl in grn_lines})
+        sku_rows = (
+            await db.execute(
+                select(SKU).where(SKU.id.in_(sku_ids), SKU.brand_id == brand_id)
+            )
+        ).scalars().all()
+        sku_map: dict[UUID, SKU] = {s.id: s for s in sku_rows}
+
+        buy_plan_ids = [line.buy_plan_line_id for line in grn_lines if line.buy_plan_line_id is not None]
+        buy_plan_map: dict[UUID, BuyPlanLine] = {}
+        if buy_plan_ids:
+            buy_plan_rows = (
+                await db.execute(select(BuyPlanLine).where(BuyPlanLine.id.in_(buy_plan_ids)))
+            ).scalars().all()
+            buy_plan_map = {line.id: line for line in buy_plan_rows}
+
+        grn_line_ids = [gl.id for gl in grn_lines]
+        res_rows = await db.execute(
+            select(
+                GRNLineReservation.grn_line_id,
+                func.coalesce(func.sum(GRNLineReservation.reserved_qty), 0).label("reserved_sum"),
+            )
+            .join(
+                InventoryReservationType,
+                and_(
+                    InventoryReservationType.id == GRNLineReservation.reservation_type_id,
+                    InventoryReservationType.is_active.is_(True),
+                    InventoryReservationType.deducts_from_first_allocation.is_(True),
+                ),
+            )
+            .where(GRNLineReservation.grn_line_id.in_(grn_line_ids))
+            .group_by(GRNLineReservation.grn_line_id)
+        )
+        reservation_map: dict[UUID, int] = {row.grn_line_id: int(row.reserved_sum) for row in res_rows.all()}
+
+        existing_lines = (
+            await db.execute(select(AllocationLine).where(AllocationLine.session_id == session.id))
+        ).scalars().all()
+        existing_line_map: dict[tuple[UUID, UUID], AllocationLine] = {
+            (line.store_id, line.sku_id): line for line in existing_lines
+        }
+        existing_lines_by_sku: dict[UUID, list[AllocationLine]] = {}
+        for line in existing_lines:
+            existing_lines_by_sku.setdefault(line.sku_id, []).append(line)
+
+        previous_season_id, season_weeks_remaining, min_presentation_qty, grade_map = await asyncio.gather(
+            get_previous_season_id(db, brand_id, grn.season_id),
+            get_season_weeks_remaining(db, brand_id, grn.season_id),
+            get_min_presentation_qty(db, brand_id),
+            load_grade_map(db, brand_id),
+        )
+
+        sales_by_store_category, grade_ros_averages = await asyncio.gather(
+            load_sales_history(db=db, brand_id=brand_id, season_id=previous_season_id),
+            load_grade_ros_averages(db=db, brand_id=brand_id, season_id=previous_season_id),
+        )
+
         total_units = 0
+        processed = 0
 
         for grn_line in grn_lines:
-            sku = await db.scalar(
-                select(SKU).where(SKU.id == grn_line.sku_id, SKU.brand_id == brand_id)
-            )
+            sku = sku_map.get(grn_line.sku_id)
             if sku is None:
                 continue
 
-            available_units = await self.get_available_for_first_allocation(grn_line, db)
+            rule = sku.store_group_rule
+            if grn_line.buy_plan_line_id is not None and grn_line.buy_plan_line_id in buy_plan_map:
+                rule = buy_plan_map[grn_line.buy_plan_line_id].store_group_rule or rule
+
+            reserved = reservation_map.get(grn_line.id)
+            if reserved is None:
+                reserved = int(grn_line.ecom_reserved_qty or 0) + int(grn_line.ars_reserved_qty or 0)
+            available_units = max(0, int(grn_line.units_received or 0) - reserved)
             if available_units <= 0:
-                logger.warning(
-                    "Skipping GRN line %s as available_for_first_allocation=%s",
-                    grn_line.id,
-                    available_units,
-                )
+                logger.warning("Skipping SKU %s because available qty is %d", sku.sku_code, available_units)
                 continue
 
-            scores = await self.score_stores(sku, stores, inventory, ros_data, brand_id, db, brand_settings)
-            eligible = await self.filter_eligible(scores, sku, inventory, db, brand_id)
-            raw = self.distribute_units(eligible, available_units, sku, brand_settings)
-            sized = await self.apply_size_curves(raw, sku, brand_id, db)
-            constrained = await self.apply_constraints(sized, available_units, grn_line, db)
+            eligible_stores = self._filter_stores_for_group_rule(
+                stores=stores,
+                grade_map=grade_map,
+                product_category=sku.category,
+                rule=rule,
+            )
+            if not eligible_stores:
+                logger.warning("No eligible stores found for SKU %s under rule %s", sku.sku_code, rule)
+                continue
 
-            for store_id, qty in constrained.items():
-                store_grade = scores[store_id].store_grade
-                size_split = await calculate_size_distribution(
-                    brand_id=brand_id,
-                    product_category=sku.category,
-                    store_id=store_id,
-                    store_grade=store_grade,
-                    total_units=qty,
-                    db=db,
-                )
-                size_distribution_source = None
-                if size_split:
-                    historical = await load_historical_size_ratios(
-                        brand_id=brand_id,
-                        product_category=sku.category,
-                        store_id=store_id,
+            demand_tasks = []
+            store_grade_map: dict[UUID, str] = {}
+            for store in eligible_stores:
+                grade = grade_map.get((store.id, sku.category), DEFAULT_GRADE)
+                store_grade_map[store.id] = grade
+                demand_tasks.append(
+                    calculate_store_demand_details(
                         db=db,
+                        brand_id=brand_id,
+                        sku=sku,
+                        store=store,
+                        season_weeks_remaining=season_weeks_remaining,
+                        fallback_grade=grade,
+                        sales_by_store_category=sales_by_store_category,
+                        grade_ros_averages=grade_ros_averages,
+                        min_presentation_qty=min_presentation_qty,
+                        previous_season_id=previous_season_id,
                     )
-                    size_distribution_source = "historical" if historical else "size_guide"
-                reasoning = await self.generate_reasoning(
-                    store_id=store_id,
-                    sku=sku,
-                    qty=qty,
-                    store_scores=scores,
-                    ros_data=ros_data,
-                    db=db,
                 )
-                confidence = self.calculate_confidence(
-                    score_data=scores[store_id],
-                    brand_settings=brand_settings,
-                )
+
+            demand_signals = await asyncio.gather(*demand_tasks)
+            store_demands: dict[UUID, int] = {}
+            demand_signal_map: dict[UUID, DemandSignal] = {}
+            for store, signal in zip(eligible_stores, demand_signals):
+                store_demands[store.id] = signal.demand
+                demand_signal_map[store.id] = signal
+
+            total_raw_demand = sum(store_demands.values())
+            scale_factor = (
+                float(available_units) / float(total_raw_demand)
+                if total_raw_demand > available_units and total_raw_demand > 0
+                else 1.0
+            )
+            final_allocations = apply_inventory_cap(
+                store_demands=store_demands,
+                available_qty=available_units,
+                min_presentation_qty=min_presentation_qty,
+                store_grades=store_grade_map,
+            )
+
+            size_distribution_sources: dict[UUID, str] = {}
+
+            for store in eligible_stores:
+                store_id = store.id
+                raw_demand = store_demands.get(store_id, 0)
+                final_qty = final_allocations.get(store_id, 0)
+                signal = demand_signal_map[store_id]
+
+                size_split: dict[str, int] = {}
+                size_distribution_source = "size_guide"
+                if final_qty > 0:
+                    try:
+                        size_split = await calculate_size_distribution(
+                            db=db,
+                            brand_id=brand_id,
+                            sku=sku,
+                            store=store,
+                            total_qty=final_qty,
+                            store_grade=store_grade_map.get(store_id, DEFAULT_GRADE),
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "Size curve failed for sku=%s store=%s",
+                            sku.sku_code,
+                            store.store_code,
+                            exc_info=True,
+                        )
+                        size_split = {}
+
+                    if size_split:
+                        non_zero_sizes = [qty for qty in size_split.values() if qty > 0]
+                        if len(non_zero_sizes) > 1:
+                            size_distribution_source = "historical"
+
+                size_distribution_sources[store_id] = size_distribution_source
+                confidence = self._confidence_from_ros_source(signal.ros_source)
                 projections = {
-                    "weeks_cover": reasoning["weeks_cover_at_recommended"],
-                    "projected_sellthrough": min(
-                        1.0,
-                        reasoning["weeks_cover_at_recommended"]
-                        / max(reasoning["season_weeks_remaining"], 1),
-                    ),
+                    "weekly_ros": round(signal.weekly_ros, 4),
+                    "ros_source": signal.ros_source,
+                    "season_weeks_remaining": season_weeks_remaining,
+                    "raw_demand": raw_demand,
+                    "scale_factor": round(scale_factor, 6),
+                    "grade": signal.grade,
+                    "grade_multiplier": signal.grade_multiplier,
+                    "size_split": size_split,
+                    "size_distribution_source": size_distribution_source,
                 }
-                if size_split:
-                    projections["size_split"] = size_split
-                    projections["size_distribution_source"] = size_distribution_source
-                allocation_lines.append(
-                    AllocationLine(
+                reasoning = {
+                    "demand_source": signal.ros_source,
+                    "store_grade": signal.grade,
+                    "season_weeks_remaining": season_weeks_remaining,
+                    "raw_demand": raw_demand,
+                    "final_qty": final_qty,
+                }
+
+                existing_line = existing_line_map.get((store_id, sku.id))
+                if existing_line is None:
+                    existing_line = AllocationLine(
                         session_id=session.id,
                         brand_id=brand_id,
                         store_id=store_id,
                         sku_id=sku.id,
-                        ai_recommended_qty=qty,
-                        ai_confidence=confidence,
                         ai_reasoning=reasoning,
-                        ai_projections=projections,
                     )
-                )
-                total_units += qty
+                    db.add(existing_line)
+                    existing_line_map[(store_id, sku.id)] = existing_line
+                else:
+                    existing_line.ai_reasoning = reasoning
 
+                existing_line.ai_recommended_qty = raw_demand
+                existing_line.final_qty = final_qty
+                existing_line.ai_confidence = confidence
+                existing_line.ai_projections = projections
+
+            touched_store_ids = {store.id for store in eligible_stores}
+            stale_lines = existing_lines_by_sku.get(sku.id, [])
+            for stale_line in stale_lines:
+                if stale_line.store_id in touched_store_ids:
+                    continue
+                stale_line.ai_recommended_qty = 0
+                stale_line.final_qty = 0
+                stale_line.ai_confidence = "LOW"
+                stale_line.ai_reasoning = {
+                    "demand_source": "not_eligible",
+                    "store_grade": grade_map.get((stale_line.store_id, sku.category), DEFAULT_GRADE),
+                    "season_weeks_remaining": season_weeks_remaining,
+                    "raw_demand": 0,
+                    "final_qty": 0,
+                }
+                stale_line.ai_projections = {
+                    "weekly_ros": 0.0,
+                    "ros_source": "minimum_presentation",
+                    "season_weeks_remaining": season_weeks_remaining,
+                    "raw_demand": 0,
+                    "scale_factor": 1.0,
+                    "grade": grade_map.get((stale_line.store_id, sku.category), DEFAULT_GRADE),
+                    "grade_multiplier": 1.0,
+                    "size_split": {},
+                    "size_distribution_source": size_distribution_sources.get(stale_line.store_id, "size_guide"),
+                }
+
+            sku_total_allocated = sum(final_allocations.values())
+            if sku_total_allocated != available_units:
+                logger.warning(
+                    "SKU cap mismatch for sku=%s: allocated=%d available=%d",
+                    sku.sku_code,
+                    sku_total_allocated,
+                    available_units,
+                )
+
+            total_units += sku_total_allocated
+
+            processed += 1
+            if processed % 100 == 0:
+                logger.info("Allocation progress: %d / %d GRN lines processed", processed, len(grn_lines))
+
+        logger.info(
+            "Allocation complete: %d total units across %d stores",
+            total_units,
+            len(stores),
+        )
         session.total_skus = len(grn_lines)
         session.total_units_recommended = total_units
         session.status = AllocationStatus.UNDER_REVIEW
-        db.add_all(allocation_lines)
         await db.flush()
         return session
+
+    def _filter_stores_for_group_rule(
+        self,
+        stores: list[Store],
+        grade_map: dict[tuple[UUID, str], str],
+        product_category: str,
+        rule: str | None,
+    ) -> list[Store]:
+        normalized_rule = (rule or "All Stores").strip().upper()
+        if normalized_rule in {"ALL STORES", "ALL"}:
+            return stores
+
+        if normalized_rule in {"A+ ONLY", "A+_ONLY"}:
+            allowed = {"A+"}
+        elif normalized_rule in {"A+ & A", "A+_A", "A+ AND A"}:
+            allowed = {"A+", "A"}
+        elif normalized_rule in {"A+, A & B", "A+_A_B", "A+, A AND B"}:
+            allowed = {"A+", "A", "B"}
+        else:
+            return stores
+
+        return [
+            store
+            for store in stores
+            if grade_map.get((store.id, product_category), DEFAULT_GRADE) in allowed
+        ]
+
+    def _confidence_from_ros_source(self, source: str) -> str:
+        if source == "store_historical":
+            return "HIGH"
+        if source == "grade_average":
+            return "MEDIUM"
+        return "LOW"
 
     async def _load_latest_inventory(
         self,
@@ -280,6 +490,23 @@ class AllocationEngine:
                 merged[key] = value
         return merged
 
+    async def _load_all_grades(self, brand_id: UUID, db: AsyncSession) -> dict[tuple[UUID, str, str | None], str]:
+        """Batch-load every StoreProductGrade row into a dict for O(1) lookups."""
+        if not hasattr(self, "_grade_cache") or self._grade_cache is None:
+            result = await db.execute(
+                select(
+                    StoreProductGrade.store_id,
+                    StoreProductGrade.product_category,
+                    StoreProductGrade.price_band,
+                    StoreProductGrade.grade,
+                ).where(StoreProductGrade.brand_id == brand_id)
+            )
+            cache: dict[tuple[UUID, str, str | None], str] = {}
+            for store_id, product_category, price_band, grade in result.all():
+                cache[(store_id, product_category, price_band)] = grade
+            self._grade_cache = cache
+        return self._grade_cache
+
     async def get_store_grade_for_sku(
         self,
         store_id: UUID,
@@ -288,29 +515,19 @@ class AllocationEngine:
         brand_id: UUID,
         db: AsyncSession,
     ) -> str:
-        exact = await db.scalar(
-            select(StoreProductGrade.grade).where(
-                StoreProductGrade.brand_id == brand_id,
-                StoreProductGrade.store_id == store_id,
-                StoreProductGrade.product_category == product_category,
-                StoreProductGrade.price_band == price_band,
-            )
-        )
+        grades = await self._load_all_grades(brand_id, db)
+
+        # exact match: store + product + price_band
+        exact = grades.get((store_id, product_category, price_band))
         if exact:
             return exact
 
-        product_level = await db.scalar(
-            select(StoreProductGrade.grade).where(
-                StoreProductGrade.brand_id == brand_id,
-                StoreProductGrade.store_id == store_id,
-                StoreProductGrade.product_category == product_category,
-                StoreProductGrade.price_band.is_(None),
-            )
-        )
+        # fallback: store + product, no price_band
+        product_level = grades.get((store_id, product_category, None))
         if product_level:
             return product_level
 
-        logger.warning(
+        logger.debug(
             "No grade found for store=%s product=%s price_band=%s brand=%s. Defaulting to %s.",
             store_id,
             product_category,

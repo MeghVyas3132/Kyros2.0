@@ -1,4 +1,5 @@
 import logging
+import os
 import subprocess
 import sys
 from time import perf_counter
@@ -8,12 +9,17 @@ from app.tasks.celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 
-def _run_upload_subprocess(upload_id: str) -> dict:
+def _run_upload_subprocess(upload_id: str, task_id: str | None = None) -> dict:
+    env = os.environ.copy()
+    if task_id:
+        env["UPLOAD_TASK_ID"] = task_id
+
     completed = subprocess.run(
         [sys.executable, "-m", "app.tasks.upload_runner", upload_id],
         check=True,
         capture_output=True,
         text=True,
+        env=env,
     )
     return {"upload_id": upload_id, "runner_output": completed.stdout.strip()}
 
@@ -41,7 +47,7 @@ def process_upload_task(upload_id: str, brand_id: str | None = None) -> dict:
     logger.info("upload_job_started", extra={"upload_id": upload_id})
 
     try:
-        result = _run_upload_subprocess(upload_id)
+        result = _run_upload_subprocess(upload_id, task_id=process_upload_task.request.id)
         logger.info(
             "upload_job_completed",
             extra={"duration_seconds": round(perf_counter() - start, 3), **result},

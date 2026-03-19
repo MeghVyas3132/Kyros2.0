@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 from uuid import UUID
 
@@ -14,7 +15,7 @@ async def run_upload(upload_id: str) -> dict:
         if upload is None:
             raise ValueError(f"Upload {upload_id} not found")
 
-        await process_upload(db, upload)
+        await process_upload(db, upload, task_id=os.getenv("UPLOAD_TASK_ID"))
         await db.commit()
         return {
             "upload_id": str(upload.id),

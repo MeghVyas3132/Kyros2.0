@@ -162,24 +162,109 @@ async def generate_allocation(
     if grn is None or grn.brand_id != current_user.brand_id:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "GRN not found"})
 
-    session = await engine.generate(payload.grn_id, current_user.brand_id, db)
+    # Check for existing session
+    existing = await db.scalar(
+        select(AllocationSession).where(
+            AllocationSession.grn_id == payload.grn_id,
+            AllocationSession.brand_id == current_user.brand_id,
+        )
+    )
+    if existing is not None:
+        if existing.status == AllocationStatus.GENERATING:
+            return envelope(existing)  # already running
+        if existing.status == AllocationStatus.APPROVED:
+            return envelope(existing)  # already approved
+
+    # Create/reuse session with GENERATING status
+    if existing is None:
+        session = AllocationSession(
+            brand_id=current_user.brand_id,
+            grn_id=payload.grn_id,
+            season_id=grn.season_id,
+            status=AllocationStatus.GENERATING,
+            generated_at=utcnow(),
+            total_stores=0,
+        )
+        db.add(session)
+    else:
+        session = existing
+        session.status = AllocationStatus.GENERATING
+        session.generated_at = utcnow()
     await db.commit()
     await db.refresh(session)
+
+    # Dispatch to Celery worker
+    from app.tasks.allocation import run_allocation_task
+    try:
+        run_allocation_task.apply_async(
+            args=[str(session.id), str(payload.grn_id), str(current_user.brand_id)],
+        )
+    except Exception:
+        # Celery unavailable — fall back to synchronous (blocks, but works)
+        import logging
+        logging.getLogger(__name__).warning("Celery unavailable, running allocation synchronously")
+        await engine.generate(payload.grn_id, current_user.brand_id, db)
+        await db.commit()
+        await db.refresh(session)
+
     return envelope(session)
 
 
-@router.get("/sessions/{session_id}")
-async def get_session(
-    session_id: UUID,
+@router.get("/sessions")
+async def list_sessions(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    session = await db.get(AllocationSession, session_id)
-    if session is None or session.brand_id != current_user.brand_id:
-        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Session not found"})
-
-    lines = await _load_session_lines(session_id, current_user.brand_id, db)
-    return envelope({"session": session, "lines": lines})
+    """List all allocation sessions for the current brand"""
+    from sqlalchemy import desc
+    
+    sessions = (
+        await db.execute(
+            select(AllocationSession)
+            .where(AllocationSession.brand_id == current_user.brand_id)
+            .order_by(desc(AllocationSession.generated_at), desc(AllocationSession.created_at))
+        )
+    ).scalars().all()
+    
+    # Enrich sessions with GRN data
+    result = []
+    for session in sessions:
+        try:
+            grn = await db.get(GRN, session.grn_id)
+            session_data = {
+                "id": str(session.id),
+                "grn_id": str(session.grn_id),
+                "brand_id": str(session.brand_id),
+                "season_id": str(session.season_id) if session.season_id else None,
+                "status": session.status.value if session.status else None,
+                "total_stores": session.total_stores,
+                "generated_at": session.generated_at.isoformat() if session.generated_at else None,
+                "created_at": session.created_at.isoformat() if session.created_at else None,
+                "grn": {
+                    "grn_code": grn.grn_code,
+                    "total_units": grn.total_units,
+                    "total_skus": grn.total_skus,
+                } if grn else None,
+            }
+            result.append(session_data)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to enrich session {session.id}: {str(e)}")
+            # Still include the session even if GRN enrichment fails
+            session_data = {
+                "id": str(session.id),
+                "grn_id": str(session.grn_id),
+                "brand_id": str(session.brand_id),
+                "season_id": str(session.season_id) if session.season_id else None,
+                "status": session.status.value if session.status else None,
+                "total_stores": session.total_stores,
+                "generated_at": session.generated_at.isoformat() if session.generated_at else None,
+                "created_at": session.created_at.isoformat() if session.created_at else None,
+                "grn": None,
+            }
+            result.append(session_data)
+    
+    return envelope(result)
 
 
 @router.get("/sessions/by-grn/{grn_id}")
@@ -199,6 +284,20 @@ async def get_session_by_grn(
     if session is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Session not found"})
     return envelope(session)
+
+
+@router.get("/sessions/{session_id}")
+async def get_session(
+    session_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    session = await db.get(AllocationSession, session_id)
+    if session is None or session.brand_id != current_user.brand_id:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Session not found"})
+
+    lines = await _load_session_lines(session_id, current_user.brand_id, db)
+    return envelope({"session": session, "lines": lines})
 
 
 @router.put("/lines/{line_id}")

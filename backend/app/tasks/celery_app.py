@@ -14,6 +14,7 @@ celery_app = Celery(
         "app.tasks.performance_snapshot",
         "app.tasks.alert_generation",
         "app.tasks.uploads",
+        "app.tasks.allocation",
     ],
 )
 

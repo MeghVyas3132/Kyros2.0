@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     app_name: str = "Kyros API"
     app_env: str = "development"
     log_level: str = "INFO"
-    cors_origins: str = "http://localhost:3000"
+    cors_origins: str = Field(default="http://localhost:3000", alias="CORS_ORIGINS")
 
     database_url: str = Field(
         default="postgresql+asyncpg://kyros:kyros_dev_password@localhost:5432/kyros_dev",
