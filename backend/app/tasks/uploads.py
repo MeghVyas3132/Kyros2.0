@@ -41,8 +41,17 @@ async def process_upload_with_fallback(upload_id: str, brand_id: str) -> dict:
         return {"mode": "sync", "task_id": None}
 
 
-@celery_app.task(name="app.tasks.uploads.process_upload")
-def process_upload_task(upload_id: str, brand_id: str | None = None) -> dict:
+@celery_app.task(
+    name="app.tasks.uploads.process_upload",
+    bind=True,
+    max_retries=3,
+    default_retry_delay=10,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    soft_time_limit=900,
+    time_limit=1080,
+)
+def process_upload_task(self, upload_id: str, brand_id: str | None = None) -> dict:
     start = perf_counter()
     logger.info("upload_job_started", extra={"upload_id": upload_id})
 

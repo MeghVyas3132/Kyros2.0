@@ -28,6 +28,7 @@ from app.schemas.allocation import (
     AllocationSimulateRequest,
 )
 from app.services.allocation.engine import AllocationEngine
+from app.services.allocation.explainer import normalize_projections, normalize_reasoning
 from app.services.allocation.simulator import simulate_quantity
 from app.services.allocation.story_concentration import compute_story_concentration
 from app.utils.date_utils import utcnow
@@ -117,8 +118,8 @@ async def _load_session_lines(
             "sku_id": line.sku_id,
             "ai_recommended_qty": line.ai_recommended_qty,
             "ai_confidence": line.ai_confidence,
-            "ai_reasoning": line.ai_reasoning,
-            "ai_projections": line.ai_projections,
+            "ai_reasoning": normalize_reasoning(line.ai_reasoning),
+            "ai_projections": normalize_projections(line.ai_projections),
             "final_qty": line.final_qty,
             "was_overridden": line.was_overridden,
             "override_reason": line.override_reason,
@@ -182,6 +183,7 @@ async def generate_allocation(
             grn_id=payload.grn_id,
             season_id=grn.season_id,
             status=AllocationStatus.GENERATING,
+            failure_reason=None,
             generated_at=utcnow(),
             total_stores=0,
         )
@@ -189,6 +191,7 @@ async def generate_allocation(
     else:
         session = existing
         session.status = AllocationStatus.GENERATING
+        session.failure_reason = None
         session.generated_at = utcnow()
     await db.commit()
     await db.refresh(session)
@@ -238,6 +241,7 @@ async def list_sessions(
                 "season_id": str(session.season_id) if session.season_id else None,
                 "status": session.status.value if session.status else None,
                 "total_stores": session.total_stores,
+                "failure_reason": session.failure_reason,
                 "generated_at": session.generated_at.isoformat() if session.generated_at else None,
                 "created_at": session.created_at.isoformat() if session.created_at else None,
                 "grn": {
@@ -258,6 +262,7 @@ async def list_sessions(
                 "season_id": str(session.season_id) if session.season_id else None,
                 "status": session.status.value if session.status else None,
                 "total_stores": session.total_stores,
+                "failure_reason": session.failure_reason,
                 "generated_at": session.generated_at.isoformat() if session.generated_at else None,
                 "created_at": session.created_at.isoformat() if session.created_at else None,
                 "grn": None,

@@ -13,6 +13,7 @@ from app.models.season import Season, SeasonOTB, SeasonStatus
 from app.models.size_guide import SizeGuide
 from app.models.sku import SKU, StyleStoreList
 from app.models.store import Store, StoreDisplayCapacity, StoreProductGrade
+from app.models.store_profile import StoreBehaviorProfile
 from app.models.upload import Upload, UploadStatus, UploadType
 from app.models.user import User, UserRole
 
@@ -42,6 +43,7 @@ __all__ = [
     "Store",
     "StoreDisplayCapacity",
     "StoreProductGrade",
+    "StoreBehaviorProfile",
     "StyleStoreList",
     "Upload",
     "UploadStatus",

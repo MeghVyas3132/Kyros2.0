@@ -29,6 +29,94 @@ class DemandSignal:
     ros_source: str
     grade: str
     grade_multiplier: float
+    is_corrected: bool = False
+    stockout_week: int | None = None
+    lost_sales_estimate: float | None = None
+    data_sample_size: int = 0
+    cluster_store_count: int = 0
+    matched_style_code: str | None = None
+    similarity_score: float | None = None
+
+
+def _infer_stockout_week(sales_by_week: list[int]) -> int | None:
+    n = len(sales_by_week)
+    if n < 6:
+        return None
+
+    for idx in range(2, n - 2):
+        if all(sales_by_week[j] == 0 for j in range(idx, min(idx + 3, n))):
+            preceding = sales_by_week[max(0, idx - 3) : idx]
+            if preceding and sum(preceding) > 0 and preceding[-1] > 0:
+                return idx - 1
+    return None
+
+
+async def _calculate_stockout_correction(
+    db: AsyncSession,
+    brand_id: UUID,
+    store_id: UUID,
+    category: str,
+    season_id: UUID | None,
+) -> tuple[float | None, int | None, float | None, int]:
+    date_range = await _season_date_range(db, brand_id, season_id)
+    if date_range is None:
+        return None, None, None, 0
+
+    start_date, end_date = date_range
+    rows = (
+        await db.execute(
+            select(
+                SalesData.week_start_date,
+                func.coalesce(func.sum(SalesData.units_sold), 0).label("units"),
+                func.bool_and(SalesData.was_in_stock).label("all_in_stock"),
+            )
+            .join(SKU, SKU.id == SalesData.sku_id)
+            .where(
+                SalesData.brand_id == brand_id,
+                SalesData.store_id == store_id,
+                SKU.category == category,
+                SalesData.week_start_date >= start_date,
+                SalesData.week_start_date <= end_date,
+            )
+            .group_by(SalesData.week_start_date)
+            .order_by(SalesData.week_start_date)
+        )
+    ).all()
+
+    if not rows:
+        return None, None, None, 0
+
+    sales_by_week = [int(row.units or 0) for row in rows]
+    total_weeks = len(sales_by_week)
+    total_sold = float(sum(sales_by_week))
+
+    stockout_week: int | None = None
+    if all(row.all_in_stock is not None for row in rows):
+        for idx, row in enumerate(rows):
+            if bool(row.all_in_stock):
+                continue
+            if idx < total_weeks - 1:
+                tail = sales_by_week[idx + 1 :]
+                if sum(tail) == 0:
+                    stockout_week = idx
+                    break
+
+    if stockout_week is None:
+        stockout_week = _infer_stockout_week(sales_by_week)
+
+    if stockout_week is None or stockout_week <= 1:
+        return (total_sold / total_weeks) if total_weeks else None, None, None, total_weeks
+
+    weeks_with_stock = stockout_week + 1
+    sales_with_stock = float(sum(sales_by_week[:weeks_with_stock]))
+    if weeks_with_stock <= 0 or sales_with_stock <= 0:
+        return (total_sold / total_weeks) if total_weeks else None, None, None, total_weeks
+
+    ros_selling_period = sales_with_stock / weeks_with_stock
+    estimated_full_season = ros_selling_period * total_weeks
+    corrected_ros = estimated_full_season / total_weeks if total_weeks else None
+    lost_sales_estimate = max(0.0, estimated_full_season - total_sold)
+    return corrected_ros, stockout_week, round(lost_sales_estimate, 1), total_weeks
 
 
 async def load_sales_history(
@@ -207,9 +295,25 @@ async def calculate_store_demand_details(
             season_id=previous_season_id,
         )
 
+    sample_size = 0
+    is_corrected = False
+    stockout_week: int | None = None
+    lost_sales_estimate: float | None = None
+    cluster_store_count = 0
+
     if store_ros is not None and float(store_ros) > 0:
         source = "store_historical"
         base_ros = float(store_ros)
+        corrected_ros, stockout_week, lost_sales_estimate, sample_size = await _calculate_stockout_correction(
+            db=db,
+            brand_id=brand_id,
+            store_id=store.id,
+            category=category,
+            season_id=previous_season_id,
+        )
+        if corrected_ros is not None and corrected_ros > base_ros:
+            base_ros = corrected_ros
+            is_corrected = True
     else:
         grade_ros = None
         if grade_ros_averages is not None:
@@ -233,6 +337,7 @@ async def calculate_store_demand_details(
                 ros_source="minimum_presentation",
                 grade=grade,
                 grade_multiplier=GRADE_MULTIPLIERS.get(grade, 1.00),
+                data_sample_size=0,
             )
 
     multiplier = GRADE_MULTIPLIERS.get(grade, 1.00)
@@ -246,6 +351,11 @@ async def calculate_store_demand_details(
         ros_source=source,
         grade=grade,
         grade_multiplier=multiplier,
+        is_corrected=is_corrected,
+        stockout_week=stockout_week,
+        lost_sales_estimate=lost_sales_estimate,
+        data_sample_size=sample_size,
+        cluster_store_count=cluster_store_count,
     )
 
 

@@ -83,22 +83,8 @@ export interface AllocationLine {
   sku_id: string;
   ai_recommended_qty: number;
   ai_confidence: "HIGH" | "MEDIUM" | "LOW" | null;
-  ai_reasoning: {
-    store_grade: string;
-    store_ros_attribute: number;
-    cluster_avg_ros_attribute: number;
-    ros_vs_cluster_pct: number;
-    current_stock_cover_days: number;
-    display_capacity_available: number;
-    season_weeks_remaining: number;
-    weeks_cover_at_recommended: number;
-    weeks_cover_at_minus_25pct: number;
-    weeks_cover_at_plus_25pct: number;
-    stockout_risk_at_lower_qty: boolean;
-    climate_match: boolean;
-    data_sample_size: number;
-    confidence_basis: string;
-  };
+  ai_reasoning: AIReasoning;
+  ai_projections?: AIProjections | null;
   final_qty: number | null;
   was_overridden: boolean;
   override_reason: string | null;
@@ -133,15 +119,66 @@ export interface AllocationLine {
   }> | null;
 }
 
+export interface AIReasoning {
+  weekly_ros?: number;
+  store_grade: string;
+  store_ros_attribute: number | string;
+  cluster_avg_ros_attribute: number | string;
+  ros_vs_cluster_pct: number;
+  ros_source?: string;
+  is_stockout_corrected?: boolean;
+  stockout_correction_applied?: boolean;
+  stockout_week?: number | null;
+  lost_sales_estimate?: number | null;
+  cover_target_weeks?: number;
+  current_stock_cover_days: number;
+  display_capacity_available: number | null;
+  season_weeks_remaining: number;
+  raw_demand_units?: number;
+  scale_factor?: number;
+  grade_multiplier?: number;
+  weeks_cover_at_recommended: number;
+  weeks_cover_minus_25?: number;
+  weeks_cover_plus_25?: number;
+  weeks_cover_at_minus_25pct: number;
+  weeks_cover_at_plus_25pct: number;
+  stockout_risk_at_lower_qty: boolean;
+  climate_match: boolean;
+  data_sample_size: number;
+  confidence_basis: string;
+  category_affinity?: string | null;
+  fabric_affinity?: string | null;
+  affinity_adjustment_units?: number | null;
+  cannibalization_factor?: number | null;
+  cannibalization_reason?: string | null;
+  colourways_in_story_at_store?: number | null;
+  size_split?: Record<string, number>;
+  size_distribution_source?: string;
+  size_distribution_season?: string | null;
+  narrative_demand?: string;
+  narrative_adjustments?: string;
+  narrative_cap?: string;
+  style_dna_match?: number | null;
+}
+
+export interface AIProjections {
+  size_split: Record<string, number>;
+  size_distribution_source: string;
+  cap_scale_factor: number;
+  total_demand_before_cap: number;
+  available_qty: number;
+}
+
 export interface AllocationSession {
   id: string;
   brand_id: string;
   grn_id: string;
-  status: "DRAFT" | "GENERATING" | "UNDER_REVIEW" | "APPROVED" | "DISPATCHED" | "CANCELLED";
+  status: "DRAFT" | "GENERATING" | "FAILED" | "UNDER_REVIEW" | "APPROVED" | "DISPATCHED" | "CANCELLED";
   total_stores: number;
   total_skus: number;
   total_units_recommended: number;
   total_units_approved: number;
+  failure_reason?: string | null;
   approved_by: string | null;
   approved_at: string | null;
   generated_at: string | null;

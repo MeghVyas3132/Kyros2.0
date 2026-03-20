@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import hashlib
 import os
 from pathlib import Path
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 import pandas as pd
 import redis.asyncio as redis
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,6 +45,7 @@ from app.models import (
     Upload,
     UploadStatus,
 )
+from app.services.allocation.store_profile import refresh_store_profiles
 from app.config import get_settings
 from app.services.ingestion.bulk import execute_with_batching
 from app.services.ingestion.lookup import build_lookup_maps, normalize_key
@@ -62,6 +63,14 @@ settings = get_settings()
 ERROR_DIR = Path(settings.local_storage_path) / "errors"
 ERROR_DIR.mkdir(parents=True, exist_ok=True)
 UPSERT_BATCH_SIZE = 1000
+SYNTHETIC_SALES_WEEKS = 8
+
+
+class IngestionRowError(ValueError):
+    def __init__(self, row_index: int, field: str, message: str) -> None:
+        self.row_index = row_index
+        self.field = field
+        super().__init__(f"Row {row_index} [{field}]: {message}")
 
 ProgressReporter = Callable[[str, int, int, str], Awaitable[None]]
 
@@ -383,13 +392,22 @@ async def _upsert_sales(
 ) -> tuple[int, dict[str, int]]:
     _require_columns(df, ["store_code", "sku_code", "units_sold"], "SS25 SALES HISTORY")
 
+    await db.execute(
+        delete(SalesData).where(
+            SalesData.brand_id == brand_id,
+            SalesData.upload_id == upload_id,
+        )
+    )
+
     store_map, store_name_map, sku_map = await build_lookup_maps(db, brand_id)
-    default_week_start = utcnow().date()
     aggregated_rows: dict[tuple[UUID, UUID, date], dict] = {}
+    synthetic_week_starts = _generate_synthetic_week_starts(SYNTHETIC_SALES_WEEKS)
 
     skipped_store_rows = 0
     skipped_sku_rows = 0
     zero_qty_rows = 0
+    synthetic_weeking_rows = 0
+    used_synthetic_weeking = False
 
     await progress("sales", 0, len(df), "Preparing sales records...")
     for idx, row in enumerate(df.to_dict(orient="records"), start=1):
@@ -410,42 +428,54 @@ async def _upsert_sales(
             zero_qty_rows += 1
             continue
 
-        week_value = row.get("week_start_date")
-        parsed_week = pd.to_datetime(week_value, errors="coerce")
-        week_start_date = parsed_week.date() if not pd.isna(parsed_week) else default_week_start
-
-        key = (store_id, sku_id, week_start_date)
-        if key not in aggregated_rows:
-            aggregated_rows[key] = {
-                "brand_id": brand_id,
-                "upload_id": upload_id,
-                "store_id": store_id,
-                "sku_id": sku_id,
-                "week_start_date": week_start_date,
-                "units_sold": 0,
-                "revenue": 0.0,
-                "_has_revenue": False,
-                "was_on_promotion": False,
-                "was_in_stock": True,
-            }
-
-        record = aggregated_rows[key]
-        record["units_sold"] += units_sold
-
         revenue_raw = row.get("revenue")
+        parsed_revenue: float | None = None
         if revenue_raw is not None and not pd.isna(revenue_raw):
             try:
-                record["revenue"] += float(revenue_raw)
-                record["_has_revenue"] = True
+                parsed_revenue = float(revenue_raw)
             except (TypeError, ValueError):
                 pass
 
-        record["was_on_promotion"] = record["was_on_promotion"] or _normalise_bool(
-            row.get("was_on_promotion"), False
-        )
-        record["was_in_stock"] = record["was_in_stock"] and _normalise_bool(
-            row.get("was_in_stock"), True
-        )
+        was_on_promotion = _normalise_bool(row.get("was_on_promotion"), False)
+        was_in_stock = _normalise_bool(row.get("was_in_stock"), True)
+
+        parsed_week = _try_parse_week_start_date(row.get("week_start_date"))
+        if parsed_week is not None:
+            targets = {parsed_week: units_sold}
+        else:
+            used_synthetic_weeking = True
+            synthetic_weeking_rows += 1
+            targets = _spread_units_across_weeks(units_sold, synthetic_week_starts)
+
+        for week_start_date, split_units in targets.items():
+            if split_units <= 0:
+                continue
+
+            key = (store_id, sku_id, week_start_date)
+            if key not in aggregated_rows:
+                aggregated_rows[key] = {
+                    "brand_id": brand_id,
+                    "upload_id": upload_id,
+                    "store_id": store_id,
+                    "sku_id": sku_id,
+                    "week_start_date": week_start_date,
+                    "units_sold": 0,
+                    "revenue": 0.0,
+                    "_has_revenue": False,
+                    "was_on_promotion": False,
+                    "was_in_stock": True,
+                }
+
+            record = aggregated_rows[key]
+            record["units_sold"] += split_units
+
+            if parsed_revenue is not None and units_sold > 0:
+                revenue_share = parsed_revenue * (split_units / units_sold)
+                record["revenue"] += revenue_share
+                record["_has_revenue"] = True
+
+            record["was_on_promotion"] = record["was_on_promotion"] or was_on_promotion
+            record["was_in_stock"] = record["was_in_stock"] and was_in_stock
 
         if idx % 10000 == 0:
             await progress("sales", idx, len(df), f"Preparing sales records: {idx:,}/{len(df):,}")
@@ -466,12 +496,20 @@ async def _upsert_sales(
             }
         )
 
+    distinct_weeks = len({row["week_start_date"] for row in rows})
+    if rows and distinct_weeks < 4 and not used_synthetic_weeking:
+        raise ValueError(
+            "Sales data appears to have collapsed into fewer than 4 weeks. "
+            "Please verify week_start_date mapping and re-upload the sales file."
+        )
+
     if not rows:
         return 0, {
             "skipped_store_rows": skipped_store_rows,
             "skipped_sku_rows": skipped_sku_rows,
             "zero_qty_rows": zero_qty_rows,
             "failed_batches_rows": 0,
+            "synthetic_weeking_rows": synthetic_weeking_rows,
         }
 
     async def _sales_progress(done: int, total: int) -> None:
@@ -504,6 +542,7 @@ async def _upsert_sales(
         "skipped_sku_rows": skipped_sku_rows,
         "zero_qty_rows": zero_qty_rows,
         "failed_batches_rows": failed_rows,
+        "synthetic_weeking_rows": synthetic_weeking_rows,
     }
 
 
@@ -820,6 +859,53 @@ def _safe_int(value: object, default: int = 0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+def _try_parse_week_start_date(raw_value: object) -> date | None:
+    if raw_value is None or str(raw_value).strip() == "":
+        return None
+
+    text = str(raw_value).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+
+    parsed = pd.to_datetime(text, errors="coerce")
+    if not pd.isna(parsed):
+        return parsed.date()
+
+    return None
+
+
+def _generate_synthetic_week_starts(week_count: int) -> list[date]:
+    count = max(week_count, 4)
+    today = utcnow().date()
+    anchor = today - timedelta(days=today.weekday())
+    starts = [anchor - timedelta(days=7 * offset) for offset in range(count - 1, -1, -1)]
+    return starts
+
+
+def _spread_units_across_weeks(units_sold: int, week_starts: list[date]) -> dict[date, int]:
+    if units_sold <= 0 or not week_starts:
+        return {}
+
+    allocation = {week: 0 for week in week_starts}
+    base = units_sold // len(week_starts)
+    remainder = units_sold % len(week_starts)
+
+    for week in week_starts:
+        allocation[week] = base
+
+    for idx in range(remainder):
+        allocation[week_starts[idx]] += 1
+
+    non_zero = {week: qty for week, qty in allocation.items() if qty > 0}
+    if non_zero:
+        return non_zero
+
+    return {week_starts[0]: units_sold}
 
 
 async def _upsert_store_grades(
@@ -1407,6 +1493,8 @@ async def process_upload(db: AsyncSession, upload: Upload, task_id: str | None =
         await _ensure_simple_mode_season(db, upload.brand_id, upload, valid_df)
         if upload.upload_type.value in {"SALES", "INVENTORY", "GRN"}:
             await _run_simple_mode_jobs(db, upload.brand_id)
+        if upload.upload_type.value == "SALES":
+            await refresh_store_profiles(upload.brand_id, db)
 
     error_report_path: str | None = None
     if all_errors:

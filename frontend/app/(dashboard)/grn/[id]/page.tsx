@@ -14,6 +14,7 @@ import { AllocationLine, AllocationSession, SimulationResult, StoryConcentration
 const FRIENDLY_STATUS: Record<string, string> = {
   DRAFT: "Draft",
   GENERATING: "Generating…",
+  FAILED: "Failed",
   UNDER_REVIEW: "Under Review",
   APPROVED: "Approved",
   DISPATCHED: "Dispatched",
@@ -285,6 +286,23 @@ export default function GRNDetailPage() {
           <div className="mx-auto mt-4 h-1.5 w-48 overflow-hidden rounded-full bg-blue-100">
             <div className="h-full w-1/3 animate-pulse rounded-full bg-blue-500" />
           </div>
+        </div>
+      ) : status === "FAILED" ? (
+        <div className="rounded-xl border border-dashed border-red-300 bg-red-50 px-6 py-16 text-center">
+          <svg className="mx-auto h-8 w-8 text-red-500" fill="currentColor" viewBox="0 0 20 20">
+            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm-1-4a1 1 0 102 0 1 1 0 00-2 0zm.293-8.707a1 1 0 011.414 0L10 5.586l.293-.293a1 1 0 111.414 1.414L11.414 7l.293.293a1 1 0 01-1.414 1.414L10 8.414l-.293.293a1 1 0 01-1.414-1.414L8.586 7l-.293-.293a1 1 0 010-1.414z" clipRule="evenodd" />
+          </svg>
+          <p className="mt-3 font-medium text-red-800">Allocation generation failed</p>
+          <p className="mt-1 text-sm text-red-700">
+            {allocation?.session?.failure_reason ?? "The worker could not complete this allocation run."}
+          </p>
+          <button
+            onClick={handleGenerate}
+            disabled={loading}
+            className="mt-4 rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+          >
+            {loading ? "Retrying..." : "Retry Allocation"}
+          </button>
         </div>
       ) : !sessionId || status === "DRAFT" ? (
         <div className="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-16 text-center">

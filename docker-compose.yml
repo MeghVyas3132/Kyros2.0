@@ -42,6 +42,7 @@ services:
   celery_worker:
     build: ./backend
     command: celery -A app.tasks.celery_app.celery_app worker --loglevel=info --pool=solo
+    restart: unless-stopped
     volumes:
       - ./backend:/app
     environment:
@@ -58,6 +59,7 @@ services:
   celery_beat:
     build: ./backend
     command: celery -A app.tasks.celery_app.celery_app beat --loglevel=info
+    restart: unless-stopped
     volumes:
       - ./backend:/app
     environment:

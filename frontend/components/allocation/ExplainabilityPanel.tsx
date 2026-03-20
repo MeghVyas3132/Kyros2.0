@@ -17,6 +17,20 @@ export function ExplainabilityPanel({ line, storyConcentration = [] }: Props) {
   }
 
   const reasoning = line.ai_reasoning;
+  const toNumber = (value: number | string | null | undefined, fallback = 0): number => {
+    if (typeof value === "number") return value;
+    if (typeof value === "string") {
+      const token = value.trim().split(" ", 1)[0].replace("%", "");
+      const parsed = Number(token);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    }
+    return fallback;
+  };
+
+  const storeRos = toNumber(reasoning.store_ros_attribute, reasoning.weekly_ros ?? 0);
+  const clusterRos = toNumber(reasoning.cluster_avg_ros_attribute, storeRos);
+  const minusCover = reasoning.weeks_cover_minus_25 ?? reasoning.weeks_cover_at_minus_25pct;
+  const plusCover = reasoning.weeks_cover_plus_25 ?? reasoning.weeks_cover_at_plus_25pct;
   const rosDelta = reasoning.ros_vs_cluster_pct >= 0 ? `+${reasoning.ros_vs_cluster_pct}` : `${reasoning.ros_vs_cluster_pct}`;
 
   return (
@@ -30,18 +44,28 @@ export function ExplainabilityPanel({ line, storyConcentration = [] }: Props) {
         <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
           <p className="font-medium text-slate-900">Demand Signal</p>
           <p className="text-slate-700">
-            ROS {reasoning.store_ros_attribute.toFixed(1)} vs cluster {reasoning.cluster_avg_ros_attribute.toFixed(1)} ({rosDelta}%)
+            ROS {storeRos.toFixed(1)} vs cluster {clusterRos.toFixed(1)} ({rosDelta}%)
           </p>
           <p className="text-slate-700">Current cover {reasoning.current_stock_cover_days.toFixed(1)} days</p>
+          {reasoning.narrative_demand ? <p className="mt-1 text-slate-600">{reasoning.narrative_demand}</p> : null}
+          {reasoning.stockout_correction_applied ? (
+            <p className="mt-1 text-amber-700">
+              Stockout-corrected ROS applied{reasoning.lost_sales_estimate != null ? ` (lost sales est. ${reasoning.lost_sales_estimate})` : ""}.
+            </p>
+          ) : null}
         </div>
 
         <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
           <p className="font-medium text-slate-900">Projection</p>
           <p className="text-slate-700">Recommended cover {reasoning.weeks_cover_at_recommended.toFixed(1)} weeks</p>
           <p className="text-slate-700">
-            Minus 25%: {reasoning.weeks_cover_at_minus_25pct.toFixed(1)} weeks · Plus 25%: {reasoning.weeks_cover_at_plus_25pct.toFixed(1)} weeks
+            Minus 25%: {minusCover.toFixed(1)} weeks · Plus 25%: {plusCover.toFixed(1)} weeks
           </p>
           <p className="text-slate-700">Season remaining {reasoning.season_weeks_remaining} weeks</p>
+          {reasoning.cover_target_weeks != null ? (
+            <p className="text-slate-700">Target cover used by model: {reasoning.cover_target_weeks} weeks</p>
+          ) : null}
+          {reasoning.narrative_adjustments ? <p className="mt-1 text-slate-600">{reasoning.narrative_adjustments}</p> : null}
         </div>
 
         <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
@@ -51,6 +75,7 @@ export function ExplainabilityPanel({ line, storyConcentration = [] }: Props) {
             Climate match: {reasoning.climate_match ? "Yes" : "No"} · Stockout risk at lower qty:{" "}
             {reasoning.stockout_risk_at_lower_qty ? "High" : "Low"}
           </p>
+          {reasoning.narrative_cap ? <p className="mt-1 text-slate-600">{reasoning.narrative_cap}</p> : null}
         </div>
 
         <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
@@ -60,6 +85,15 @@ export function ExplainabilityPanel({ line, storyConcentration = [] }: Props) {
           </p>
           <p className="text-slate-700">{reasoning.confidence_basis}</p>
         </div>
+
+        {reasoning.category_affinity || reasoning.fabric_affinity ? (
+          <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
+            <p className="font-medium text-slate-900">Store Profile</p>
+            <p className="text-slate-700">
+              Category affinity: {reasoning.category_affinity ?? "N/A"} · Fabric affinity: {reasoning.fabric_affinity ?? "N/A"}
+            </p>
+          </div>
+        ) : null}
 
         <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
           <p className="font-medium text-slate-900">Allocation Ceiling</p>

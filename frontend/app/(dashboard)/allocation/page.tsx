@@ -5,15 +5,15 @@ import Link from "next/link";
 import { apiRequest } from "@/lib/api";
 import { AllocationSession } from "@/types";
 
-type StatusFilter = "all" | "generating" | "under_review" | "approved" | "dispatched";
-
 const STATUS_CONFIG: Record<string, { label: string; color: string; bg: string }> = {
   DRAFT: { label: "Draft", color: "text-slate-600", bg: "bg-slate-100" },
   GENERATING: { label: "Generating", color: "text-blue-600", bg: "bg-blue-100" },
+  FAILED: { label: "Failed", color: "text-red-600", bg: "bg-red-100" },
   UNDER_REVIEW: { label: "Under Review", color: "text-amber-600", bg: "bg-amber-100" },
   APPROVED: { label: "Approved", color: "text-emerald-600", bg: "bg-emerald-100" },
   DISPATCHED: { label: "Dispatched", color: "text-slate-600", bg: "bg-slate-100" },
 };
+type StatusFilter = "all" | "generating" | "failed" | "under_review" | "approved" | "dispatched";
 
 interface AllocationWithGRN extends AllocationSession {
   grn?: {
@@ -162,6 +162,7 @@ export default function AllocationsPage() {
               <option value="draft">Draft</option>
               <option value="generating">Generating</option>
               <option value="under_review">Under Review</option>
+              <option value="failed">Failed</option>
               <option value="approved">Approved</option>
               <option value="dispatched">Dispatched</option>
             </select>
@@ -286,6 +287,9 @@ export default function AllocationsPage() {
                           </svg>
                         )}
                       </span>
+                      {allocation.status === "FAILED" && allocation.failure_reason ? (
+                        <p className="mt-1 max-w-sm text-xs text-red-700">{allocation.failure_reason}</p>
+                      ) : null}
                     </td>
                     <td className="px-6 py-4 text-right text-sm font-medium text-slate-900">
                       {allocation.grn?.total_units?.toLocaleString() || "—"}
@@ -297,25 +301,40 @@ export default function AllocationsPage() {
                       {formatDate(allocation.generated_at)}
                     </td>
                     <td className="px-6 py-4 text-right">
-                      <Link
-                        href={`/grn/${allocation.grn_id}`}
-                        className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 transition"
-                      >
-                        View
-                        <svg
-                          className="h-3.5 w-3.5"
-                          fill="none"
-                          viewBox="0 0 24 24"
-                          stroke="currentColor"
+                      <div className="flex items-center justify-end gap-2">
+                        {allocation.status === "FAILED" ? (
+                          <button
+                            onClick={async () => {
+                              await apiRequest("/api/v1/allocation/generate", {
+                                method: "POST",
+                                body: JSON.stringify({ grn_id: allocation.grn_id }),
+                              });
+                            }}
+                            className="inline-flex items-center gap-1.5 rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700 transition"
+                          >
+                            Retry
+                          </button>
+                        ) : null}
+                        <Link
+                          href={`/grn/${allocation.grn_id}`}
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 transition"
                         >
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth={2}
-                            d="M9 5l7 7-7 7"
-                          />
-                        </svg>
-                      </Link>
+                          View
+                          <svg
+                            className="h-3.5 w-3.5"
+                            fill="none"
+                            viewBox="0 0 24 24"
+                            stroke="currentColor"
+                          >
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth={2}
+                              d="M9 5l7 7-7 7"
+                            />
+                          </svg>
+                        </Link>
+                      </div>
                     </td>
                   </tr>
                 );

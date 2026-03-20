@@ -25,6 +25,7 @@ class AllocationSessionOut(BaseModel):
     total_skus: int
     total_units_recommended: int
     total_units_approved: int
+    failure_reason: str | None
     approved_by: UUID | None
     approved_at: datetime | None
     created_at: datetime

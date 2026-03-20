@@ -42,6 +42,7 @@ from app.services.allocation.demand import (
 )
 from app.utils.date_utils import utcnow
 from app.services.allocation.size_curve import calculate_size_distribution
+from app.services.allocation.store_profile import load_store_profile_map
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,21 @@ DEFAULT_BRAND_SETTINGS: dict = {
     "cold_start": {
         "scoring_mode": "GRADE_ONLY",
     },
+}
+
+DEFAULT_COVER_TARGETS: dict[tuple[str, str], int] = {
+    ("PROVEN", "A+"): 7,
+    ("PROVEN", "A"): 5,
+    ("PROVEN", "B"): 4,
+    ("PROVEN", "C"): 3,
+    ("CONFIDENT", "A+"): 6,
+    ("CONFIDENT", "A"): 5,
+    ("CONFIDENT", "B"): 3,
+    ("CONFIDENT", "C"): 2,
+    ("EXPERIMENTAL", "A+"): 4,
+    ("EXPERIMENTAL", "A"): 3,
+    ("EXPERIMENTAL", "B"): 2,
+    ("EXPERIMENTAL", "C"): 0,
 }
 
 
@@ -200,6 +216,8 @@ class AllocationEngine:
             load_sales_history(db=db, brand_id=brand_id, season_id=previous_season_id),
             load_grade_ros_averages(db=db, brand_id=brand_id, season_id=previous_season_id),
         )
+        brand_settings = await self._load_brand_settings(brand_id, db)
+        store_profile_map = await load_store_profile_map(brand_id, db)
 
         total_units = 0
         processed = 0
@@ -255,7 +273,16 @@ class AllocationEngine:
             store_demands: dict[UUID, int] = {}
             demand_signal_map: dict[UUID, DemandSignal] = {}
             for store, signal in zip(eligible_stores, demand_signals):
-                store_demands[store.id] = signal.demand
+                style_risk_group = (sku.style_risk_group or "PROVEN").upper()
+                grade = store_grade_map[store.id]
+                cover_target_weeks = self._cover_target_weeks(style_risk_group, grade)
+                if cover_target_weeks <= 0:
+                    store_demands[store.id] = 0
+                    demand_signal_map[store.id] = signal
+                    continue
+
+                raw_target = round(signal.weekly_ros * signal.grade_multiplier * cover_target_weeks)
+                store_demands[store.id] = int(max(raw_target, min_presentation_qty))
                 demand_signal_map[store.id] = signal
 
             total_raw_demand = sum(store_demands.values())
@@ -278,6 +305,9 @@ class AllocationEngine:
                 raw_demand = store_demands.get(store_id, 0)
                 final_qty = final_allocations.get(store_id, 0)
                 signal = demand_signal_map[store_id]
+                style_risk_group = (sku.style_risk_group or "PROVEN").upper()
+                cover_target_weeks = self._cover_target_weeks(style_risk_group, signal.grade)
+                profile = store_profile_map.get(store_id)
 
                 size_split: dict[str, int] = {}
                 size_distribution_source = "size_guide"
@@ -306,24 +336,71 @@ class AllocationEngine:
                             size_distribution_source = "historical"
 
                 size_distribution_sources[store_id] = size_distribution_source
-                confidence = self._confidence_from_ros_source(signal.ros_source)
+                confidence = self.calculate_confidence(
+                    ScoreData(
+                        score=0.0,
+                        store_ros=signal.weekly_ros,
+                        grade_score=GRADE_SCORES.get(signal.grade, GRADE_SCORES[DEFAULT_GRADE]),
+                        current_cover=0.0,
+                        sample_size=signal.data_sample_size,
+                        store_grade=signal.grade,
+                    ),
+                    brand_settings,
+                )
+
+                local_scale_factor = (final_qty / raw_demand) if raw_demand > 0 else 1.0
+                weeks_cover = (final_qty / signal.weekly_ros) if signal.weekly_ros > 0 else 0.0
+
                 projections = {
-                    "weekly_ros": round(signal.weekly_ros, 4),
-                    "ros_source": signal.ros_source,
-                    "season_weeks_remaining": season_weeks_remaining,
-                    "raw_demand": raw_demand,
-                    "scale_factor": round(scale_factor, 6),
-                    "grade": signal.grade,
-                    "grade_multiplier": signal.grade_multiplier,
                     "size_split": size_split,
                     "size_distribution_source": size_distribution_source,
+                    "cap_scale_factor": round(local_scale_factor, 4),
+                    "total_demand_before_cap": int(total_raw_demand),
+                    "available_qty": int(available_units),
                 }
                 reasoning = {
-                    "demand_source": signal.ros_source,
-                    "store_grade": signal.grade,
+                    "weekly_ros": round(signal.weekly_ros, 3),
+                    "store_ros_attribute": f"{signal.weekly_ros:.1f} units/week ({signal.ros_source})",
+                    "cluster_avg_ros_attribute": f"{signal.weekly_ros:.1f} units/week (cluster proxy)",
+                    "ros_vs_cluster_pct": 0,
+                    "ros_source": signal.ros_source,
+                    "is_stockout_corrected": signal.is_corrected,
+                    "stockout_correction_applied": signal.is_corrected,
+                    "stockout_week": signal.stockout_week,
+                    "lost_sales_estimate": signal.lost_sales_estimate,
+                    "cover_target_weeks": cover_target_weeks,
+                    "weeks_cover_at_recommended": round(weeks_cover, 1),
+                    "weeks_cover_minus_25": round(weeks_cover * 0.75, 1),
+                    "weeks_cover_plus_25": round(weeks_cover * 1.25, 1),
                     "season_weeks_remaining": season_weeks_remaining,
-                    "raw_demand": raw_demand,
-                    "final_qty": final_qty,
+                    "raw_demand_units": raw_demand,
+                    "scale_factor": round(local_scale_factor, 4),
+                    "store_grade": signal.grade,
+                    "grade_multiplier": signal.grade_multiplier,
+                    "category_affinity": profile.category_affinity if profile else None,
+                    "fabric_affinity": profile.fabric_affinity if profile else None,
+                    "affinity_adjustment_units": None,  # TODO: Phase 2
+                    "cannibalization_factor": None,  # TODO: Phase 2
+                    "cannibalization_reason": None,  # TODO: Phase 2
+                    "colourways_in_story_at_store": None,  # TODO: Phase 2
+                    "size_split": size_split,
+                    "size_distribution_source": "store_historical"
+                    if size_distribution_source == "historical"
+                    else "brand_size_guide",
+                    "size_distribution_season": None,
+                    "narrative_demand": self._build_demand_narrative(signal),
+                    "narrative_adjustments": self._build_adjustment_narrative(signal.grade, signal.grade_multiplier),
+                    "narrative_cap": self._build_cap_narrative(raw_demand, final_qty, local_scale_factor, available_units),
+                    "confidence_basis": self._build_confidence_basis(signal),
+                    "data_sample_size": profile.sample_size if profile else signal.data_sample_size,
+                    "style_dna_match": None,  # TODO: Phase 2
+                    # Backward compatible fields currently used by frontend panel.
+                    "current_stock_cover_days": round(weeks_cover * 7, 1),
+                    "display_capacity_available": None,
+                    "stockout_risk_at_lower_qty": (weeks_cover * 0.75) < max(season_weeks_remaining * 0.7, 1),
+                    "climate_match": True,
+                    "weeks_cover_at_minus_25pct": round(weeks_cover * 0.75, 1),
+                    "weeks_cover_at_plus_25pct": round(weeks_cover * 1.25, 1),
                 }
 
                 existing_line = existing_line_map.get((store_id, sku.id))
@@ -354,22 +431,52 @@ class AllocationEngine:
                 stale_line.final_qty = 0
                 stale_line.ai_confidence = "LOW"
                 stale_line.ai_reasoning = {
-                    "demand_source": "not_eligible",
-                    "store_grade": grade_map.get((stale_line.store_id, sku.category), DEFAULT_GRADE),
+                    "weekly_ros": 0.0,
+                    "store_ros_attribute": "0.0 units/week (not eligible)",
+                    "cluster_avg_ros_attribute": "0.0 units/week (cluster proxy)",
+                    "ros_vs_cluster_pct": 0,
+                    "ros_source": "minimum_presentation",
+                    "is_stockout_corrected": False,
+                    "stockout_correction_applied": False,
+                    "stockout_week": None,
+                    "lost_sales_estimate": None,
+                    "cover_target_weeks": 0,
+                    "weeks_cover_at_recommended": 0.0,
+                    "weeks_cover_minus_25": 0.0,
+                    "weeks_cover_plus_25": 0.0,
                     "season_weeks_remaining": season_weeks_remaining,
-                    "raw_demand": 0,
-                    "final_qty": 0,
+                    "raw_demand_units": 0,
+                    "scale_factor": 1.0,
+                    "store_grade": grade_map.get((stale_line.store_id, sku.category), DEFAULT_GRADE),
+                    "grade_multiplier": 1.0,
+                    "category_affinity": None,  # TODO: Phase 2
+                    "fabric_affinity": None,  # TODO: Phase 2
+                    "affinity_adjustment_units": None,  # TODO: Phase 2
+                    "cannibalization_factor": None,  # TODO: Phase 2
+                    "cannibalization_reason": None,  # TODO: Phase 2
+                    "colourways_in_story_at_store": None,  # TODO: Phase 2
+                    "size_split": {},
+                    "size_distribution_source": "brand_size_guide",
+                    "size_distribution_season": None,
+                    "narrative_demand": "This line is not eligible under current store group or constraints.",
+                    "narrative_adjustments": "No adjustments applied.",
+                    "narrative_cap": "No scaling required.",
+                    "confidence_basis": "No historical demand available for this store/style context.",
+                    "data_sample_size": 0,
+                    "style_dna_match": None,  # TODO: Phase 2
+                    "current_stock_cover_days": 0.0,
+                    "display_capacity_available": None,
+                    "stockout_risk_at_lower_qty": False,
+                    "climate_match": True,
+                    "weeks_cover_at_minus_25pct": 0.0,
+                    "weeks_cover_at_plus_25pct": 0.0,
                 }
                 stale_line.ai_projections = {
-                    "weekly_ros": 0.0,
-                    "ros_source": "minimum_presentation",
-                    "season_weeks_remaining": season_weeks_remaining,
-                    "raw_demand": 0,
-                    "scale_factor": 1.0,
-                    "grade": grade_map.get((stale_line.store_id, sku.category), DEFAULT_GRADE),
-                    "grade_multiplier": 1.0,
                     "size_split": {},
                     "size_distribution_source": size_distribution_sources.get(stale_line.store_id, "size_guide"),
+                    "cap_scale_factor": 1.0,
+                    "total_demand_before_cap": 0,
+                    "available_qty": int(available_units),
                 }
 
             sku_total_allocated = sum(final_allocations.values())
@@ -934,3 +1041,48 @@ class AllocationEngine:
         if score_data.sample_size >= 5:
             return "MEDIUM"
         return "LOW"
+
+    def _cover_target_weeks(self, style_risk_group: str, grade: str) -> int:
+        risk = (style_risk_group or "PROVEN").upper()
+        normalized_grade = grade if grade in GRADE_SCORES else DEFAULT_GRADE
+        return DEFAULT_COVER_TARGETS.get((risk, normalized_grade), DEFAULT_COVER_TARGETS[("PROVEN", normalized_grade)])
+
+    def _build_demand_narrative(self, signal: DemandSignal) -> str:
+        if signal.is_corrected:
+            return (
+                f"Demand uses stockout-corrected ROS of {signal.weekly_ros:.1f} units/week "
+                f"from {signal.ros_source} history."
+            )
+        return f"Demand uses ROS of {signal.weekly_ros:.1f} units/week from {signal.ros_source} history."
+
+    def _build_adjustment_narrative(self, grade: str, grade_multiplier: float) -> str:
+        if abs(grade_multiplier - 1.0) < 0.01:
+            return f"No grade uplift/penalty applied for grade {grade}."
+        if grade_multiplier > 1.0:
+            return f"Grade {grade} uplift applied (+{(grade_multiplier - 1) * 100:.0f}%)."
+        return f"Grade {grade} guardrail applied ({(grade_multiplier - 1) * 100:.0f}%)."
+
+    def _build_cap_narrative(
+        self,
+        raw_demand: int,
+        final_qty: int,
+        local_scale_factor: float,
+        available_units: int,
+    ) -> str:
+        if raw_demand <= 0:
+            return "No demand generated for this store under current eligibility and cover targets."
+        if final_qty == raw_demand:
+            return "No cap reduction required; recommendation fits available inventory."
+        return (
+            "Inventory cap applied: "
+            f"{raw_demand} -> {final_qty} units (scale {local_scale_factor:.2f}) "
+            f"with {available_units} units available at style level."
+        )
+
+    def _build_confidence_basis(self, signal: DemandSignal) -> str:
+        if signal.data_sample_size <= 0:
+            return "Based on fallback demand source due to limited historical observations."
+        return (
+            f"Based on {signal.data_sample_size} historical observations from "
+            f"{signal.ros_source} demand source."
+        )
