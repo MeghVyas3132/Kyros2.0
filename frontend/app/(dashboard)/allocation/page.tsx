@@ -299,6 +299,18 @@ export default function AllocationsPage() {
                             Retry
                           </button>
                         ) : null}
+                        {["UNDER_REVIEW", "APPROVED", "DISPATCHED"].includes(allocation.status || "") ? (
+                          <a
+                            href={`http://localhost:8000/api/v1/allocation/sessions/${allocation.id}/export`}
+                            download={`allocation-${allocation.grn?.grn_code || allocation.id}.csv`}
+                            className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 transition"
+                          >
+                            <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                            </svg>
+                            Download CSV
+                          </a>
+                        ) : null}
                         <Link
                           href={`/grn/${allocation.grn_id}`}
                           className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 transition"
