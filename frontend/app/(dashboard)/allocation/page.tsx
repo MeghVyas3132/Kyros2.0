@@ -31,50 +31,39 @@ export default function AllocationsPage() {
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
 
+  // Load allocations on mount and poll every 5 seconds
   useEffect(() => {
-    const loadAllocations = async () => {
+    let mounted = true;
+
+    const fetchAllocations = async () => {
       try {
-        setLoading(true);
         setError(null);
-        console.log("Fetching allocations from /api/v1/allocation/sessions");
-        
-        // Create abort controller with 10 second timeout
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000);
-        
         const response = await apiRequest<AllocationWithGRN[]>("/api/v1/allocation/sessions", {
           method: "GET",
-          signal: controller.signal,
         });
-        
-        clearTimeout(timeoutId);
-        console.log("Allocations response:", response);
-        setAllocations(Array.isArray(response) ? response : []);
-      } catch (error) {
-        if (error instanceof Error) {
-          if (error.name === 'AbortError') {
-            const errorMessage = "Request timeout - backend may be slow";
-            console.error(errorMessage);
-            setError(errorMessage);
-          } else {
-            console.error("Failed to load allocations:", error.message, error);
-            setError(error.message);
-          }
-        } else {
-          console.error("Failed to load allocations:", error);
-          setError("Unknown error occurred");
+        if (mounted) {
+          setAllocations(Array.isArray(response) ? response : []);
+          setLoading(false);
         }
-        setAllocations([]);
-      } finally {
-        setLoading(false);
+      } catch (err) {
+        if (mounted) {
+          setError(err instanceof Error ? err.message : "Failed to load allocations");
+          setAllocations([]);
+          setLoading(false);
+        }
       }
     };
 
-    loadAllocations();
-    const interval = setInterval(loadAllocations, 5000);
-    return () => clearInterval(interval);
+    fetchAllocations();
+    const interval = setInterval(fetchAllocations, 5000);
+
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
   }, []);
 
+  // Filter allocations whenever allocations, search, or status filter changes
   useEffect(() => {
     let filtered = allocations;
 
@@ -95,19 +84,14 @@ export default function AllocationsPage() {
       );
     }
 
-    console.log("Filtering allocations:", {
-      total: allocations.length,
-      statusFilter,
-      searchTerm,
-      filtered: filtered.length,
-      data: allocations,
-    });
-
-    setFilteredAllocations(filtered.sort((a, b) => {
+    // Sort by generated_at descending
+    const sorted = filtered.sort((a, b) => {
       const dateA = new Date(a.generated_at || 0).getTime();
       const dateB = new Date(b.generated_at || 0).getTime();
       return dateB - dateA;
-    }));
+    });
+
+    setFilteredAllocations(sorted);
   }, [allocations, statusFilter, searchTerm]);
 
   const formatDate = (date: string | null | undefined) => {

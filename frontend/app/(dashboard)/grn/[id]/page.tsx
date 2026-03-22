@@ -52,6 +52,7 @@ export default function GRNDetailPage() {
     pollRef.current = setInterval(() => {
       void apiRequest<{ id: string; status: string }>(`/api/v1/allocation/sessions/by-grn/${grnId}`)
         .then((session) => {
+          setCheckingSession(false);
           setSessionStatus(session.status);
           if (session.status !== "GENERATING") {
             void mutate();
@@ -125,6 +126,9 @@ export default function GRNDetailPage() {
       );
       setSessionId(session.id);
       setSessionStatus(session.status);
+      // We already have a concrete session now, so stop showing the
+      // "checking existing allocations" state even if initial lookup lags.
+      setCheckingSession(false);
       // polling useEffect will take over from here
     } finally {
       setLoading(false);
