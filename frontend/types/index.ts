@@ -119,47 +119,61 @@ export interface AllocationLine {
   }> | null;
 }
 
-export interface AIReasoning {
-  weekly_ros?: number;
-  store_grade: string;
-  store_ros_attribute: number | string;
-  cluster_avg_ros_attribute: number | string;
-  ros_vs_cluster_pct: number;
-  ros_source?: string;
-  is_stockout_corrected?: boolean;
-  stockout_correction_applied?: boolean;
-  stockout_week?: number | null;
-  lost_sales_estimate?: number | null;
-  cover_target_weeks?: number;
-  current_stock_cover_days: number;
-  display_capacity_available: number | null;
-  season_weeks_remaining: number;
-  raw_demand_units?: number;
-  scale_factor?: number;
-  grade_multiplier?: number;
-  weeks_cover_at_recommended: number;
-  weeks_cover_minus_25?: number;
-  weeks_cover_plus_25?: number;
-  weeks_cover_at_minus_25pct: number;
-  weeks_cover_at_plus_25pct: number;
-  stockout_risk_at_lower_qty: boolean;
-  climate_match: boolean;
+export interface AllocationReasoning {
+  // Demand
+  weekly_ros: number;
+  raw_weekly_ros: number;
+  ros_source: 'store_historical' | 'cluster_average' | 'grade_average' | 'minimum_presentation' | 'no_history';
+  is_stockout_corrected: boolean;
+  stockout_week: number | null;
+  lost_sales_estimate: number | null;
   data_sample_size: number;
+  cluster_store_count: number;
+
+  // Projection
+  cover_target_weeks: number;
+  weeks_cover_at_recommended: number;
+  weeks_cover_minus_25pct: number;
+  weeks_cover_plus_25pct: number;
+  season_weeks_remaining: number;
+  raw_demand_units: number;
+  scale_factor: number;
+
+  // Store
+  store_grade: string;
+  grade_multiplier: number;
+  category_affinity: number | null;
+  fabric_affinity: number | null;
+  affinity_adjustment_units: number | null;
+
+  // Story concentration
+  cannibalization_factor: number | null;
+  cannibalization_reason: string | null;
+  colourways_in_story_at_store: number | null;
+
+  // Capacity
+  excluded_by_capacity: boolean;
+  exclusion_reason: string | null;
+
+  // Size split
+  size_split: Record<string, number>;
+  size_distribution_source: 'store_historical' | 'cluster_historical' | 'brand_size_guide';
+  size_distribution_season: string | null;
+
+  // Narratives — always non-empty strings
+  narrative_demand: string;
+  narrative_adjustments: string;
+  narrative_cap: string;
   confidence_basis: string;
-  category_affinity?: string | null;
-  fabric_affinity?: string | null;
-  affinity_adjustment_units?: number | null;
-  cannibalization_factor?: number | null;
-  cannibalization_reason?: string | null;
-  colourways_in_story_at_store?: number | null;
-  size_split?: Record<string, number>;
-  size_distribution_source?: string;
-  size_distribution_season?: string | null;
-  narrative_demand?: string;
-  narrative_adjustments?: string;
-  narrative_cap?: string;
-  style_dna_match?: number | null;
+
+  // Phase 2 — always null for now
+  style_dna_match: null;
+
+  // Backward compat
+  [key: string]: any;
 }
+
+export interface AIReasoning extends AllocationReasoning {}
 
 export interface AIProjections {
   size_split: Record<string, number>;
@@ -173,6 +187,7 @@ export interface AllocationSession {
   id: string;
   brand_id: string;
   grn_id: string;
+  season_id?: string | null;
   status: "DRAFT" | "GENERATING" | "FAILED" | "UNDER_REVIEW" | "APPROVED" | "DISPATCHED" | "CANCELLED";
   total_stores: number;
   total_skus: number;

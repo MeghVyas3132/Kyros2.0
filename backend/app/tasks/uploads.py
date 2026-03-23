@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import subprocess
@@ -37,7 +38,22 @@ async def process_upload_with_fallback(upload_id: str, brand_id: str) -> dict:
         return {"mode": "async", "task_id": task.id}
     except Exception:
         logger.warning("Celery unavailable, processing upload %s synchronously", upload_id)
-        process_upload_sync(upload_id, brand_id)
+        env = os.environ.copy()
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "app.tasks.upload_runner",
+            upload_id,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(
+                f"Upload subprocess failed with code {process.returncode}: {stderr.decode().strip()}"
+            )
+        logger.info("upload_sync_fallback_completed upload_id=%s output=%s", upload_id, stdout.decode().strip())
         return {"mode": "sync", "task_id": None}
 
 

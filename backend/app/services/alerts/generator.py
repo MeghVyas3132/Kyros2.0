@@ -6,7 +6,7 @@ from uuid import UUID
 from sqlalchemy import and_, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Alert, AlertType, AllocationSession, GRN, InventoryState
+from app.models import Alert, AlertType, AllocationLine, AllocationSession, AllocationStatus, GRN, InventoryState
 
 
 async def _has_active_duplicate(
@@ -140,6 +140,78 @@ async def generate_alerts(brand_id: UUID, run_date: date, db: AsyncSession) -> i
                 message="GRN is older than 14 days and still unallocated.",
                 grn_id=grn.id,
                 action_url=f"/grn/{grn.id}",
+                generated_at=func.now(),
+            )
+        )
+        created += 1
+
+    warehouse_rows = (
+        await db.execute(
+            select(InventoryState).where(
+                InventoryState.brand_id == brand_id,
+                InventoryState.snapshot_date == latest_date,
+                InventoryState.location_type == "WAREHOUSE",
+                InventoryState.units_on_hand > 0,
+            )
+        )
+    ).scalars().all()
+    for row in warehouse_rows:
+        if await _has_active_duplicate(
+            db,
+            brand_id,
+            AlertType.WAREHOUSE_STOCK_SITTING,
+            None,
+            row.sku_id,
+            None,
+        ):
+            continue
+        db.add(
+            Alert(
+                brand_id=brand_id,
+                alert_type=AlertType.WAREHOUSE_STOCK_SITTING,
+                severity="MEDIUM",
+                title="Warehouse stock sitting unallocated",
+                message="Warehouse has stock that is not yet flowing to stores.",
+                sku_id=row.sku_id,
+                action_url="/allocation",
+                generated_at=func.now(),
+            )
+        )
+        created += 1
+
+    high_cover_rows = (
+        await db.execute(
+            select(AllocationLine)
+            .join(AllocationSession, AllocationSession.id == AllocationLine.session_id)
+            .where(
+                AllocationLine.brand_id == brand_id,
+                AllocationSession.brand_id == brand_id,
+                AllocationSession.status.in_([AllocationStatus.UNDER_REVIEW, AllocationStatus.APPROVED]),
+            )
+        )
+    ).scalars().all()
+    for line in high_cover_rows:
+        reasoning = line.ai_reasoning or {}
+        weeks_cover = float(reasoning.get("weeks_cover_at_recommended") or 0)
+        target_cover = float(reasoning.get("cover_target_weeks") or 0)
+        if target_cover <= 0:
+            continue
+        if weeks_cover <= target_cover * 1.5:
+            continue
+        if await _has_active_duplicate(db, brand_id, AlertType.HIGH_COVER, line.store_id, line.sku_id, None):
+            continue
+        db.add(
+            Alert(
+                brand_id=brand_id,
+                alert_type=AlertType.HIGH_COVER,
+                severity="MEDIUM",
+                title="High cover allocation",
+                message=(
+                    f"Allocated cover ({weeks_cover:.1f}w) exceeds target ({target_cover:.1f}w) by more than 50%."
+                ),
+                store_id=line.store_id,
+                sku_id=line.sku_id,
+                action_url="/allocation",
                 generated_at=func.now(),
             )
         )

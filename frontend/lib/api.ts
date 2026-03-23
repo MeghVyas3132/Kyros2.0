@@ -1,6 +1,7 @@
 import { ApiErrorEnvelope, ApiResponse } from "@/types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const DEFAULT_REQUEST_TIMEOUT_MS = 12000;
 
 export class ApiError extends Error {
   code: string;
@@ -36,6 +37,59 @@ export function clearAuthTokens(): void {
   localStorage.removeItem("kyros_user");
 }
 
+function mergeAbortSignals(signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const activeSignals = signals.filter((signal): signal is AbortSignal => Boolean(signal));
+  if (activeSignals.length === 0) return undefined;
+  if (activeSignals.length === 1) return activeSignals[0];
+
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  activeSignals.forEach((signal) => {
+    if (signal.aborted) {
+      controller.abort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  return controller.signal;
+}
+
+function withTimeoutSignal(
+  timeoutMs: number,
+  baseSignal?: AbortSignal
+): { signal?: AbortSignal; cancel: () => void } {
+  if (timeoutMs <= 0) {
+    return { signal: baseSignal, cancel: () => undefined };
+  }
+
+  const timeoutController = new AbortController();
+  const timeoutId = globalThis.setTimeout(() => timeoutController.abort(), timeoutMs);
+  const signal = mergeAbortSignals([baseSignal, timeoutController.signal]);
+
+  return {
+    signal,
+    cancel: () => globalThis.clearTimeout(timeoutId),
+  };
+}
+
+async function parseApiError(response: Response): Promise<ApiError> {
+  try {
+    const error = (await response.json()) as ApiErrorEnvelope;
+    return new ApiError(
+      error?.error?.code ?? `HTTP_${response.status}`,
+      error?.error?.message ?? `Request failed with status ${response.status}`,
+      error?.error?.details
+    );
+  } catch {
+    return new ApiError(`HTTP_${response.status}`, `Request failed with status ${response.status}`);
+  }
+}
+
+type ApiRequestOptions = RequestInit & {
+  timeoutMs?: number;
+  retryCount?: number;
+};
+
 async function tryRefreshToken(): Promise<boolean> {
   const refreshToken = getRefreshToken();
   if (!refreshToken) return false;
@@ -56,18 +110,40 @@ async function tryRefreshToken(): Promise<boolean> {
   return true;
 }
 
-export async function apiRequest<T>(path: string, options?: RequestInit): Promise<T> {
+export async function apiRequest<T>(path: string, options?: ApiRequestOptions): Promise<T> {
   const token = getToken();
   const isFormData = options?.body instanceof FormData;
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const retryCount = options?.retryCount ?? 0;
 
-  const response = await fetch(`${API_URL}${path}`, {
-    ...options,
-    headers: {
-      ...(isFormData ? {} : { "Content-Type": "application/json" }),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...options?.headers,
-    },
-  });
+  const { signal, cancel } = withTimeoutSignal(timeoutMs, options?.signal ?? undefined);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      ...options,
+      signal,
+      headers: {
+        ...(isFormData ? {} : { "Content-Type": "application/json" }),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...options?.headers,
+      },
+    });
+  } catch (error) {
+    cancel();
+    if (error instanceof DOMException && error.name === "AbortError") {
+      if (retryCount > 0) {
+        return apiRequest<T>(path, { ...options, retryCount: retryCount - 1 });
+      }
+      throw new ApiError("REQUEST_TIMEOUT", "Request timed out. Please try again.");
+    }
+    if (retryCount > 0) {
+      return apiRequest<T>(path, { ...options, retryCount: retryCount - 1 });
+    }
+    throw new ApiError("NETWORK_ERROR", "Could not reach server. Please check connection.");
+  } finally {
+    cancel();
+  }
 
   if (response.status === 401) {
     const refreshed = await tryRefreshToken();
@@ -81,8 +157,7 @@ export async function apiRequest<T>(path: string, options?: RequestInit): Promis
   }
 
   if (!response.ok) {
-    const error = (await response.json()) as ApiErrorEnvelope;
-    throw new ApiError(error.error.code, error.error.message, error.error.details);
+    throw await parseApiError(response);
   }
 
   const payload = (await response.json()) as ApiResponse<T>;

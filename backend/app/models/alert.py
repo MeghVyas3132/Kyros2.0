@@ -12,6 +12,8 @@ class AlertType(str, enum.Enum):
     STOCKOUT_RISK = "STOCKOUT_RISK"
     AGING_STOCK = "AGING_STOCK"
     GRN_UNALLOCATED = "GRN_UNALLOCATED"
+    WAREHOUSE_STOCK_SITTING = "WAREHOUSE_STOCK_SITTING"
+    HIGH_COVER = "HIGH_COVER"
 
 
 class Alert(UUIDPrimaryKeyMixin, TimestampMixin, Base):

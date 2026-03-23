@@ -1,14 +1,71 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 
+import { apiRequest } from "@/lib/api";
 import { useAlertCount, useAlerts } from "@/lib/hooks/useAlerts";
 import { useGRNs } from "@/lib/hooks/useGrns";
+
+interface AllocationSessionLite {
+  id: string;
+  status: string;
+}
+
+interface AllocationInsights {
+  lost_sales_correction: {
+    stores_corrected: number;
+    estimated_recovered_units: number;
+    headline: string;
+    subtext: string;
+  };
+  under_covered_stores: {
+    count: number;
+    headline: string;
+  };
+  confidence_breakdown: {
+    high: number;
+    moderate: number;
+    low: number;
+  };
+  total_lines: number;
+  total_units_allocated: number;
+}
 
 export default function DashboardPage() {
   const { data: alerts } = useAlertCount();
   const { data: alertItems } = useAlerts();
   const { data: grns } = useGRNs();
+  const [insights, setInsights] = useState<AllocationInsights | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadInsights() {
+      try {
+        const allocations = await apiRequest<AllocationSessionLite[]>("/api/v1/allocation/sessions");
+        const latestSession = allocations.find(
+          (a) => a.status === "UNDER_REVIEW" || a.status === "APPROVED"
+        );
+        if (!latestSession) {
+          if (!cancelled) setInsights(null);
+          return;
+        }
+
+        const data = await apiRequest<AllocationInsights>(
+          `/api/v1/allocation/${latestSession.id}/insights`
+        );
+        if (!cancelled) setInsights(data);
+      } catch {
+        if (!cancelled) setInsights(null);
+      }
+    }
+
+    void loadInsights();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const pending = (grns ?? []).find((grn) => grn.status === "RECEIVED");
   const hasData = (grns ?? []).length > 0;
@@ -90,6 +147,41 @@ export default function DashboardPage() {
           <p className="mt-2 text-3xl font-bold text-slate-900">{pending ? "Yes" : "None"}</p>
         </div>
       </div>
+
+      {insights ? (
+        <div className="grid grid-cols-1 gap-4 mb-1 md:grid-cols-3">
+          <div className="rounded-lg border p-4">
+            <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Stockout Recovery</p>
+            <p className="text-2xl font-bold">+{insights.lost_sales_correction.estimated_recovered_units}</p>
+            <p className="mt-1 text-sm text-slate-500">{insights.lost_sales_correction.headline}</p>
+            <p className="mt-1 text-xs text-slate-500">{insights.lost_sales_correction.subtext}</p>
+          </div>
+
+          <div className="rounded-lg border p-4">
+            <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Constrained Stores</p>
+            <p className="text-2xl font-bold">{insights.under_covered_stores.count}</p>
+            <p className="mt-1 text-sm text-slate-500">{insights.under_covered_stores.headline}</p>
+          </div>
+
+          <div className="rounded-lg border p-4">
+            <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Signal Confidence</p>
+            <div className="mt-2 flex gap-3">
+              <span className="text-sm">
+                <span className="font-bold text-green-700">{insights.confidence_breakdown.high}</span>
+                <span className="ml-1 text-xs text-slate-500">high</span>
+              </span>
+              <span className="text-sm">
+                <span className="font-bold text-amber-600">{insights.confidence_breakdown.moderate}</span>
+                <span className="ml-1 text-xs text-slate-500">mod</span>
+              </span>
+              <span className="text-sm">
+                <span className="font-bold text-red-500">{insights.confidence_breakdown.low}</span>
+                <span className="ml-1 text-xs text-slate-500">low</span>
+              </span>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {/* Pending Allocation CTA */}
       {pending ? (

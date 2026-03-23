@@ -5,6 +5,7 @@ import { useParams } from "next/navigation";
 
 import { AllocationTable } from "@/components/allocation/AllocationTable";
 import { ExplainabilityPanel } from "@/components/allocation/ExplainabilityPanel";
+import { ScenarioSimulator } from "@/components/allocation/ScenarioSimulator";
 import { StatusBadge } from "@/components/shared/StatusBadge";
 import { apiRequest } from "@/lib/api";
 import { useGRN } from "@/lib/hooks/useGrns";
@@ -332,7 +333,17 @@ export default function GRNDetailPage() {
             />
           </div>
           <div className="col-span-4">
-            <ExplainabilityPanel line={selectedLine} storyConcentration={storyConcentration} />
+            <ExplainabilityPanel
+              line={selectedLine}
+              skuName={selectedLine?.style_name ?? undefined}
+              styleRiskGroup={selectedLine?.sku_style_risk_group ?? undefined}
+            />
+            {selectedLine ? (
+              <>
+                <hr className="my-3 border-slate-200" />
+                <ScenarioSimulator line={selectedLine} />
+              </>
+            ) : null}
           </div>
         </div>
       )}

@@ -2,8 +2,8 @@ from io import BytesIO
 from uuid import UUID
 
 import pandas as pd
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,10 +18,22 @@ router = APIRouter(prefix="/api/v1/skus", tags=["skus"])
 
 @router.get("")
 async def list_skus(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> dict:
-    rows = (await db.execute(select(SKU).where(SKU.brand_id == current_user.brand_id))).scalars().all()
-    return envelope(rows)
+    offset = (page - 1) * page_size
+    total = await db.scalar(select(func.count(SKU.id)).where(SKU.brand_id == current_user.brand_id))
+    rows = (
+        await db.execute(
+            select(SKU)
+            .where(SKU.brand_id == current_user.brand_id)
+            .order_by(SKU.style_name.asc(), SKU.sku_code.asc())
+            .limit(page_size)
+            .offset(offset)
+        )
+    ).scalars().all()
+    return envelope(rows, meta={"page": page, "per_page": page_size, "total": int(total or 0)})
 
 
 @router.post("")

@@ -78,6 +78,7 @@ async def load_historical_size_ratios(
     product_category: str,
     store_id: UUID,
     db: AsyncSession,
+    historical_season_id: UUID | None = None,
 ) -> dict[str, float]:
     """
     Fallback chain:
@@ -93,6 +94,7 @@ async def load_historical_size_ratios(
             SalesData.brand_id == brand_id,
             SalesData.store_id == store_id,
             SKU.category == product_category,
+            *( [SalesData.season_id == historical_season_id] if historical_season_id is not None else [] ),
         )
         .group_by(SKU.size)
     )
@@ -115,6 +117,7 @@ async def load_historical_size_ratios(
                 SalesData.brand_id == brand_id,
                 Store.cluster_id == cluster_id,
                 SKU.category == product_category,
+                *( [SalesData.season_id == historical_season_id] if historical_season_id is not None else [] ),
             )
             .group_by(SKU.size)
         )
@@ -128,6 +131,7 @@ async def load_historical_size_ratios(
         .where(
             SalesData.brand_id == brand_id,
             SKU.category == product_category,
+            *( [SalesData.season_id == historical_season_id] if historical_season_id is not None else [] ),
         )
         .group_by(SKU.size)
     )
@@ -151,6 +155,7 @@ async def distribute_size_sets(
     total_units: int,
     eligible_guides: list[SizeGuide],
     db: AsyncSession,
+    historical_season_id: UUID | None = None,
 ) -> dict[str, int]:
     """
     For products where sizes are combined sets (for example S/M and L/XL).
@@ -169,6 +174,7 @@ async def distribute_size_sets(
         product_category=product_category,
         store_id=store_id,
         db=db,
+        historical_season_id=historical_season_id,
     )
 
     weights: dict[str, float] = {}
@@ -205,6 +211,7 @@ async def calculate_size_distribution(
     store_id: UUID | None = None,
     store_grade: str | None = None,
     total_units: int | None = None,
+    historical_season_id: UUID | None = None,
 ) -> dict[str, int]:
     """
     Generic size distribution:
@@ -257,6 +264,7 @@ async def calculate_size_distribution(
             total_units=resolved_total_units,
             eligible_guides=eligible,
             db=db,
+            historical_season_id=historical_season_id,
         )
 
     historical = await load_historical_size_ratios(
@@ -264,6 +272,7 @@ async def calculate_size_distribution(
         product_category=resolved_category,
         store_id=resolved_store_id,
         db=db,
+        historical_season_id=historical_season_id,
     )
     base_weights = {guide.size: float(guide.min_max_ratio) for guide in eligible}
     total_base = sum(base_weights.values()) or 1.0

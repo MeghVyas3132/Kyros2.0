@@ -8,9 +8,9 @@ from io import BytesIO
 
 import pandas as pd
 import redis
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -406,12 +406,22 @@ async def smart_upload(
 
 @router.get("/uploads")
 async def list_uploads(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> dict:
+    offset = (page - 1) * page_size
+    total = await db.scalar(select(func.count(Upload.id)).where(Upload.brand_id == current_user.brand_id))
     rows = (
-        await db.execute(select(Upload).where(Upload.brand_id == current_user.brand_id).order_by(Upload.created_at.desc()))
+        await db.execute(
+            select(Upload)
+            .where(Upload.brand_id == current_user.brand_id)
+            .order_by(Upload.created_at.desc())
+            .limit(page_size)
+            .offset(offset)
+        )
     ).scalars().all()
-    return envelope(rows)
+    return envelope(rows, meta={"page": page, "per_page": page_size, "total": int(total or 0)})
 
 
 @router.get("/uploads/{task_id}/progress")

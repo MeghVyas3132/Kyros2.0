@@ -1,141 +1,109 @@
 "use client";
 
-import { AllocationLine, StoryConcentration } from "@/types";
+import { AllocationLine, AllocationReasoning } from "@/types";
 
 interface Props {
   line: AllocationLine | null;
-  storyConcentration?: StoryConcentration[];
+  skuName?: string;
+  styleRiskGroup?: string;
 }
 
-export function ExplainabilityPanel({ line, storyConcentration = [] }: Props) {
+const SIZE_ORDER = ["XS", "S", "M", "L", "XL", "XXL", "2XL", "3XL", "28", "30", "32", "34", "36", "38", "40", "42"];
+
+export function ExplainabilityPanel({ line, skuName, styleRiskGroup }: Props) {
   if (!line) {
     return (
-      <div className="rounded-xl border border-slate-300 bg-white/95 p-4 text-sm text-slate-500 shadow-sm">
-        Select a row to view AI reasoning.
+      <div className="p-4 text-sm text-slate-500">
+        Select a row to view reasoning.
       </div>
     );
   }
 
-  const reasoning = line.ai_reasoning;
-  const toNumber = (value: number | string | null | undefined, fallback = 0): number => {
-    if (typeof value === "number") return value;
-    if (typeof value === "string") {
-      const token = value.trim().split(" ", 1)[0].replace("%", "");
-      const parsed = Number(token);
-      return Number.isFinite(parsed) ? parsed : fallback;
-    }
-    return fallback;
-  };
+  const r = line.ai_reasoning as AllocationReasoning | null;
+  if (!r) {
+    return <div className="p-4 text-sm text-slate-500">No reasoning data available for this line.</div>;
+  }
 
-  const storeRos = toNumber(reasoning.store_ros_attribute, reasoning.weekly_ros ?? 0);
-  const clusterRos = toNumber(reasoning.cluster_avg_ros_attribute, storeRos);
-  const minusCover = reasoning.weeks_cover_minus_25 ?? reasoning.weeks_cover_at_minus_25pct;
-  const plusCover = reasoning.weeks_cover_plus_25 ?? reasoning.weeks_cover_at_plus_25pct;
-  const rosDelta = reasoning.ros_vs_cluster_pct >= 0 ? `+${reasoning.ros_vs_cluster_pct}` : `${reasoning.ros_vs_cluster_pct}`;
+  const sizeSplitEntries = Object.entries(r.size_split || {}).sort(([a], [b]) => {
+    const ai = SIZE_ORDER.indexOf(a);
+    const bi = SIZE_ORDER.indexOf(b);
+    return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+  });
+  const sizeSplitTotal = sizeSplitEntries.reduce((sum, [, n]) => sum + n, 0);
 
   return (
-    <div className="rounded-xl border border-slate-300 bg-white/95 p-4 shadow-sm">
-      <h3 className="mb-1 text-sm font-semibold uppercase tracking-[0.08em] text-slate-700">Explainability</h3>
-      <p className="mb-4 text-sm text-slate-900">
-        {line.store_name ?? line.store_code} · {line.style_name ?? line.sku_code} {line.sku_size ?? ""}
-      </p>
-
-      <div className="space-y-3 text-sm">
-        <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
-          <p className="font-medium text-slate-900">Demand Signal</p>
-          <p className="text-slate-700">
-            ROS {storeRos.toFixed(1)} vs cluster {clusterRos.toFixed(1)} ({rosDelta}%)
-          </p>
-          <p className="text-slate-700">Current cover {reasoning.current_stock_cover_days.toFixed(1)} days</p>
-          {reasoning.narrative_demand ? <p className="mt-1 text-slate-600">{reasoning.narrative_demand}</p> : null}
-          {reasoning.stockout_correction_applied ? (
-            <p className="mt-1 text-amber-700">
-              Stockout-corrected ROS applied{reasoning.lost_sales_estimate != null ? ` (lost sales est. ${reasoning.lost_sales_estimate})` : ""}.
-            </p>
-          ) : null}
+    <div className="space-y-5 p-4 text-sm">
+      <div className="grid grid-cols-2 gap-3 rounded-lg border bg-slate-50/70 p-4">
+        <div>
+          <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Target Cover</p>
+          <p className="text-3xl font-bold tabular-nums">{r.cover_target_weeks}w</p>
+          <p className="mt-1 text-xs text-slate-500">{styleRiskGroup ?? "-"} × Grade {r.store_grade}</p>
         </div>
-
-        <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
-          <p className="font-medium text-slate-900">Projection</p>
-          <p className="text-slate-700">Recommended cover {reasoning.weeks_cover_at_recommended.toFixed(1)} weeks</p>
-          <p className="text-slate-700">
-            Minus 25%: {minusCover.toFixed(1)} weeks · Plus 25%: {plusCover.toFixed(1)} weeks
-          </p>
-          <p className="text-slate-700">Season remaining {reasoning.season_weeks_remaining} weeks</p>
-          {reasoning.cover_target_weeks != null ? (
-            <p className="text-slate-700">Target cover used by model: {reasoning.cover_target_weeks} weeks</p>
-          ) : null}
-          {reasoning.narrative_adjustments ? <p className="mt-1 text-slate-600">{reasoning.narrative_adjustments}</p> : null}
+        <div>
+          <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Allocated</p>
+          <p className="text-3xl font-bold tabular-nums">{r.weeks_cover_at_recommended}w</p>
+          <p className="mt-1 text-xs text-slate-500">at {line.final_qty} units</p>
         </div>
+      </div>
 
-        <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
-          <p className="font-medium text-slate-900">Constraints</p>
-          <p className="text-slate-700">Display capacity available: {reasoning.display_capacity_available}</p>
-          <p className="text-slate-700">
-            Climate match: {reasoning.climate_match ? "Yes" : "No"} · Stockout risk at lower qty:{" "}
-            {reasoning.stockout_risk_at_lower_qty ? "High" : "Low"}
+      {r.is_stockout_corrected && (
+        <div className="rounded-md border border-amber-200 bg-amber-50 p-3">
+          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-amber-800">Stockout correction applied</p>
+          <p className="text-amber-700">
+            Store stocked out around week {r.stockout_week ?? "?"}.
+            {r.lost_sales_estimate != null ? <> Estimated {Math.round(r.lost_sales_estimate)} lost units.</> : null} Demand corrected from <strong>{r.raw_weekly_ros.toFixed(1)}</strong> to <strong>{r.weekly_ros.toFixed(1)}</strong> units/week.
           </p>
-          {reasoning.narrative_cap ? <p className="mt-1 text-slate-600">{reasoning.narrative_cap}</p> : null}
         </div>
+      )}
 
-        <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
-          <p className="font-medium text-slate-900">Confidence</p>
-          <p className="text-slate-700">
-            {line.ai_confidence ?? "LOW"} confidence from {reasoning.data_sample_size} comparable store-weeks
+      <div>
+        <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Demand Basis</p>
+        <p className="text-slate-900 leading-relaxed">{r.narrative_demand}</p>
+        <p className="mt-1 text-xs text-slate-500">{r.confidence_basis}</p>
+      </div>
+
+      <div>
+        <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Store Adjustment</p>
+        <p className="text-slate-900 leading-relaxed">{r.narrative_adjustments}</p>
+      </div>
+
+      <div>
+        <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Inventory</p>
+        <p className="text-slate-900 leading-relaxed">{r.narrative_cap}</p>
+      </div>
+
+      {sizeSplitEntries.length > 0 && (
+        <div>
+          <p className="mb-2 text-xs uppercase tracking-wide text-slate-500">
+            Size Split <span className="normal-case font-normal">({(r.size_distribution_source ?? "unknown").replace(/_/g, " ")})</span>
           </p>
-          <p className="text-slate-700">{reasoning.confidence_basis}</p>
-        </div>
-
-        {reasoning.category_affinity || reasoning.fabric_affinity ? (
-          <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
-            <p className="font-medium text-slate-900">Store Profile</p>
-            <p className="text-slate-700">
-              Category affinity: {reasoning.category_affinity ?? "N/A"} · Fabric affinity: {reasoning.fabric_affinity ?? "N/A"}
-            </p>
+          <div className="space-y-1.5">
+            {sizeSplitEntries.map(([size, qty]) => {
+              const pct = sizeSplitTotal > 0 ? Math.round((qty / sizeSplitTotal) * 100) : 0;
+              return (
+                <div key={size} className="flex items-center gap-2">
+                  <span className="w-7 shrink-0 text-right text-xs text-slate-500">{size}</span>
+                  <div className="h-1.5 flex-1 rounded-full bg-slate-200">
+                    <div className="h-1.5 rounded-full bg-slate-900 transition-all" style={{ width: `${pct}%` }} />
+                  </div>
+                  <span className="w-16 shrink-0 text-right text-xs text-slate-500">{qty} ({pct}%)</span>
+                </div>
+              );
+            })}
           </div>
-        ) : null}
-
-        <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
-          <p className="font-medium text-slate-900">Allocation Ceiling</p>
-          <p className="text-slate-700">Total received: {line.grn_units_received ?? 0}</p>
-          {(line.grn_reservations ?? []).length > 0 ? (
-            <div className="mt-1 space-y-1 text-slate-700">
-              {(line.grn_reservations ?? []).map((reservation) => (
-                <p key={`${reservation.code}-${reservation.label}`}>
-                  {reservation.label}: {reservation.reserved_qty}
-                </p>
-              ))}
-            </div>
-          ) : (
-            <div className="mt-1 space-y-1 text-slate-700">
-              <p>E-Commerce reserve: {line.grn_ecom_reserved_qty ?? 0}</p>
-              <p>ARS reserve: {line.grn_ars_reserved_qty ?? 0}</p>
-            </div>
-          )}
-          <p className="mt-1 text-slate-900">
-            Available for first allocation: {line.grn_available_for_first_allocation ?? 0}
-          </p>
         </div>
+      )}
 
-        <div className="rounded-md border border-slate-200 bg-slate-50/80 p-3">
-          <p className="font-medium text-slate-900">Story Concentration</p>
-          {storyConcentration.length === 0 ? (
-            <p className="text-slate-700">No story concentration data for this store yet.</p>
-          ) : (
-            <div className="mt-1 space-y-1">
-              {storyConcentration.map((item) => (
-                <p key={item.story} className="text-slate-700">
-                  {item.story}: {item.style_count} styles{" "}
-                  {item.is_high ? (
-                    <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-900">
-                      High
-                    </span>
-                  ) : null}
-                </p>
-              ))}
-            </div>
-          )}
+      {r.excluded_by_capacity && r.exclusion_reason && (
+        <div className="rounded-md border border-red-200 bg-red-50 p-3">
+          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-red-800">Excluded by display capacity</p>
+          <p className="text-red-700">{r.exclusion_reason}</p>
         </div>
+      )}
+
+      <div className="space-y-2 border-t pt-4 opacity-50">
+        <p className="text-xs uppercase tracking-wide text-slate-500">Coming next</p>
+        <p className="text-xs text-slate-500">Style DNA matching · Category and fabric affinity · Cannibalization scoring</p>
       </div>
     </div>
   );

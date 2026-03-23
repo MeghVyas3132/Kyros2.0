@@ -4,13 +4,16 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 
 
-def envelope(data: Any) -> dict[str, Any]:
+def envelope(data: Any, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload_meta: dict[str, Any] = {
+        "request_id": "req-local",
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    if meta:
+        payload_meta.update(meta)
     return {
         "data": jsonable_encoder(data),
-        "meta": {
-            "request_id": "req-local",
-            "timestamp": datetime.now(UTC).isoformat(),
-        },
+        "meta": payload_meta,
     }
 
 

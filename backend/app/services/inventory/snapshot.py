@@ -4,7 +4,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -66,53 +66,111 @@ async def build_snapshot_for_brand(brand_id: UUID, snapshot_date: date, db: Asyn
     if not pairs:
         return 0
 
+    pair_keys = {(str(store_id), sku_id) for store_id, sku_id in pairs}
+
+    latest_inv_rows = await db.execute(
+        select(
+            InventoryState.location_id,
+            InventoryState.sku_id,
+            InventoryState.units_on_hand,
+            InventoryState.snapshot_date,
+        )
+        .where(
+            InventoryState.brand_id == brand_id,
+            InventoryState.location_type == "STORE",
+            InventoryState.snapshot_date <= snapshot_date,
+        )
+        .order_by(
+            InventoryState.location_id,
+            InventoryState.sku_id,
+            InventoryState.snapshot_date.desc(),
+        )
+    )
+    latest_inv_map: dict[tuple[str, UUID], int] = {}
+    for location_id, sku_id, units_on_hand, _ in latest_inv_rows.all():
+        key = (location_id, sku_id)
+        if key not in latest_inv_map:
+            latest_inv_map[key] = int(units_on_hand or 0)
+
+    sales_rows = await db.execute(
+        select(
+            SalesData.store_id,
+            SalesData.sku_id,
+            func.coalesce(
+                func.sum(
+                    case((SalesData.week_start_date >= seven_days_ago, SalesData.units_sold), else_=0)
+                ),
+                0,
+            ).label("units_sold_7d"),
+            func.coalesce(
+                func.sum(
+                    case((SalesData.week_start_date >= twenty_eight_days_ago, SalesData.units_sold), else_=0)
+                ),
+                0,
+            ).label("units_sold_28d"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(SalesData.week_start_date >= seven_days_ago, SalesData.was_in_stock.is_(True)),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("in_stock_weeks_7d"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(SalesData.week_start_date >= twenty_eight_days_ago, SalesData.was_in_stock.is_(True)),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("in_stock_weeks_28d"),
+            func.coalesce(func.sum(SalesData.units_sold), 0).label("total_sold"),
+            func.min(SalesData.week_start_date).label("first_sale_date"),
+        )
+        .where(
+            SalesData.brand_id == brand_id,
+            SalesData.week_start_date <= snapshot_date,
+        )
+        .group_by(SalesData.store_id, SalesData.sku_id)
+    )
+    sales_map: dict[tuple[str, UUID], dict[str, float | int | date | None]] = {}
+    for row in sales_rows.all():
+        sales_map[(str(row.store_id), row.sku_id)] = {
+            "units_sold_7d": int(row.units_sold_7d or 0),
+            "units_sold_28d": int(row.units_sold_28d or 0),
+            "in_stock_weeks_7d": int(row.in_stock_weeks_7d or 0),
+            "in_stock_weeks_28d": int(row.in_stock_weeks_28d or 0),
+            "total_sold": float(row.total_sold or 0),
+            "first_sale_date": row.first_sale_date,
+        }
+
+    last_grn_rows = await db.execute(
+        select(GRNLine.sku_id, func.max(GRN.grn_date))
+        .join(GRN, GRNLine.grn_id == GRN.id)
+        .where(GRN.brand_id == brand_id, GRNLine.brand_id == brand_id)
+        .group_by(GRNLine.sku_id)
+    )
+    last_grn_map = {sku_id: grn_date for sku_id, grn_date in last_grn_rows.all()}
+
     upsert_rows = []
-    for store_id, sku_id in pairs:
-        recent_inv = await db.execute(
-            select(InventoryState)
-            .where(
-                InventoryState.brand_id == brand_id,
-                InventoryState.location_type == "STORE",
-                InventoryState.location_id == str(store_id),
-                InventoryState.sku_id == sku_id,
-                InventoryState.snapshot_date <= snapshot_date,
-            )
-            .order_by(InventoryState.snapshot_date.desc())
-            .limit(1)
-        )
-        latest_inv = recent_inv.scalar_one_or_none()
-        units_on_hand = latest_inv.units_on_hand if latest_inv else 0
+    for location_id, sku_id in pair_keys:
+        units_on_hand = int(latest_inv_map.get((location_id, sku_id), 0))
+        sales = sales_map.get((location_id, sku_id), {})
+        units_sold_7d = int(sales.get("units_sold_7d", 0) or 0)
+        units_sold_28d = int(sales.get("units_sold_28d", 0) or 0)
+        in_stock_weeks_7d = int(sales.get("in_stock_weeks_7d", 0) or 0)
+        in_stock_weeks_28d = int(sales.get("in_stock_weeks_28d", 0) or 0)
 
-        sales_7d = await db.execute(
-            select(
-                func.coalesce(func.sum(SalesData.units_sold), 0),
-                func.count(func.nullif(SalesData.was_in_stock, False)),
-            ).where(
-                SalesData.brand_id == brand_id,
-                SalesData.store_id == store_id,
-                SalesData.sku_id == sku_id,
-                SalesData.week_start_date >= seven_days_ago,
-                SalesData.week_start_date <= snapshot_date,
-            )
-        )
-        units_sold_7d, in_stock_weeks_7d = sales_7d.one()
-
-        sales_28d = await db.execute(
-            select(
-                func.coalesce(func.sum(SalesData.units_sold), 0),
-                func.count(func.nullif(SalesData.was_in_stock, False)),
-            ).where(
-                SalesData.brand_id == brand_id,
-                SalesData.store_id == store_id,
-                SalesData.sku_id == sku_id,
-                SalesData.week_start_date >= twenty_eight_days_ago,
-                SalesData.week_start_date <= snapshot_date,
-            )
-        )
-        units_sold_28d, in_stock_weeks_28d = sales_28d.one()
-
-        days_in_stock_7d = int(in_stock_weeks_7d or 0) * 7
-        days_in_stock_28d = int(in_stock_weeks_28d or 0) * 7
+        days_in_stock_7d = in_stock_weeks_7d * 7
+        days_in_stock_28d = in_stock_weeks_28d * 7
         ros_7d = _safe_div(float(units_sold_7d), max(days_in_stock_7d, 1))
         ros_28d = _safe_div(float(units_sold_28d), max(days_in_stock_28d, 1))
 
@@ -125,44 +183,21 @@ async def build_snapshot_for_brand(brand_id: UUID, snapshot_date: date, db: Asyn
         else:
             stock_cover_days = float(units_on_hand) / ros_7d
 
-        latest_grn = await db.execute(
-            select(func.max(GRN.grn_date))
-            .join(GRNLine, GRNLine.grn_id == GRN.id)
-            .where(
-                GRN.brand_id == brand_id,
-                GRNLine.brand_id == brand_id,
-                GRNLine.sku_id == sku_id,
-            )
-        )
-        grn_date = latest_grn.scalar_one_or_none()
+        grn_date = last_grn_map.get(sku_id)
         days_since_grn = (snapshot_date - grn_date).days if grn_date else None
 
-        total_sold_q = await db.execute(
-            select(func.coalesce(func.sum(SalesData.units_sold), 0)).where(
-                SalesData.brand_id == brand_id,
-                SalesData.store_id == store_id,
-                SalesData.sku_id == sku_id,
-            )
-        )
-        total_sold = float(total_sold_q.scalar_one() or 0)
+        total_sold = float(sales.get("total_sold", 0.0) or 0.0)
         denominator = total_sold + float(units_on_hand)
         sell_through_pct = (total_sold / denominator) if denominator > 0 else None
 
-        first_sale_q = await db.execute(
-            select(func.min(SalesData.week_start_date)).where(
-                SalesData.brand_id == brand_id,
-                SalesData.store_id == store_id,
-                SalesData.sku_id == sku_id,
-            )
-        )
-        first_sale_date = first_sale_q.scalar_one_or_none()
+        first_sale_date = sales.get("first_sale_date")
         days_since_first_sale = (snapshot_date - first_sale_date).days if first_sale_date else None
 
         upsert_rows.append(
             {
                 "brand_id": brand_id,
                 "snapshot_date": snapshot_date,
-                "location_id": str(store_id),
+                "location_id": location_id,
                 "location_type": "STORE",
                 "sku_id": sku_id,
                 "units_on_hand": int(units_on_hand),

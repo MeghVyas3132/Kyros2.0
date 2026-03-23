@@ -6,20 +6,16 @@ from math import ceil
 from typing import Mapping
 from uuid import UUID
 
-from sqlalchemy import distinct, func, select
+from sqlalchemy import distinct, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import BrandSettings, SKU, SalesData, Season, Store, StoreProductGrade
-
-GRADE_MULTIPLIERS: dict[str, float] = {
-    "A+": 1.25,
-    "A": 1.00,
-    "B": 0.75,
-    "C": 0.50,
-}
-DEFAULT_GRADE = "C"
-DEFAULT_MIN_PRESENTATION_QTY = 2
-DEFAULT_SEASON_WEEKS_REMAINING = 8
+from app.services.allocation.constants import (
+    DEFAULT_GRADE,
+    DEFAULT_MIN_PRESENTATION_QTY,
+    DEFAULT_SEASON_WEEKS_REMAINING,
+    GRADE_MULTIPLIERS,
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +32,19 @@ class DemandSignal:
     cluster_store_count: int = 0
     matched_style_code: str | None = None
     similarity_score: float | None = None
+
+
+@dataclass
+class TrueDemandResult:
+    """Refined demand signal with full context for Phase 2."""
+    weekly_ros: float
+    source: str
+    is_corrected: bool = False
+    stockout_week: int | None = None
+    lost_sales_estimate: float | None = None
+    data_sample_size: int = 0
+    cluster_store_count: int = 0
+    raw_weekly_ros: float = 0.0
 
 
 def _infer_stockout_week(sales_by_week: list[int]) -> int | None:
@@ -57,43 +66,48 @@ async def _calculate_stockout_correction(
     store_id: UUID,
     category: str,
     season_id: UUID | None,
+    preloaded_rows: list[tuple[date, int, bool | None]] | None = None,
 ) -> tuple[float | None, int | None, float | None, int]:
-    date_range = await _season_date_range(db, brand_id, season_id)
-    if date_range is None:
-        return None, None, None, 0
+    if preloaded_rows is not None:
+        rows = preloaded_rows
+    else:
+        date_range = await _season_date_range(db, brand_id, season_id)
+        if date_range is None:
+            return None, None, None, 0
 
-    start_date, end_date = date_range
-    rows = (
-        await db.execute(
-            select(
-                SalesData.week_start_date,
-                func.coalesce(func.sum(SalesData.units_sold), 0).label("units"),
-                func.bool_and(SalesData.was_in_stock).label("all_in_stock"),
+        start_date, end_date = date_range
+        rows = (
+            await db.execute(
+                select(
+                    SalesData.week_start_date,
+                    func.coalesce(func.sum(SalesData.units_sold), 0).label("units"),
+                    func.bool_and(SalesData.was_in_stock).label("all_in_stock"),
+                )
+                .join(SKU, SKU.id == SalesData.sku_id)
+                .where(
+                    SalesData.brand_id == brand_id,
+                    SalesData.store_id == store_id,
+                    SKU.category == category,
+                    SalesData.week_start_date >= start_date,
+                    SalesData.week_start_date <= end_date,
+                )
+                .group_by(SalesData.week_start_date)
+                .order_by(SalesData.week_start_date)
             )
-            .join(SKU, SKU.id == SalesData.sku_id)
-            .where(
-                SalesData.brand_id == brand_id,
-                SalesData.store_id == store_id,
-                SKU.category == category,
-                SalesData.week_start_date >= start_date,
-                SalesData.week_start_date <= end_date,
-            )
-            .group_by(SalesData.week_start_date)
-            .order_by(SalesData.week_start_date)
-        )
-    ).all()
+        ).all()
 
     if not rows:
         return None, None, None, 0
 
-    sales_by_week = [int(row.units or 0) for row in rows]
+    sales_by_week = [int(row[1] if isinstance(row, tuple) else row.units or 0) for row in rows]
     total_weeks = len(sales_by_week)
     total_sold = float(sum(sales_by_week))
 
     stockout_week: int | None = None
-    if all(row.all_in_stock is not None for row in rows):
+    if all((row[2] if isinstance(row, tuple) else row.all_in_stock) is not None for row in rows):
         for idx, row in enumerate(rows):
-            if bool(row.all_in_stock):
+            in_stock = row[2] if isinstance(row, tuple) else row.all_in_stock
+            if bool(in_stock):
                 continue
             if idx < total_weeks - 1:
                 tail = sales_by_week[idx + 1 :]
@@ -157,6 +171,44 @@ async def load_sales_history(
             continue
         result[(store_id, category)] = value
     return result
+
+
+async def preload_stockout_signals(
+    db: AsyncSession,
+    brand_id: UUID,
+    season_id: UUID | None,
+) -> dict[tuple[UUID, str], list[tuple[date, int, bool | None]]]:
+    date_range = await _season_date_range(db, brand_id, season_id)
+    if date_range is None:
+        return {}
+
+    start_date, end_date = date_range
+    rows = await db.execute(
+        select(
+            SalesData.store_id,
+            SKU.category,
+            SalesData.week_start_date,
+            func.coalesce(func.sum(SalesData.units_sold), 0).label("units"),
+            func.bool_and(SalesData.was_in_stock).label("all_in_stock"),
+        )
+        .join(SKU, SKU.id == SalesData.sku_id)
+        .where(
+            SalesData.brand_id == brand_id,
+            SalesData.week_start_date >= start_date,
+            SalesData.week_start_date <= end_date,
+        )
+        .group_by(SalesData.store_id, SKU.category, SalesData.week_start_date)
+        .order_by(SalesData.store_id, SKU.category, SalesData.week_start_date)
+    )
+
+    signal_map: dict[tuple[UUID, str], list[tuple[date, int, bool | None]]] = {}
+    for store_id, category, week_start_date, units, all_in_stock in rows.all():
+        if category is None:
+            continue
+        signal_map.setdefault((store_id, category), []).append(
+            (week_start_date, int(units or 0), all_in_stock)
+        )
+    return signal_map
 
 
 async def load_grade_map(db: AsyncSession, brand_id: UUID) -> dict[tuple[UUID, str], str]:
@@ -277,6 +329,7 @@ async def calculate_store_demand_details(
     grade_ros_averages: Mapping[tuple[str, str], float] | None = None,
     min_presentation_qty: int | None = None,
     previous_season_id: UUID | None = None,
+    preloaded_stockout_signals: Mapping[tuple[UUID, str], list[tuple[date, int, bool | None]]] | None = None,
 ) -> DemandSignal:
     category = sku.category
     grade = _normalize_grade(fallback_grade)
@@ -310,6 +363,7 @@ async def calculate_store_demand_details(
             store_id=store.id,
             category=category,
             season_id=previous_season_id,
+            preloaded_rows=(preloaded_stockout_signals or {}).get((store.id, category)),
         )
         if corrected_ros is not None and corrected_ros > base_ros:
             base_ros = corrected_ros
@@ -568,3 +622,256 @@ def _normalize_grade(grade: str | None) -> str:
 def _grade_rank(grade: str | None) -> int:
     order = {"A+": 4, "A": 3, "B": 2, "C": 1}
     return order.get(_normalize_grade(grade), 1)
+
+
+def build_allocation_reasoning(
+    store_id: str,
+    sku_id: str,
+    grade: str,
+    demand_result: TrueDemandResult,
+    cover_target_weeks: int,
+    raw_demand_units: int,
+    final_qty: int,
+    available_qty: int,
+    size_result: dict,
+    season_weeks_remaining: int,
+    grade_multiplier: float,
+    story_concentration_note: str | None = None,
+    excluded_by_capacity: bool = False,
+    exclusion_reason: str | None = None,
+) -> dict:
+    """Build complete reasoning payload for an allocation line."""
+    from app.services.allocation.constants import GRADE_MULTIPLIERS
+
+    weekly_ros = demand_result.weekly_ros
+    scale_factor = final_qty / raw_demand_units if raw_demand_units > 0 else 1.0
+    weeks_at_final = (final_qty / weekly_ros) if weekly_ros > 0 else 0.0
+
+    return {
+        # DEMAND
+        "weekly_ros": round(weekly_ros, 3),
+        "raw_weekly_ros": round(demand_result.raw_weekly_ros, 3),
+        "ros_source": demand_result.source,
+        "is_stockout_corrected": demand_result.is_corrected,
+        "stockout_week": demand_result.stockout_week,
+        "lost_sales_estimate": demand_result.lost_sales_estimate,
+        "data_sample_size": demand_result.data_sample_size,
+        "cluster_store_count": demand_result.cluster_store_count,
+        # PROJECTION
+        "cover_target_weeks": cover_target_weeks,
+        "weeks_cover_at_recommended": round(weeks_at_final, 1),
+        "weeks_cover_minus_25pct": round(weeks_at_final * 0.75, 1),
+        "weeks_cover_plus_25pct": round(weeks_at_final * 1.25, 1),
+        "season_weeks_remaining": season_weeks_remaining,
+        "raw_demand_units": raw_demand_units,
+        "scale_factor": round(scale_factor, 4),
+        # STORE ADJUSTMENTS
+        "store_grade": grade,
+        "grade_multiplier": grade_multiplier,
+        "category_affinity": None,
+        "fabric_affinity": None,
+        "affinity_adjustment_units": None,
+        # STORY CONCENTRATION
+        "cannibalization_factor": None,
+        "cannibalization_reason": story_concentration_note,
+        "colourways_in_story_at_store": None,
+        # CAPACITY EXCLUSION
+        "excluded_by_capacity": excluded_by_capacity,
+        "exclusion_reason": exclusion_reason,
+        # SIZE SPLIT
+        "size_split": size_result.get("size_split", {}),
+        "size_distribution_source": size_result.get("source", "store_historical"),
+        "size_distribution_season": size_result.get("season_code"),
+        # NARRATIVES (simplified for Phase 1)
+        "narrative_demand": (
+            f"Weekly ROS: {demand_result.weekly_ros:.1f} units/week "
+            f"({demand_result.source}, {demand_result.data_sample_size}w history)"
+            + (f". Stockout-corrected from {demand_result.raw_weekly_ros:.1f} in week {demand_result.stockout_week}." 
+               if demand_result.is_corrected else ".")
+        ),
+        "narrative_adjustments": f"Grade {grade} multiplier: {grade_multiplier:.2f}x",
+        "narrative_cap": (
+            f"Scaled {raw_demand_units} → {final_qty} (factor {scale_factor:.2f}). "
+            if scale_factor < 0.99
+            else "Full demand met within warehouse availability."
+        ),
+        "confidence_basis": (
+            f"High confidence ({demand_result.data_sample_size}w history)"
+            if demand_result.data_sample_size >= 12
+            else f"Moderate confidence ({demand_result.data_sample_size}w history)"
+            if demand_result.data_sample_size >= 6
+            else f"Low confidence ({demand_result.data_sample_size}w history)"
+        ),
+        # PHASE 2 PLACEHOLDERS
+        "style_dna_match": None,
+    }
+
+
+async def _get_cluster_avg_ros(
+    db: AsyncSession,
+    brand_id: UUID,
+    cluster_id: UUID,
+    sku_id: UUID,
+    season_id: UUID | None,
+) -> TrueDemandResult:
+    """
+    Get average ROS for a SKU across all active stores in a cluster.
+    """
+    if cluster_id is None:
+        return TrueDemandResult(weekly_ros=0.0, source="cluster_average")
+    
+    result = await db.execute(
+        select(
+            func.avg(
+                func.sum(SalesData.units_sold) /
+                func.nullif(func.count(distinct(SalesData.week_start_date)), 0)
+            ).label("avg_ros"),
+            func.count(distinct(Store.id)).label("store_count"),
+        )
+        .select_from(Store)
+        .join(SalesData, SalesData.store_id == Store.id)
+        .where(
+            Store.cluster_id == cluster_id,
+            Store.brand_id == brand_id,
+            Store.is_active == True,
+            SalesData.sku_id == sku_id,
+            SalesData.brand_id == brand_id,
+        )
+        .group_by(Store.id)
+    )
+    rows = result.all()
+    if rows and len(rows) > 0:
+        avg_values = [float(row[0]) for row in rows if row[0] is not None]
+        if avg_values:
+            cluster_avg = sum(avg_values) / len(avg_values)
+            return TrueDemandResult(
+                weekly_ros=cluster_avg,
+                source="cluster_average",
+                cluster_store_count=len(rows),
+                raw_weekly_ros=cluster_avg,
+            )
+    return TrueDemandResult(weekly_ros=0.0, source="cluster_average")
+
+
+async def _get_grade_avg_ros(
+    db: AsyncSession,
+    brand_id: UUID,
+    grade: str,
+    sku_id: UUID,
+    season_id: UUID | None,
+) -> TrueDemandResult:
+    """
+    Average ROS across all stores of this grade with history for this SKU.
+    """
+    normalized_grade = _normalize_grade(grade)
+    result = await db.execute(
+        text("""
+            SELECT AVG(store_ros) AS avg_ros
+            FROM (
+                SELECT 
+                    sd.store_id,
+                    SUM(sd.units_sold)::float / NULLIF(COUNT(DISTINCT sd.week_start_date), 0) AS store_ros
+                FROM sales_data sd
+                JOIN store_product_grades g 
+                    ON g.store_id = sd.store_id 
+                    AND g.brand_id = sd.brand_id
+                WHERE sd.sku_id = :sku_id
+                  AND sd.brand_id = :brand_id
+                  AND g.grade = :grade
+                GROUP BY sd.store_id
+            ) ros_by_store
+            WHERE store_ros > 0
+        """),
+        {"brand_id": str(brand_id), "sku_id": str(sku_id), "grade": normalized_grade}
+    )
+    row = result.first()
+    if row and row.avg_ros:
+        return TrueDemandResult(
+            weekly_ros=float(row.avg_ros),
+            source="grade_average",
+            raw_weekly_ros=float(row.avg_ros),
+        )
+    return TrueDemandResult(weekly_ros=0.0, source="grade_average")
+
+
+async def calculate_demand_with_fallback(
+    db: AsyncSession,
+    brand_id: UUID,
+    store_id: UUID,
+    sku_id: UUID,
+    season_id: UUID,
+    store_grade: str,
+    cluster_id: UUID | None,
+    preloaded_stockout_signals: dict | None = None,
+) -> TrueDemandResult:
+    """
+    Full demand fallback chain:
+    1. Store historical (with stockout correction)
+    2. Cluster average ROS for this SKU
+    3. Grade average ROS for this category
+    4. Minimum presentation (weekly_ros = 0, source = 'minimum_presentation')
+    """
+    from app.models import SKU as SKUModel
+    
+    # Get SKU to access category
+    sku = await db.get(SKUModel, sku_id)
+    if sku is None:
+        return TrueDemandResult(weekly_ros=0.0, source="error")
+    
+    category = sku.category
+    
+    # Try store-level ROS
+    store_ros = await _load_store_weekly_ros_from_db(
+        db=db,
+        brand_id=brand_id,
+        store_id=store_id,
+        product_category=category,
+        season_id=season_id,
+    )
+    
+    if store_ros is not None and float(store_ros) > 0:
+        # Apply stockout correction if available
+        corrected_ros, stockout_week, lost_sales, sample_size = await _calculate_stockout_correction(
+            db=db,
+            brand_id=brand_id,
+            store_id=store_id,
+            category=category,
+            season_id=season_id,
+            preloaded_rows=(preloaded_stockout_signals or {}).get((store_id, category)),
+        )
+        
+        if corrected_ros is not None and corrected_ros > float(store_ros):
+            return TrueDemandResult(
+                weekly_ros=corrected_ros,
+                raw_weekly_ros=float(store_ros),
+                source="store_historical",
+                is_corrected=True,
+                stockout_week=stockout_week,
+                lost_sales_estimate=lost_sales,
+                data_sample_size=sample_size,
+            )
+        return TrueDemandResult(
+            weekly_ros=float(store_ros),
+            raw_weekly_ros=float(store_ros),
+            source="store_historical",
+            is_corrected=False,
+            data_sample_size=sample_size,
+        )
+    
+    # Try cluster-level ROS
+    if cluster_id:
+        cluster_result = await _get_cluster_avg_ros(db, brand_id, cluster_id, sku_id, season_id)
+        if cluster_result.weekly_ros > 0:
+            return cluster_result
+    
+    # Try grade-level ROS
+    grade_result = await _get_grade_avg_ros(db, brand_id, store_grade, sku_id, season_id)
+    if grade_result.weekly_ros > 0:
+        return grade_result
+    
+    # Fallback to minimum presentation
+    return TrueDemandResult(
+        weekly_ros=0.0,
+        source="minimum_presentation",
+        raw_weekly_ros=0.0,
+    )

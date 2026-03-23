@@ -22,11 +22,13 @@ logger = logging.getLogger(__name__)
 
 import pandas as pd
 import redis.asyncio as redis
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
+    AllocationSession,
+    AllocationStatus,
     BuyPlanFile,
     BuyPlanLine,
     BrandSettings,
@@ -45,7 +47,7 @@ from app.models import (
     Upload,
     UploadStatus,
 )
-from app.services.allocation.store_profile import refresh_store_profiles
+from app.services.allocation.store_profile import build_all_store_profiles
 from app.config import get_settings
 from app.services.ingestion.bulk import execute_with_batching
 from app.services.ingestion.lookup import build_lookup_maps, normalize_key
@@ -121,6 +123,30 @@ def _require_columns(df: pd.DataFrame, required: list[str], sheet_name: str) -> 
         return
     raise ValueError(
         f"Column(s) {missing} not found in sheet '{sheet_name}'. Found columns: {list(df.columns)}"
+    )
+
+
+async def _resolve_ingestion_season(db: AsyncSession, brand_id: UUID) -> Season:
+    season = await db.scalar(
+        select(Season)
+        .where(Season.brand_id == brand_id, Season.status == SeasonStatus.ACTIVE)
+        .order_by(Season.start_date.desc())
+        .limit(1)
+    )
+    if season is not None:
+        return season
+
+    season = await db.scalar(
+        select(Season)
+        .where(Season.brand_id == brand_id, Season.status == SeasonStatus.PLANNING)
+        .order_by(Season.start_date.desc())
+        .limit(1)
+    )
+    if season is not None:
+        return season
+
+    raise ValueError(
+        "No active season found for this brand. Please create a season before uploading a buy file."
     )
 
 
@@ -722,6 +748,8 @@ async def _upsert_grn(
     ).scalars().all()
     grn_by_code = {normalize_key(grn.grn_code): grn for grn in existing_grns}
 
+    season = await _resolve_ingestion_season(db, brand_id)
+
     grn_rows: list[dict] = []
     for grn_code, lines in grouped.items():
         if not grn_code:
@@ -734,6 +762,7 @@ async def _upsert_grn(
                 "grn_date": first.get("grn_date"),
                 "warehouse_id": first.get("warehouse_id"),
                 "supplier_name": first.get("supplier_name"),
+                "season_id": season.id,
                 "status": "RECEIVED",
                 "created_by": user_id,
             }
@@ -748,6 +777,7 @@ async def _upsert_grn(
                     "grn_date": stmt.excluded.grn_date,
                     "warehouse_id": stmt.excluded.warehouse_id,
                     "supplier_name": stmt.excluded.supplier_name,
+                    "season_id": stmt.excluded.season_id,
                     "status": stmt.excluded.status,
                     "updated_at": utcnow(),
                 },
@@ -1066,7 +1096,7 @@ async def _upsert_buy_file(
     df: pd.DataFrame,
     progress: ProgressReporter,
 ) -> int:
-    _require_columns(df, ["sku_code"], "SS26 BUY FILE")
+    _require_columns(df, ["sku_code"], "BUY FILE")
     brand_id = upload.brand_id
     raw_config = await db.scalar(select(BrandSettings.config).where(BrandSettings.brand_id == brand_id))
     config = raw_config if isinstance(raw_config, dict) else {}
@@ -1184,24 +1214,7 @@ async def _upsert_buy_file(
         db.add(buy_plan_file)
         await db.flush()
 
-    season = await db.scalar(
-        select(Season)
-        .where(
-            Season.brand_id == brand_id,
-            Season.status == SeasonStatus.ACTIVE,
-        )
-        .order_by(Season.start_date.desc())
-    )
-    if season is None:
-        season = Season(
-            brand_id=brand_id,
-            name="SS26",
-            start_date=date(2026, 3, 1),
-            end_date=date(2026, 9, 30),
-            status=SeasonStatus.ACTIVE,
-        )
-        db.add(season)
-        await db.flush()
+    season = await _resolve_ingestion_season(db, brand_id)
 
     buy_plan_file.season_id = season.id
 
@@ -1281,21 +1294,21 @@ async def _upsert_buy_file(
         )
     ).scalars().all()
 
+    grn_code = f"{season.name}-INITIAL-STOCK"
     existing_grn = await db.scalar(
-        select(GRN).where(GRN.brand_id == brand_id, GRN.grn_code == "SS26-INITIAL-STOCK")
+        select(GRN).where(GRN.brand_id == brand_id, GRN.grn_code == grn_code)
     )
     if existing_grn is not None:
-        existing_lines = (
-            await db.execute(select(GRNLine).where(GRNLine.grn_id == existing_grn.id))
-        ).scalars().all()
-        if existing_lines:
-            line_ids = [line.id for line in existing_lines]
-            await db.execute(
-                GRNLineReservation.__table__.delete().where(GRNLineReservation.grn_line_id.in_(line_ids))
+        locked_sessions = await db.scalar(
+            select(func.count(AllocationSession.id)).where(
+                AllocationSession.grn_id == existing_grn.id,
+                AllocationSession.status.not_in([AllocationStatus.FAILED, AllocationStatus.DRAFT]),
             )
-            await db.execute(GRNLine.__table__.delete().where(GRNLine.id.in_(line_ids)))
-        await db.delete(existing_grn)
-        await db.flush()
+        )
+        if (locked_sessions or 0) > 0:
+            raise ValueError(
+                "Cannot replace GRN with active or approved allocations. Archive the current allocations first."
+            )
 
     total_units = 0
     unique_skus = {line.sku_id for line in buy_plan_lines}
@@ -1307,18 +1320,28 @@ async def _upsert_buy_file(
             available = units_received
         total_units += available
 
-    grn = GRN(
-        brand_id=brand_id,
-        grn_code="SS26-INITIAL-STOCK",
-        grn_date=date.today(),
-        supplier_name="Buy Plan Import",
-        status="RECEIVED",
-        total_units=total_units,
-        total_skus=len(unique_skus),
-        season_id=buy_plan_file.season_id,
-    )
-    db.add(grn)
-    await db.flush()
+    if existing_grn is None:
+        grn = GRN(
+            brand_id=brand_id,
+            grn_code=grn_code,
+            grn_date=date.today(),
+            supplier_name="Buy Plan Import",
+            status="RECEIVED",
+            total_units=total_units,
+            total_skus=len(unique_skus),
+            season_id=buy_plan_file.season_id,
+        )
+        db.add(grn)
+        await db.flush()
+    else:
+        grn = existing_grn
+        grn.grn_date = date.today()
+        grn.supplier_name = "Buy Plan Import"
+        grn.status = "RECEIVED"
+        grn.total_units = total_units
+        grn.total_skus = len(unique_skus)
+        grn.season_id = buy_plan_file.season_id
+        await db.flush()
 
     reservation_types = (
         await db.execute(
@@ -1326,21 +1349,28 @@ async def _upsert_buy_file(
         )
     ).scalars().all()
 
-    grn_line_rows: list[dict] = []
+    aggregated_by_sku: dict[UUID, dict[str, int | UUID | None]] = {}
     for line in buy_plan_lines:
         reserved = reservation_by_key.get((line.sku_id, line.store_group_rule), {"ecom": 0, "ars": 0})
-        grn_line_rows.append(
+        row = aggregated_by_sku.setdefault(
+            line.sku_id,
             {
                 "grn_id": grn.id,
                 "brand_id": brand_id,
                 "sku_id": line.sku_id,
-                "units_received": int(line.total_buy_qty or 0),
-                "total_buy_qty": int(line.total_buy_qty or 0),
-                "ecom_reserved_qty": int(reserved.get("ecom", 0)),
-                "ars_reserved_qty": int(reserved.get("ars", 0)),
+                "units_received": 0,
+                "total_buy_qty": 0,
+                "ecom_reserved_qty": 0,
+                "ars_reserved_qty": 0,
                 "buy_plan_line_id": line.id,
-            }
+            },
         )
+        row["units_received"] = int(row["units_received"] or 0) + int(line.total_buy_qty or 0)
+        row["total_buy_qty"] = int(row["total_buy_qty"] or 0) + int(line.total_buy_qty or 0)
+        row["ecom_reserved_qty"] = int(row["ecom_reserved_qty"] or 0) + int(reserved.get("ecom", 0))
+        row["ars_reserved_qty"] = int(row["ars_reserved_qty"] or 0) + int(reserved.get("ars", 0))
+
+    grn_line_rows = list(aggregated_by_sku.values())
 
     if grn_line_rows:
         def _grn_line_stmt(batch: list[dict]) -> object:
@@ -1363,6 +1393,18 @@ async def _upsert_buy_file(
             statement_factory=_grn_line_stmt,
             label="grn_line_upsert",
         )
+
+    keep_sku_ids = [row["sku_id"] for row in grn_line_rows]
+    existing_lines = (
+        await db.execute(select(GRNLine).where(GRNLine.grn_id == grn.id))
+    ).scalars().all()
+    stale_lines = [line for line in existing_lines if line.sku_id not in keep_sku_ids]
+    if stale_lines:
+        stale_line_ids = [line.id for line in stale_lines]
+        await db.execute(
+            GRNLineReservation.__table__.delete().where(GRNLineReservation.grn_line_id.in_(stale_line_ids))
+        )
+        await db.execute(GRNLine.__table__.delete().where(GRNLine.id.in_(stale_line_ids)))
 
     if reservation_types:
         fresh_grn_lines = (
@@ -1491,10 +1533,17 @@ async def process_upload(db: AsyncSession, upload: Upload, task_id: str | None =
 
     if upload.status in {UploadStatus.COMPLETED, UploadStatus.PARTIAL} and successes > 0:
         await _ensure_simple_mode_season(db, upload.brand_id, upload, valid_df)
-        if upload.upload_type.value in {"SALES", "INVENTORY", "GRN"}:
-            await _run_simple_mode_jobs(db, upload.brand_id)
         if upload.upload_type.value == "SALES":
-            await refresh_store_profiles(upload.brand_id, db)
+            try:
+                season = await _resolve_ingestion_season(db, upload.brand_id)
+                await build_all_store_profiles(db, upload.brand_id, season.id)
+                logger.info(
+                    "Store profiles built for brand=%s season=%s",
+                    upload.brand_id,
+                    season.name,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Store profile build failed (non-blocking): %s", exc)
 
     error_report_path: str | None = None
     if all_errors:

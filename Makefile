@@ -1,5 +1,7 @@
+.PHONY: up down migrate load-pilot test jobs logs shell-backend shell-db
+
 up:
-	docker compose up --build
+	docker compose up -d --build
 
 down:
 	docker compose down
@@ -7,24 +9,20 @@ down:
 migrate:
 	docker compose exec backend alembic upgrade head
 
-seed:
-	docker compose exec backend python -m scripts.seed_data
-
-init: migrate seed
-	@echo "✅ Database migrated and seeded. Login at http://localhost:3000 with admin@kyros.ai / kyros123"
-
-start: up
-	@echo "Waiting for services to start..."
-	sleep 8
-	docker compose exec backend alembic upgrade head
-	docker compose exec backend python -m scripts.seed_data
-	@echo "✅ Ready! Open http://localhost:3000"
-
 load-pilot:
-	@echo "Load pilot data using DB restore or ingestion APIs before testing."
+	docker compose exec backend python scripts/seed_data.py
 
 test:
-	docker compose exec backend pytest
+	docker compose exec backend pytest -v --tb=short
 
 jobs:
-	docker compose exec backend python -m app.tasks.run_jobs
+	docker compose exec backend celery -A app.tasks.celery_app worker --beat -l info
+
+logs:
+	docker compose logs -f backend celery_worker
+
+shell-backend:
+	docker compose exec backend bash
+
+shell-db:
+	docker compose exec postgres psql -U kyros -d kyros_dev

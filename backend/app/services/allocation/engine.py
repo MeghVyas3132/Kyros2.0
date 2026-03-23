@@ -30,6 +30,12 @@ from app.models import (
     StyleStoreList,
 )
 from app.services.allocation.cap import apply_inventory_cap
+from app.services.allocation.constants import (
+    DEFAULT_COVER_TARGETS,
+    DEFAULT_GRADE,
+    GRADE_SCORES,
+    MINIMUM_ALLOCATION_QTY,
+)
 from app.services.allocation.demand import (
     DemandSignal,
     calculate_store_demand_details,
@@ -39,6 +45,7 @@ from app.services.allocation.demand import (
     load_grade_map,
     load_grade_ros_averages,
     load_sales_history,
+    preload_stockout_signals,
 )
 from app.utils.date_utils import utcnow
 from app.services.allocation.size_curve import calculate_size_distribution
@@ -49,11 +56,6 @@ logger = logging.getLogger(__name__)
 ROS_WEIGHT = 0.50
 GRADE_WEIGHT = 0.25
 COVER_WEIGHT = 0.25
-MINIMUM_ALLOCATION_QTY = 6
-
-GRADE_SCORES = {"A+": 5, "A": 4, "B": 3, "C": 2}
-DEFAULT_GRADE = "C"
-
 CLIMATE_RULES = {
     "South": {"blocked_fabrics": ["Wool", "Heavy Fleece"]},
     "North": {"blocked_categories_in_summer": []},
@@ -68,22 +70,6 @@ DEFAULT_BRAND_SETTINGS: dict = {
         "scoring_mode": "GRADE_ONLY",
     },
 }
-
-DEFAULT_COVER_TARGETS: dict[tuple[str, str], int] = {
-    ("PROVEN", "A+"): 7,
-    ("PROVEN", "A"): 5,
-    ("PROVEN", "B"): 4,
-    ("PROVEN", "C"): 3,
-    ("CONFIDENT", "A+"): 6,
-    ("CONFIDENT", "A"): 5,
-    ("CONFIDENT", "B"): 3,
-    ("CONFIDENT", "C"): 2,
-    ("EXPERIMENTAL", "A+"): 4,
-    ("EXPERIMENTAL", "A"): 3,
-    ("EXPERIMENTAL", "B"): 2,
-    ("EXPERIMENTAL", "C"): 0,
-}
-
 
 @dataclass
 class ScoreData:
@@ -212,12 +198,17 @@ class AllocationEngine:
             load_grade_map(db, brand_id),
         )
 
-        sales_by_store_category, grade_ros_averages = await asyncio.gather(
+        sales_by_store_category, grade_ros_averages, preloaded_stockout_signals = await asyncio.gather(
             load_sales_history(db=db, brand_id=brand_id, season_id=previous_season_id),
             load_grade_ros_averages(db=db, brand_id=brand_id, season_id=previous_season_id),
+            preload_stockout_signals(db=db, brand_id=brand_id, season_id=previous_season_id),
         )
-        brand_settings = await self._load_brand_settings(brand_id, db)
-        store_profile_map = await load_store_profile_map(brand_id, db)
+        brand_settings, store_profile_map, inventory, ros_by_attribute = await asyncio.gather(
+            self._load_brand_settings(brand_id, db),
+            load_store_profile_map(brand_id, db),
+            self._load_latest_inventory(brand_id, db),
+            self._load_ros_by_attribute(brand_id, db),
+        )
 
         total_units = 0
         processed = 0
@@ -249,6 +240,27 @@ class AllocationEngine:
                 logger.warning("No eligible stores found for SKU %s under rule %s", sku.sku_code, rule)
                 continue
 
+            store_scores = await self.score_stores(
+                sku=sku,
+                stores=eligible_stores,
+                inventory=inventory,
+                ros_by_attribute=ros_by_attribute,
+                brand_id=brand_id,
+                db=db,
+                brand_settings=brand_settings,
+            )
+            eligible_scores = await self.filter_eligible(
+                store_scores=store_scores,
+                sku=sku,
+                inventory=inventory,
+                db=db,
+                brand_id=brand_id,
+            )
+            if not eligible_scores:
+                logger.warning("No stores passed eligibility constraints for SKU %s", sku.sku_code)
+                continue
+            eligible_stores = [self._store_cache[store_id] for store_id in eligible_scores.keys()]
+
             demand_tasks = []
             store_grade_map: dict[UUID, str] = {}
             for store in eligible_stores:
@@ -266,6 +278,7 @@ class AllocationEngine:
                         grade_ros_averages=grade_ros_averages,
                         min_presentation_qty=min_presentation_qty,
                         previous_season_id=previous_season_id,
+                        preloaded_stockout_signals=preloaded_stockout_signals,
                     )
                 )
 
@@ -286,17 +299,25 @@ class AllocationEngine:
                 demand_signal_map[store.id] = signal
 
             total_raw_demand = sum(store_demands.values())
-            scale_factor = (
-                float(available_units) / float(total_raw_demand)
-                if total_raw_demand > available_units and total_raw_demand > 0
-                else 1.0
-            )
+            base_distribution = self.distribute_units(eligible_scores, available_units, sku, brand_settings)
+            if base_distribution:
+                allowed_store_ids = set(base_distribution.keys())
+                store_demands = {
+                    store_id: qty for store_id, qty in store_demands.items() if store_id in allowed_store_ids
+                }
+                total_raw_demand = sum(store_demands.values())
+
+            if total_raw_demand <= 0:
+                continue
+
             final_allocations = apply_inventory_cap(
                 store_demands=store_demands,
                 available_qty=available_units,
                 min_presentation_qty=min_presentation_qty,
                 store_grades=store_grade_map,
             )
+            final_allocations = await self.apply_constraints(final_allocations, available_units, grn_line, db)
+            final_allocations = await self.apply_size_curves(final_allocations, sku, brand_id, db)
 
             size_distribution_sources: dict[UUID, str] = {}
 
@@ -320,6 +341,7 @@ class AllocationEngine:
                             store=store,
                             total_qty=final_qty,
                             store_grade=store_grade_map.get(store_id, DEFAULT_GRADE),
+                            historical_season_id=previous_season_id,
                         )
                     except Exception:  # noqa: BLE001
                         logger.warning(
@@ -351,6 +373,15 @@ class AllocationEngine:
                 local_scale_factor = (final_qty / raw_demand) if raw_demand > 0 else 1.0
                 weeks_cover = (final_qty / signal.weekly_ros) if signal.weekly_ros > 0 else 0.0
 
+                method_reasoning = await self.generate_reasoning(
+                    store_id=store_id,
+                    sku=sku,
+                    qty=final_qty,
+                    store_scores=eligible_scores,
+                    ros_data=ros_by_attribute,
+                    db=db,
+                )
+
                 projections = {
                     "size_split": size_split,
                     "size_distribution_source": size_distribution_source,
@@ -359,6 +390,7 @@ class AllocationEngine:
                     "available_qty": int(available_units),
                 }
                 reasoning = {
+                    **method_reasoning,
                     "weekly_ros": round(signal.weekly_ros, 3),
                     "store_ros_attribute": f"{signal.weekly_ros:.1f} units/week ({signal.ros_source})",
                     "cluster_avg_ros_attribute": f"{signal.weekly_ros:.1f} units/week (cluster proxy)",
@@ -387,7 +419,7 @@ class AllocationEngine:
                     "size_distribution_source": "store_historical"
                     if size_distribution_source == "historical"
                     else "brand_size_guide",
-                    "size_distribution_season": None,
+                    "size_distribution_season": str(previous_season_id) if previous_season_id else None,
                     "narrative_demand": self._build_demand_narrative(signal),
                     "narrative_adjustments": self._build_adjustment_narrative(signal.grade, signal.grade_multiplier),
                     "narrative_cap": self._build_cap_narrative(raw_demand, final_qty, local_scale_factor, available_units),
@@ -396,9 +428,9 @@ class AllocationEngine:
                     "style_dna_match": None,  # TODO: Phase 2
                     # Backward compatible fields currently used by frontend panel.
                     "current_stock_cover_days": round(weeks_cover * 7, 1),
-                    "display_capacity_available": None,
+                    "display_capacity_available": method_reasoning.get("display_capacity_available"),
                     "stockout_risk_at_lower_qty": (weeks_cover * 0.75) < max(season_weeks_remaining * 0.7, 1),
-                    "climate_match": True,
+                    "climate_match": method_reasoning.get("climate_match", True),
                     "weeks_cover_at_minus_25pct": round(weeks_cover * 0.75, 1),
                     "weeks_cover_at_plus_25pct": round(weeks_cover * 1.25, 1),
                 }

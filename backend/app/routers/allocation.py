@@ -2,8 +2,9 @@ from uuid import UUID
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import Response
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -175,6 +176,17 @@ async def generate_allocation(
             return envelope(existing)  # already running
         if existing.status == AllocationStatus.APPROVED:
             return envelope(existing)  # already approved
+        if existing.status == AllocationStatus.UNDER_REVIEW:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "CONFLICT",
+                    "message": (
+                        "This allocation is currently under review. Regenerating will discard "
+                        "review progress. Reset the session to DRAFT before regenerating."
+                    ),
+                },
+            )
 
     # Create/reuse session with GENERATING status
     if existing is None:
@@ -218,57 +230,29 @@ async def list_sessions(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    """List all allocation sessions for the current brand"""
-    from sqlalchemy import desc
-    
-    sessions = (
+    rows = (
         await db.execute(
-            select(AllocationSession)
+            select(AllocationSession, GRN)
+            .outerjoin(GRN, GRN.id == AllocationSession.grn_id)
             .where(AllocationSession.brand_id == current_user.brand_id)
             .order_by(desc(AllocationSession.generated_at), desc(AllocationSession.created_at))
         )
-    ).scalars().all()
-    
-    # Enrich sessions with GRN data
+    ).all()
+
     result = []
-    for session in sessions:
-        try:
-            grn = await db.get(GRN, session.grn_id)
-            session_data = {
-                "id": str(session.id),
-                "grn_id": str(session.grn_id),
-                "brand_id": str(session.brand_id),
-                "season_id": str(session.season_id) if session.season_id else None,
-                "status": session.status.value if session.status else None,
-                "total_stores": session.total_stores,
-                "failure_reason": session.failure_reason,
-                "generated_at": session.generated_at.isoformat() if session.generated_at else None,
-                "created_at": session.created_at.isoformat() if session.created_at else None,
-                "grn": {
-                    "grn_code": grn.grn_code,
-                    "total_units": grn.total_units,
-                    "total_skus": grn.total_skus,
-                } if grn else None,
+    for session, grn in rows:
+        session_payload = jsonable_encoder(session)
+        session_payload["grn"] = (
+            {
+                "grn_code": grn.grn_code,
+                "total_units": grn.total_units,
+                "total_skus": grn.total_skus,
             }
-            result.append(session_data)
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(f"Failed to enrich session {session.id}: {str(e)}")
-            # Still include the session even if GRN enrichment fails
-            session_data = {
-                "id": str(session.id),
-                "grn_id": str(session.grn_id),
-                "brand_id": str(session.brand_id),
-                "season_id": str(session.season_id) if session.season_id else None,
-                "status": session.status.value if session.status else None,
-                "total_stores": session.total_stores,
-                "failure_reason": session.failure_reason,
-                "generated_at": session.generated_at.isoformat() if session.generated_at else None,
-                "created_at": session.created_at.isoformat() if session.created_at else None,
-                "grn": None,
-            }
-            result.append(session_data)
-    
+            if grn is not None
+            else None
+        )
+        result.append(session_payload)
+
     return envelope(result)
 
 
@@ -419,6 +403,78 @@ async def export_session(
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=allocation-{session_id}.csv"},
     )
+
+
+@router.get("/{allocation_id}/insights")
+async def get_allocation_insights(
+    allocation_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return VP-level insight cards for an allocation session."""
+    
+    session = await db.get(AllocationSession, allocation_id)
+    if session is None or session.brand_id != current_user.brand_id:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Fetch all allocation lines with demand data
+    result = await db.execute(
+        select(AllocationLine)
+        .where(AllocationLine.session_id == allocation_id)
+        .where(AllocationLine.final_qty > 0)
+    )
+    lines = result.scalars().all()
+    
+    if not lines:
+        raise HTTPException(status_code=404, detail="No allocation lines found")
+    
+    # Calculate metrics from reasoning payload
+    corrected_lines = [
+        l for l in lines 
+        if isinstance(l.ai_reasoning, dict) and l.ai_reasoning.get("is_stockout_corrected")
+    ]
+    
+    under_covered = [
+        l for l in lines
+        if isinstance(l.ai_reasoning, dict) and (
+            l.ai_reasoning.get("weeks_cover_at_recommended", 99) < 
+            l.ai_reasoning.get("cover_target_weeks", 0) * 0.7
+        )
+    ]
+    
+    def confidence_tier(line):
+        basis = line.ai_reasoning.get("confidence_basis", "") if isinstance(line.ai_reasoning, dict) else ""
+        if "High" in basis:
+            return "high"
+        if "Moderate" in basis:
+            return "moderate"
+        return "low"
+    
+    return envelope({
+        "lost_sales_correction": {
+            "stores_corrected": len(set(l.store_id for l in corrected_lines)),
+            "estimated_recovered_units": round(sum(
+                (l.ai_reasoning.get("lost_sales_estimate") or 0) if isinstance(l.ai_reasoning, dict) else 0
+                for l in corrected_lines
+            )),
+            "headline": f"Stockout correction applied to {len(set(l.store_id for l in corrected_lines))} stores.",
+            "subtext": "These stores stocked out in SS25. Allocations corrected upward.",
+        },
+        "under_covered_stores": {
+            "count": len(set(l.store_id for l in under_covered)),
+            "headline": (
+                f"{len(set(l.store_id for l in under_covered))} stores below target cover "
+                f"due to inventory constraints."
+            ),
+        },
+        "confidence_breakdown": {
+            "high": sum(1 for l in lines if confidence_tier(l) == "high"),
+            "moderate": sum(1 for l in lines if confidence_tier(l) == "moderate"),
+            "low": sum(1 for l in lines if confidence_tier(l) == "low"),
+        },
+        "total_lines": len(lines),
+        "total_units_allocated": sum(l.final_qty for l in lines if l.final_qty),
+    })
 
 
 @router.get("/sessions/{session_id}/stores/{store_id}/story-concentration")

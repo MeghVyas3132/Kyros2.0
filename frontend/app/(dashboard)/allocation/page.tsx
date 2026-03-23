@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { apiRequest } from "@/lib/api";
 import { AllocationSession } from "@/types";
+
+const EXPORT_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 const STATUS_CONFIG: Record<string, { label: string; color: string; bg: string }> = {
   DRAFT: { label: "Draft", color: "text-slate-600", bg: "bg-slate-100" },
@@ -25,46 +27,86 @@ interface AllocationWithGRN extends AllocationSession {
 
 export default function AllocationsPage() {
   const [allocations, setAllocations] = useState<AllocationWithGRN[]>([]);
-  const [filteredAllocations, setFilteredAllocations] = useState<AllocationWithGRN[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const mountedRef = useRef(true);
+  const inFlightRef = useRef<Promise<void> | null>(null);
+  const activeRequestRef = useRef<AbortController | null>(null);
 
-  // Load allocations on mount and poll every 5 seconds
-  useEffect(() => {
-    let mounted = true;
+  const loadAllocations = useCallback(async (showSpinner: boolean) => {
+    if (inFlightRef.current) {
+      return;
+    }
 
-    const fetchAllocations = async () => {
+    const controller = new AbortController();
+    activeRequestRef.current = controller;
+
+    const request = (async () => {
+      if (showSpinner && mountedRef.current) {
+        setLoading(true);
+      }
+
       try {
         setError(null);
         const response = await apiRequest<AllocationWithGRN[]>("/api/v1/allocation/sessions", {
           method: "GET",
+          signal: controller.signal,
+          timeoutMs: 15000,
+          retryCount: 1,
         });
-        if (mounted) {
-          setAllocations(Array.isArray(response) ? response : []);
-          setLoading(false);
-        }
+
+        if (!mountedRef.current) return;
+        setAllocations(Array.isArray(response) ? response : []);
       } catch (err) {
-        if (mounted) {
-          setError(err instanceof Error ? err.message : "Failed to load allocations");
-          setAllocations([]);
+        if (!mountedRef.current || controller.signal.aborted) return;
+        setError(err instanceof Error ? err.message : "Failed to load allocations");
+        setAllocations([]);
+      } finally {
+        if (mountedRef.current && showSpinner) {
           setLoading(false);
         }
+        if (activeRequestRef.current === controller) {
+          activeRequestRef.current = null;
+        }
+        inFlightRef.current = null;
       }
-    };
+    })();
 
-    fetchAllocations();
-    const interval = setInterval(fetchAllocations, 5000);
-
-    return () => {
-      mounted = false;
-      clearInterval(interval);
-    };
+    inFlightRef.current = request;
+    await request;
   }, []);
 
-  // Filter allocations whenever allocations, search, or status filter changes
   useEffect(() => {
+    mountedRef.current = true;
+    void loadAllocations(true);
+
+    return () => {
+      mountedRef.current = false;
+      activeRequestRef.current?.abort();
+    };
+  }, [loadAllocations]);
+
+  const hasGenerating = useMemo(
+    () => allocations.some((allocation) => allocation.status === "GENERATING"),
+    [allocations]
+  );
+
+  useEffect(() => {
+    if (!hasGenerating) return;
+
+    const interval = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      void loadAllocations(false);
+    }, 5000);
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, [hasGenerating, loadAllocations]);
+
+  const filteredAllocations = useMemo(() => {
     let filtered = allocations;
 
     // Filter by status
@@ -85,13 +127,13 @@ export default function AllocationsPage() {
     }
 
     // Sort by generated_at descending
-    const sorted = filtered.sort((a, b) => {
+    const sorted = [...filtered].sort((a, b) => {
       const dateA = new Date(a.generated_at || 0).getTime();
       const dateB = new Date(b.generated_at || 0).getTime();
       return dateB - dateA;
     });
 
-    setFilteredAllocations(sorted);
+    return sorted;
   }, [allocations, statusFilter, searchTerm]);
 
   const formatDate = (date: string | null | undefined) => {
@@ -164,6 +206,12 @@ export default function AllocationsPage() {
             <div>
               <p className="text-sm font-medium text-red-900">Failed to load allocations</p>
               <p className="mt-1 text-xs text-red-700">{error}</p>
+              <button
+                onClick={() => void loadAllocations(true)}
+                className="mt-3 inline-flex items-center rounded-md bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700"
+              >
+                Retry Load
+              </button>
             </div>
           </div>
         </div>
@@ -293,6 +341,7 @@ export default function AllocationsPage() {
                                 method: "POST",
                                 body: JSON.stringify({ grn_id: allocation.grn_id }),
                               });
+                              await loadAllocations(false);
                             }}
                             className="inline-flex items-center gap-1.5 rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700 transition"
                           >
@@ -301,7 +350,7 @@ export default function AllocationsPage() {
                         ) : null}
                         {["UNDER_REVIEW", "APPROVED", "DISPATCHED"].includes(allocation.status || "") ? (
                           <a
-                            href={`http://localhost:8000/api/v1/allocation/sessions/${allocation.id}/export`}
+                            href={`${EXPORT_BASE_URL}/api/v1/allocation/sessions/${allocation.id}/export`}
                             download={`allocation-${allocation.grn?.grn_code || allocation.id}.csv`}
                             className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 transition"
                           >
