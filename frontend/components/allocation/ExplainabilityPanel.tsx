@@ -24,7 +24,23 @@ export function ExplainabilityPanel({ line, skuName, styleRiskGroup }: Props) {
     return <div className="p-4 text-sm text-slate-500">No reasoning data available for this line.</div>;
   }
 
-  const sizeSplitEntries = Object.entries(r.size_split || {}).sort(([a], [b]) => {
+  const reasoning = r;
+  const ros = reasoning?.weekly_ros ?? reasoning?.raw_weekly_ros ?? 0;
+  const rawRos = reasoning?.raw_weekly_ros ?? reasoning?.weekly_ros ?? 0;
+  const excluded = reasoning?.excluded_by_capacity ?? false;
+  const exclusionReason = reasoning?.exclusion_reason ?? null;
+  const coverTargetWeeks = reasoning?.cover_target_weeks ?? 0;
+  const storeGrade = reasoning?.store_grade ?? "-";
+  const weeksCoverRecommended = reasoning?.weeks_cover_at_recommended ?? 0;
+  const stockoutWeek = reasoning?.stockout_week ?? null;
+  const lostSalesEstimate = reasoning?.lost_sales_estimate ?? null;
+  const narrativeDemand = reasoning?.narrative_demand ?? "Demand narrative unavailable.";
+  const confidenceBasis = reasoning?.confidence_basis ?? "Confidence basis unavailable.";
+  const narrativeAdjustments = reasoning?.narrative_adjustments ?? "Adjustment narrative unavailable.";
+  const narrativeCap = reasoning?.narrative_cap ?? "Inventory narrative unavailable.";
+  const sizeDistributionSource = reasoning?.size_distribution_source ?? "unknown";
+
+  const sizeSplitEntries = Object.entries(reasoning?.size_split ?? {}).sort(([a], [b]) => {
     const ai = SIZE_ORDER.indexOf(a);
     const bi = SIZE_ORDER.indexOf(b);
     return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
@@ -36,46 +52,46 @@ export function ExplainabilityPanel({ line, skuName, styleRiskGroup }: Props) {
       <div className="grid grid-cols-2 gap-3 rounded-lg border bg-slate-50/70 p-4">
         <div>
           <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Target Cover</p>
-          <p className="text-3xl font-bold tabular-nums">{r.cover_target_weeks}w</p>
-          <p className="mt-1 text-xs text-slate-500">{styleRiskGroup ?? "-"} × Grade {r.store_grade}</p>
+          <p className="text-3xl font-bold tabular-nums">{coverTargetWeeks}w</p>
+          <p className="mt-1 text-xs text-slate-500">{styleRiskGroup ?? "-"} × Grade {storeGrade}</p>
         </div>
         <div>
           <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Allocated</p>
-          <p className="text-3xl font-bold tabular-nums">{r.weeks_cover_at_recommended}w</p>
+          <p className="text-3xl font-bold tabular-nums">{weeksCoverRecommended}w</p>
           <p className="mt-1 text-xs text-slate-500">at {line.final_qty} units</p>
         </div>
       </div>
 
-      {r.is_stockout_corrected && (
+      {(reasoning?.is_stockout_corrected ?? false) && (
         <div className="rounded-md border border-amber-200 bg-amber-50 p-3">
           <p className="mb-1 text-xs font-medium uppercase tracking-wide text-amber-800">Stockout correction applied</p>
           <p className="text-amber-700">
-            Store stocked out around week {r.stockout_week ?? "?"}.
-            {r.lost_sales_estimate != null ? <> Estimated {Math.round(r.lost_sales_estimate)} lost units.</> : null} Demand corrected from <strong>{r.raw_weekly_ros.toFixed(1)}</strong> to <strong>{r.weekly_ros.toFixed(1)}</strong> units/week.
+            Store stocked out around week {stockoutWeek ?? "?"}.
+            {lostSalesEstimate != null ? <> Estimated {Math.round(lostSalesEstimate)} lost units.</> : null} Demand corrected from <strong>{rawRos.toFixed(1)}</strong> to <strong>{ros.toFixed(1)}</strong> units/week.
           </p>
         </div>
       )}
 
       <div>
         <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Demand Basis</p>
-        <p className="text-slate-900 leading-relaxed">{r.narrative_demand}</p>
-        <p className="mt-1 text-xs text-slate-500">{r.confidence_basis}</p>
+        <p className="text-slate-900 leading-relaxed">{narrativeDemand}</p>
+        <p className="mt-1 text-xs text-slate-500">{confidenceBasis}</p>
       </div>
 
       <div>
         <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Store Adjustment</p>
-        <p className="text-slate-900 leading-relaxed">{r.narrative_adjustments}</p>
+        <p className="text-slate-900 leading-relaxed">{narrativeAdjustments}</p>
       </div>
 
       <div>
         <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Inventory</p>
-        <p className="text-slate-900 leading-relaxed">{r.narrative_cap}</p>
+        <p className="text-slate-900 leading-relaxed">{narrativeCap}</p>
       </div>
 
       {sizeSplitEntries.length > 0 && (
         <div>
           <p className="mb-2 text-xs uppercase tracking-wide text-slate-500">
-            Size Split <span className="normal-case font-normal">({(r.size_distribution_source ?? "unknown").replace(/_/g, " ")})</span>
+            Size Split <span className="normal-case font-normal">({sizeDistributionSource.replace(/_/g, " ")})</span>
           </p>
           <div className="space-y-1.5">
             {sizeSplitEntries.map(([size, qty]) => {
@@ -94,10 +110,10 @@ export function ExplainabilityPanel({ line, skuName, styleRiskGroup }: Props) {
         </div>
       )}
 
-      {r.excluded_by_capacity && r.exclusion_reason && (
+      {excluded && exclusionReason && (
         <div className="rounded-md border border-red-200 bg-red-50 p-3">
           <p className="mb-1 text-xs font-medium uppercase tracking-wide text-red-800">Excluded by display capacity</p>
-          <p className="text-red-700">{r.exclusion_reason}</p>
+          <p className="text-red-700">{exclusionReason}</p>
         </div>
       )}
 

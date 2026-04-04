@@ -137,8 +137,8 @@ async def load_sales_history(
     db: AsyncSession,
     brand_id: UUID,
     season_id: UUID | None,
-) -> dict[tuple[UUID, str], float]:
-    """Return store x category weekly ROS for the selected season."""
+) -> dict[tuple[UUID, UUID], float]:
+    """Return store x SKU weekly ROS for the selected season."""
     date_range = await _season_date_range(db, brand_id, season_id)
     if date_range is None:
         return {}
@@ -147,29 +147,26 @@ async def load_sales_history(
     rows = await db.execute(
         select(
             SalesData.store_id,
-            SKU.category,
-            (
-                func.coalesce(func.sum(SalesData.units_sold), 0)
-                / func.nullif(func.count(distinct(SalesData.week_start_date)), 0)
-            ).label("weekly_ros"),
+            SalesData.sku_id,
+            func.sum(SalesData.units_sold).label("total_sold"),
+            func.count(distinct(SalesData.week_start_date)).label("weeks_with_data"),
         )
-        .join(SKU, SKU.id == SalesData.sku_id)
         .where(
             SalesData.brand_id == brand_id,
             SalesData.week_start_date >= start_date,
             SalesData.week_start_date <= end_date,
         )
-        .group_by(SalesData.store_id, SKU.category)
+        .group_by(SalesData.store_id, SalesData.sku_id)
     )
 
-    result: dict[tuple[UUID, str], float] = {}
-    for store_id, category, weekly_ros in rows.all():
-        if category is None:
+    result: dict[tuple[UUID, UUID], float] = {}
+    for store_id, sku_id, total_sold, weeks_with_data in rows.all():
+        if weeks_with_data is None or weeks_with_data == 0:
             continue
-        value = float(weekly_ros or 0.0)
-        if value <= 0:
+        weekly_ros = float(total_sold or 0) / float(weeks_with_data)
+        if weekly_ros <= 0:
             continue
-        result[(store_id, category)] = value
+        result[(store_id, sku_id)] = weekly_ros
     return result
 
 
@@ -236,20 +233,22 @@ async def load_grade_ros_averages(
     db: AsyncSession,
     brand_id: UUID,
     season_id: UUID | None,
-) -> dict[tuple[str, str], float]:
-    """Return grade x category average weekly ROS."""
+) -> dict[tuple[str, UUID], float]:
+    """Return grade x SKU average weekly ROS."""
     date_range = await _season_date_range(db, brand_id, season_id)
     if date_range is None:
         return {}
 
     start_date, end_date = date_range
 
+    # Subquery: Calculate weekly ROS per store × SKU
     store_ros_subquery = (
         select(
             SalesData.store_id.label("store_id"),
+            SalesData.sku_id.label("sku_id"),
             SKU.category.label("category"),
             (
-                func.coalesce(func.sum(SalesData.units_sold), 0)
+                func.sum(SalesData.units_sold)
                 / func.nullif(func.count(distinct(SalesData.week_start_date)), 0)
             ).label("store_weekly_ros"),
         )
@@ -259,14 +258,15 @@ async def load_grade_ros_averages(
             SalesData.week_start_date >= start_date,
             SalesData.week_start_date <= end_date,
         )
-        .group_by(SalesData.store_id, SKU.category)
+        .group_by(SalesData.store_id, SalesData.sku_id, SKU.category)
         .subquery()
     )
 
+    # Join with store grades and average by grade × SKU
     rows = await db.execute(
         select(
             StoreProductGrade.grade,
-            StoreProductGrade.product_category,
+            store_ros_subquery.c.sku_id,
             func.avg(store_ros_subquery.c.store_weekly_ros).label("grade_avg_ros"),
         )
         .join(
@@ -275,17 +275,17 @@ async def load_grade_ros_averages(
             & (store_ros_subquery.c.category == StoreProductGrade.product_category),
         )
         .where(StoreProductGrade.brand_id == brand_id)
-        .group_by(StoreProductGrade.grade, StoreProductGrade.product_category)
+        .group_by(StoreProductGrade.grade, store_ros_subquery.c.sku_id)
     )
 
-    result: dict[tuple[str, str], float] = {}
-    for grade, product_category, avg_ros in rows.all():
-        if product_category is None:
+    result: dict[tuple[str, UUID], float] = {}
+    for grade, sku_id, avg_ros in rows.all():
+        if sku_id is None:
             continue
         value = float(avg_ros or 0.0)
         if value <= 0:
             continue
-        result[(_normalize_grade(grade), product_category)] = value
+        result[(_normalize_grade(grade), sku_id)] = value
     return result
 
 
@@ -297,8 +297,8 @@ async def calculate_store_demand(
     season_weeks_remaining: int,
     fallback_grade: str,
     *,
-    sales_by_store_category: Mapping[tuple[UUID, str], float] | None = None,
-    grade_ros_averages: Mapping[tuple[str, str], float] | None = None,
+    sales_by_store_category: Mapping[tuple[UUID, UUID], float] | None = None,
+    grade_ros_averages: Mapping[tuple[str, UUID], float] | None = None,
     min_presentation_qty: int | None = None,
     previous_season_id: UUID | None = None,
 ) -> int:
@@ -325,29 +325,28 @@ async def calculate_store_demand_details(
     season_weeks_remaining: int,
     fallback_grade: str,
     *,
-    sales_by_store_category: Mapping[tuple[UUID, str], float] | None = None,
-    grade_ros_averages: Mapping[tuple[str, str], float] | None = None,
+    sales_by_store_category: Mapping[tuple[UUID, UUID], float] | None = None,
+    grade_ros_averages: Mapping[tuple[str, UUID], float] | None = None,
     min_presentation_qty: int | None = None,
     previous_season_id: UUID | None = None,
     preloaded_stockout_signals: Mapping[tuple[UUID, str], list[tuple[date, int, bool | None]]] | None = None,
 ) -> DemandSignal:
+    """
+    Calculate demand for a store × SKU combination using three-tier fallback:
+    1. Store-specific historical ROS for this SKU
+    2. Grade-level average ROS for this SKU
+    3. Minimum presentation quantity
+    """
     category = sku.category
     grade = _normalize_grade(fallback_grade)
     min_qty = min_presentation_qty if min_presentation_qty is not None else await get_min_presentation_qty(db, brand_id)
     weeks_remaining = max(int(season_weeks_remaining or DEFAULT_SEASON_WEEKS_REMAINING), 1)
 
+    # TIER 1: Try store-specific ROS for this SKU
     store_ros = None
     if sales_by_store_category is not None:
-        store_ros = sales_by_store_category.get((store.id, category))
-    if store_ros is None:
-        store_ros = await _load_store_weekly_ros_from_db(
-            db=db,
-            brand_id=brand_id,
-            store_id=store.id,
-            product_category=category,
-            season_id=previous_season_id,
-        )
-
+        store_ros = sales_by_store_category.get((store.id, sku.id))
+    
     sample_size = 0
     is_corrected = False
     stockout_week: int | None = None
@@ -357,6 +356,7 @@ async def calculate_store_demand_details(
     if store_ros is not None and float(store_ros) > 0:
         source = "store_historical"
         base_ros = float(store_ros)
+        # Note: Stockout correction is category-level, kept for consistency
         corrected_ros, stockout_week, lost_sales_estimate, sample_size = await _calculate_stockout_correction(
             db=db,
             brand_id=brand_id,
@@ -369,22 +369,40 @@ async def calculate_store_demand_details(
             base_ros = corrected_ros
             is_corrected = True
     else:
+        # TIER 2: Try grade-level average for this SKU
         grade_ros = None
         if grade_ros_averages is not None:
-            grade_ros = grade_ros_averages.get((grade, category))
-        if grade_ros is None:
-            grade_ros = await _load_grade_weekly_ros_from_db(
-                db=db,
-                brand_id=brand_id,
-                product_category=category,
-                grade=grade,
-                season_id=previous_season_id,
-            )
-
+            grade_ros = grade_ros_averages.get((grade, sku.id))
+        
         if grade_ros is not None and float(grade_ros) > 0:
             source = "grade_average"
             base_ros = float(grade_ros)
         else:
+            style_dna = await _load_style_dna_proxy(
+                db=db,
+                brand_id=brand_id,
+                store_id=store.id,
+                sku=sku,
+                season_id=previous_season_id,
+            )
+            if style_dna is not None:
+                dna_ros, matched_style_code, similarity_score, dna_sample_size = style_dna
+                source = "style_dna_analogue"
+                multiplier = GRADE_MULTIPLIERS.get(grade, 1.00)
+                raw_demand = round(dna_ros * weeks_remaining)
+                raw_demand = int(max(raw_demand, min_qty))
+                return DemandSignal(
+                    demand=raw_demand,
+                    weekly_ros=float(dna_ros),
+                    ros_source=source,
+                    grade=grade,
+                    grade_multiplier=multiplier,
+                    data_sample_size=dna_sample_size,
+                    matched_style_code=matched_style_code,
+                    similarity_score=similarity_score,
+                )
+
+            # TIER 3: Fallback to minimum presentation
             return DemandSignal(
                 demand=int(min_qty),
                 weekly_ros=0.0,
@@ -394,9 +412,11 @@ async def calculate_store_demand_details(
                 data_sample_size=0,
             )
 
+    # Grade multiplier is informational only - do not apply to ROS
+    # The weekly_ros stored here is the unadjusted base rate
+    # Engine applies multiplier during final calculation
     multiplier = GRADE_MULTIPLIERS.get(grade, 1.00)
-    adjusted_ros = base_ros * multiplier
-    raw_demand = round(adjusted_ros * weeks_remaining)
+    raw_demand = round(base_ros * weeks_remaining)
     raw_demand = int(max(raw_demand, min_qty))
 
     return DemandSignal(
@@ -610,6 +630,110 @@ async def _load_grade_weekly_ros_from_db(
         return None
     avg_ros = float(value or 0.0)
     return avg_ros if avg_ros > 0 else None
+
+
+def _attribute_match_score(left: str | None, right: str | None, weight: float) -> float:
+    if not left or not right:
+        return 0.0
+    if left.strip().lower() == right.strip().lower():
+        return weight
+    return 0.0
+
+
+def _style_similarity_score(sku: SKU, candidate: dict[str, object]) -> float:
+    score = 0.35  # Category is fixed by candidate query
+    score += _attribute_match_score(sku.fabric, candidate.get("fabric"), 0.20)
+    score += _attribute_match_score(sku.price_band, candidate.get("price_band"), 0.15)
+    score += _attribute_match_score(sku.colour_family, candidate.get("colour_family"), 0.15)
+    score += _attribute_match_score(sku.resolved_risk_level, candidate.get("resolved_risk_level"), 0.10)
+    score += _attribute_match_score(sku.sub_category, candidate.get("sub_category"), 0.05)
+    return min(score, 1.0)
+
+
+async def _load_style_dna_proxy(
+    db: AsyncSession,
+    brand_id: UUID,
+    store_id: UUID,
+    sku: SKU,
+    season_id: UUID | None,
+) -> tuple[float, str, float, int] | None:
+    date_range = await _season_date_range(db, brand_id, season_id)
+    if date_range is None:
+        return None
+
+    start_date, end_date = date_range
+    rows = await db.execute(
+        select(
+            SKU.sku_code,
+            SKU.fabric,
+            SKU.price_band,
+            SKU.colour_family,
+            SKU.resolved_risk_level,
+            SKU.sub_category,
+            (
+                func.coalesce(func.sum(SalesData.units_sold), 0)
+                / func.nullif(func.count(distinct(SalesData.week_start_date)), 0)
+            ).label("weekly_ros"),
+            func.count(distinct(SalesData.week_start_date)).label("weeks_with_data"),
+        )
+        .join(SKU, SKU.id == SalesData.sku_id)
+        .where(
+            SalesData.brand_id == brand_id,
+            SalesData.store_id == store_id,
+            SalesData.week_start_date >= start_date,
+            SalesData.week_start_date <= end_date,
+            SKU.category == sku.category,
+            SalesData.sku_id != sku.id,
+        )
+        .group_by(
+            SKU.sku_code,
+            SKU.fabric,
+            SKU.price_band,
+            SKU.colour_family,
+            SKU.resolved_risk_level,
+            SKU.sub_category,
+        )
+        .having(
+            (
+                func.coalesce(func.sum(SalesData.units_sold), 0)
+                / func.nullif(func.count(distinct(SalesData.week_start_date)), 0)
+            )
+            > 0
+        )
+    )
+
+    scored: list[dict[str, object]] = []
+    for row in rows.all():
+        candidate = {
+            "sku_code": row.sku_code,
+            "fabric": row.fabric,
+            "price_band": row.price_band,
+            "colour_family": row.colour_family,
+            "resolved_risk_level": row.resolved_risk_level,
+            "sub_category": row.sub_category,
+            "weekly_ros": float(row.weekly_ros or 0.0),
+            "weeks_with_data": int(row.weeks_with_data or 0),
+        }
+        similarity = _style_similarity_score(sku, candidate)
+        if similarity >= 0.45 and candidate["weekly_ros"] > 0:
+            candidate["similarity"] = similarity
+            scored.append(candidate)
+
+    if not scored:
+        return None
+
+    top_matches = sorted(scored, key=lambda item: float(item["similarity"]), reverse=True)[:5]
+    weight_sum = sum(float(item["similarity"]) for item in top_matches)
+    if weight_sum <= 0:
+        return None
+
+    weighted_ros = sum(
+        float(item["weekly_ros"]) * float(item["similarity"]) for item in top_matches
+    ) / weight_sum
+    top_match = top_matches[0]
+    avg_similarity = sum(float(item["similarity"]) for item in top_matches) / len(top_matches)
+    sample_size = sum(int(item["weeks_with_data"]) for item in top_matches)
+    return weighted_ros, str(top_match["sku_code"]), round(avg_similarity, 3), sample_size
 
 
 def _normalize_grade(grade: str | None) -> str:

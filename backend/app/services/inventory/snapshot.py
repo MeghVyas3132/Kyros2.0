@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import and_, case, func, select
@@ -20,15 +19,34 @@ from app.models import (
 )
 
 
+UPSERT_BATCH_SIZE = 1000
+
+
 def _safe_div(numerator: float, denominator: float) -> float | None:
     if denominator <= 0:
         return None
     return numerator / denominator
 
 
-def _chunked(rows: list[dict], size: int = 1000):
-    for idx in range(0, len(rows), size):
-        yield rows[idx : idx + size]
+def _inventory_state_upsert_stmt(rows: list[dict]):
+    stmt = insert(InventoryState).values(rows)
+    return stmt.on_conflict_do_update(
+        constraint="uq_inventory_state_unique",
+        set_={
+            "units_on_hand": stmt.excluded.units_on_hand,
+            "units_in_transit": stmt.excluded.units_in_transit,
+            "units_sold_7d": stmt.excluded.units_sold_7d,
+            "units_sold_28d": stmt.excluded.units_sold_28d,
+            "ros_7d": stmt.excluded.ros_7d,
+            "ros_28d": stmt.excluded.ros_28d,
+            "stock_cover_days": stmt.excluded.stock_cover_days,
+            "days_since_grn": stmt.excluded.days_since_grn,
+            "days_since_first_sale": stmt.excluded.days_since_first_sale,
+            "sell_through_pct": stmt.excluded.sell_through_pct,
+            "is_stockout": stmt.excluded.is_stockout,
+            "is_new_arrival": stmt.excluded.is_new_arrival,
+        },
+    )
 
 
 async def build_snapshot_for_brand(brand_id: UUID, snapshot_date: date, db: AsyncSession) -> int:
@@ -73,8 +91,8 @@ async def build_snapshot_for_brand(brand_id: UUID, snapshot_date: date, db: Asyn
             InventoryState.location_id,
             InventoryState.sku_id,
             InventoryState.units_on_hand,
-            InventoryState.snapshot_date,
         )
+        .distinct(InventoryState.location_id, InventoryState.sku_id)
         .where(
             InventoryState.brand_id == brand_id,
             InventoryState.location_type == "STORE",
@@ -87,10 +105,8 @@ async def build_snapshot_for_brand(brand_id: UUID, snapshot_date: date, db: Asyn
         )
     )
     latest_inv_map: dict[tuple[str, UUID], int] = {}
-    for location_id, sku_id, units_on_hand, _ in latest_inv_rows.all():
-        key = (location_id, sku_id)
-        if key not in latest_inv_map:
-            latest_inv_map[key] = int(units_on_hand or 0)
+    for location_id, sku_id, units_on_hand in latest_inv_rows.all():
+        latest_inv_map[(location_id, sku_id)] = int(units_on_hand or 0)
 
     sales_rows = await db.execute(
         select(
@@ -160,7 +176,9 @@ async def build_snapshot_for_brand(brand_id: UUID, snapshot_date: date, db: Asyn
     )
     last_grn_map = {sku_id: grn_date for sku_id, grn_date in last_grn_rows.all()}
 
-    upsert_rows = []
+    upsert_count = 0
+    upsert_batch: list[dict] = []
+
     for location_id, sku_id in pair_keys:
         units_on_hand = int(latest_inv_map.get((location_id, sku_id), 0))
         sales = sales_map.get((location_id, sku_id), {})
@@ -193,7 +211,7 @@ async def build_snapshot_for_brand(brand_id: UUID, snapshot_date: date, db: Asyn
         first_sale_date = sales.get("first_sale_date")
         days_since_first_sale = (snapshot_date - first_sale_date).days if first_sale_date else None
 
-        upsert_rows.append(
+        upsert_batch.append(
             {
                 "brand_id": brand_id,
                 "snapshot_date": snapshot_date,
@@ -214,30 +232,16 @@ async def build_snapshot_for_brand(brand_id: UUID, snapshot_date: date, db: Asyn
                 "is_new_arrival": days_since_grn is not None and days_since_grn <= 14,
             }
         )
+        upsert_count += 1
 
-    if upsert_rows:
-        for batch in _chunked(upsert_rows):
-            stmt = insert(InventoryState).values(batch)
-            stmt = stmt.on_conflict_do_update(
-                constraint="uq_inventory_state_unique",
-                set_={
-                    "units_on_hand": stmt.excluded.units_on_hand,
-                    "units_in_transit": stmt.excluded.units_in_transit,
-                    "units_sold_7d": stmt.excluded.units_sold_7d,
-                    "units_sold_28d": stmt.excluded.units_sold_28d,
-                    "ros_7d": stmt.excluded.ros_7d,
-                    "ros_28d": stmt.excluded.ros_28d,
-                    "stock_cover_days": stmt.excluded.stock_cover_days,
-                    "days_since_grn": stmt.excluded.days_since_grn,
-                    "days_since_first_sale": stmt.excluded.days_since_first_sale,
-                    "sell_through_pct": stmt.excluded.sell_through_pct,
-                    "is_stockout": stmt.excluded.is_stockout,
-                    "is_new_arrival": stmt.excluded.is_new_arrival,
-                },
-            )
-            await db.execute(stmt)
+        if len(upsert_batch) >= UPSERT_BATCH_SIZE:
+            await db.execute(_inventory_state_upsert_stmt(upsert_batch))
+            upsert_batch.clear()
 
-    return len(upsert_rows)
+    if upsert_batch:
+        await db.execute(_inventory_state_upsert_stmt(upsert_batch))
+
+    return upsert_count
 
 
 async def get_available_for_first_allocation(grn_line_id: UUID, db: AsyncSession) -> int:
@@ -282,11 +286,12 @@ async def seed_warehouse_inventory(grn_id: UUID, brand_id: UUID, db: AsyncSessio
 
     stores = (await db.execute(select(Store).where(Store.brand_id == brand_id))).scalars().all()
     snapshot_date = date.today()
+    upsert_count = 0
+    upsert_batch: list[dict] = []
 
-    rows: list[dict] = []
     for grn_line in grn_lines:
         available = await get_available_for_first_allocation(grn_line.id, db)
-        rows.append(
+        upsert_batch.append(
             {
                 "brand_id": brand_id,
                 "snapshot_date": snapshot_date,
@@ -307,8 +312,14 @@ async def seed_warehouse_inventory(grn_id: UUID, brand_id: UUID, db: AsyncSessio
                 "is_new_arrival": False,
             }
         )
+        upsert_count += 1
+
+        if len(upsert_batch) >= UPSERT_BATCH_SIZE:
+            await db.execute(_inventory_state_upsert_stmt(upsert_batch))
+            upsert_batch.clear()
+
         for store in stores:
-            rows.append(
+            upsert_batch.append(
                 {
                     "brand_id": brand_id,
                     "snapshot_date": snapshot_date,
@@ -329,29 +340,13 @@ async def seed_warehouse_inventory(grn_id: UUID, brand_id: UUID, db: AsyncSessio
                     "is_new_arrival": False,
                 }
             )
+            upsert_count += 1
 
-    if not rows:
-        return 0
+            if len(upsert_batch) >= UPSERT_BATCH_SIZE:
+                await db.execute(_inventory_state_upsert_stmt(upsert_batch))
+                upsert_batch.clear()
 
-    for batch in _chunked(rows):
-        stmt = insert(InventoryState).values(batch)
-        stmt = stmt.on_conflict_do_update(
-            constraint="uq_inventory_state_unique",
-            set_={
-                "units_on_hand": stmt.excluded.units_on_hand,
-                "units_in_transit": stmt.excluded.units_in_transit,
-                "units_sold_7d": stmt.excluded.units_sold_7d,
-                "units_sold_28d": stmt.excluded.units_sold_28d,
-                "ros_7d": stmt.excluded.ros_7d,
-                "ros_28d": stmt.excluded.ros_28d,
-                "stock_cover_days": stmt.excluded.stock_cover_days,
-                "days_since_grn": stmt.excluded.days_since_grn,
-                "days_since_first_sale": stmt.excluded.days_since_first_sale,
-                "sell_through_pct": stmt.excluded.sell_through_pct,
-                "is_stockout": stmt.excluded.is_stockout,
-                "is_new_arrival": stmt.excluded.is_new_arrival,
-            },
-        )
-        await db.execute(stmt)
+    if upsert_batch:
+        await db.execute(_inventory_state_upsert_stmt(upsert_batch))
 
-    return len(rows)
+    return upsert_count

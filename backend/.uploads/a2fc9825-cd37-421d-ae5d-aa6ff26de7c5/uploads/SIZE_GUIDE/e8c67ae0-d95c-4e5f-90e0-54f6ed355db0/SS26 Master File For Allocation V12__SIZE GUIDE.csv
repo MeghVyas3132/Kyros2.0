@@ -1,0 +1,81 @@
+product_category,size,min_max_ratio,size_type
+Co-Ords Set,XS,1,NON PIVOTAL
+Co-Ords Set,S,2,PIVOTAL
+Co-Ords Set,M,2,PIVOTAL
+Co-Ords Set,L,2,PIVOTAL
+Co-Ords Set,XL,1,PIVOTAL
+Co-Ords Set,2XL,0,NON PIVOTAL
+Co-Ords Set,S/M,0,NON PIVOTAL
+Co-Ords Set,L/XL,0,NON PIVOTAL
+Dress,XS,1,NON PIVOTAL
+Dress,S,1,PIVOTAL
+Dress,M,2,PIVOTAL
+Dress,L,2,PIVOTAL
+Dress,XL,1,PIVOTAL
+Dress,2XL,1,NON PIVOTAL
+Dress,S/M,0,NON PIVOTAL
+Dress,L/XL,0,NON PIVOTAL
+Ghagra Choli,XS,0,NON PIVOTAL
+Ghagra Choli,S,0,PIVOTAL
+Ghagra Choli,M,0,PIVOTAL
+Ghagra Choli,L,0,PIVOTAL
+Ghagra Choli,XL,0,PIVOTAL
+Ghagra Choli,2XL,0,NON PIVOTAL
+Ghagra Choli,S/M,1,PIVOTAL
+Ghagra Choli,L/XL,1,PIVOTAL
+Gown,XS,0,NON PIVOTAL
+Gown,S,0,PIVOTAL
+Gown,M,0,PIVOTAL
+Gown,L,0,PIVOTAL
+Gown,XL,0,PIVOTAL
+Gown,2XL,0,NON PIVOTAL
+Gown,S/M,1,PIVOTAL
+Gown,L/XL,1,PIVOTAL
+Kaftan,XS,0,NON PIVOTAL
+Kaftan,S,0,PIVOTAL
+Kaftan,M,0,PIVOTAL
+Kaftan,L,0,PIVOTAL
+Kaftan,XL,0,PIVOTAL
+Kaftan,2XL,0,NON PIVOTAL
+Kaftan,S/M,1,PIVOTAL
+Kaftan,L/XL,1,PIVOTAL
+Kaftan Suit,XS,0,NON PIVOTAL
+Kaftan Suit,S,0,PIVOTAL
+Kaftan Suit,M,0,PIVOTAL
+Kaftan Suit,L,0,PIVOTAL
+Kaftan Suit,XL,0,PIVOTAL
+Kaftan Suit,2XL,0,NON PIVOTAL
+Kaftan Suit,S/M,1,PIVOTAL
+Kaftan Suit,L/XL,1,PIVOTAL
+Kurta,XS,1,NON PIVOTAL
+Kurta,S,1,PIVOTAL
+Kurta,M,2,PIVOTAL
+Kurta,L,2,PIVOTAL
+Kurta,XL,2,PIVOTAL
+Kurta,2XL,1,PIVOTAL
+Kurta,S/M,0,NON PIVOTAL
+Kurta,L/XL,0,NON PIVOTAL
+Kurta Set,XS,1,NON PIVOTAL
+Kurta Set,S,2,PIVOTAL
+Kurta Set,M,2,PIVOTAL
+Kurta Set,L,2,PIVOTAL
+Kurta Set,XL,2,PIVOTAL
+Kurta Set,2XL,0,NON PIVOTAL
+Kurta Set,S/M,0,NON PIVOTAL
+Kurta Set,L/XL,0,NON PIVOTAL
+Salwar Suit,XS,0,NON PIVOTAL
+Salwar Suit,S,1,PIVOTAL
+Salwar Suit,M,1,PIVOTAL
+Salwar Suit,L,1,PIVOTAL
+Salwar Suit,XL,1,PIVOTAL
+Salwar Suit,2XL,1,NON PIVOTAL
+Salwar Suit,S/M,0,NON PIVOTAL
+Salwar Suit,L/XL,0,NON PIVOTAL
+Tunic,XS,1,NON PIVOTAL
+Tunic,S,2,PIVOTAL
+Tunic,M,2,PIVOTAL
+Tunic,L,2,PIVOTAL
+Tunic,XL,1,PIVOTAL
+Tunic,2XL,1,PIVOTAL
+Tunic,S/M,0,NON PIVOTAL
+Tunic,L/XL,0,NON PIVOTAL

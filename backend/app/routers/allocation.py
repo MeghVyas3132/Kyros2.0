@@ -1,10 +1,12 @@
+from datetime import datetime
 from uuid import UUID
 
+import logging
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import Response
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -36,6 +38,7 @@ from app.utils.date_utils import utcnow
 
 router = APIRouter(prefix="/api/v1/allocation", tags=["allocation"])
 engine = AllocationEngine()
+logger = logging.getLogger(__name__)
 
 
 async def _load_session_lines(
@@ -214,13 +217,15 @@ async def generate_allocation(
         run_allocation_task.apply_async(
             args=[str(session.id), str(payload.grn_id), str(current_user.brand_id)],
         )
-    except Exception:
-        # Celery unavailable — fall back to synchronous (blocks, but works)
-        import logging
-        logging.getLogger(__name__).warning("Celery unavailable, running allocation synchronously")
-        await engine.generate(payload.grn_id, current_user.brand_id, db)
-        await db.commit()
-        await db.refresh(session)
+    except Exception as e:
+        logger.error(f"Celery dispatch failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Allocation queue is unavailable. "
+                "Please try again in a few seconds."
+            ),
+        )
 
     return envelope(session)
 
@@ -289,6 +294,42 @@ async def get_session(
     return envelope({"session": session, "lines": lines})
 
 
+@router.post("/sessions/{session_id}/recover")
+async def recover_stuck_session(
+    session_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.ADMIN, UserRole.PLANNER)),
+):
+    session = await db.get(AllocationSession, session_id)
+    if session is None or session.brand_id != current_user.brand_id:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Session not found"})
+
+    if session.status != AllocationStatus.GENERATING:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Session is {session.status}, not GENERATING.",
+        )
+
+    # Only recover if session has been stuck for >30 minutes.
+    stuck_since = session.updated_at or session.created_at
+    if (datetime.utcnow() - stuck_since).total_seconds() < 1800:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Session has been GENERATING for less than 30 minutes. "
+                "Wait before recovering."
+            ),
+        )
+
+    session.status = AllocationStatus.FAILED
+    session.failure_reason = (
+        "Recovered from stuck GENERATING state. "
+        "Worker likely crashed. Please regenerate."
+    )
+    await db.commit()
+    return {"status": "recovered", "session_id": str(session_id)}
+
+
 @router.put("/lines/{line_id}")
 async def update_line(
     line_id: UUID,
@@ -299,6 +340,46 @@ async def update_line(
     line = await db.get(AllocationLine, line_id)
     if line is None or line.brand_id != current_user.brand_id:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Line not found"})
+
+    override_qty = int(payload.final_qty)
+
+    # Get the GRN line for this allocation line.
+    grn_line = await db.execute(
+        select(GRNLine)
+        .join(AllocationSession, AllocationSession.grn_id == GRNLine.grn_id)
+        .join(AllocationLine, AllocationLine.session_id == AllocationSession.id)
+        .where(AllocationLine.id == line_id)
+    )
+    grn_line = grn_line.scalar_one_or_none()
+
+    if grn_line:
+        # Sum all other final_qty for same SKU in this session.
+        other_lines_total = await db.scalar(
+            select(func.sum(AllocationLine.final_qty))
+            .where(
+                AllocationLine.session_id == line.session_id,
+                AllocationLine.sku_id == line.sku_id,
+                AllocationLine.id != line_id,
+            )
+        ) or 0
+
+        available = (
+            int(grn_line.units_received or 0)
+            - int(grn_line.ecom_reserved_qty or 0)
+            - int(grn_line.ars_reserved_qty or 0)
+        )
+
+        if int(other_lines_total) + override_qty > available:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Override quantity {override_qty} would exceed "
+                    f"available inventory. "
+                    f"Available: {available}, "
+                    f"Already allocated to other stores: "
+                    f"{int(other_lines_total)}"
+                ),
+            )
 
     line.final_qty = payload.final_qty
     line.override_reason = payload.override_reason

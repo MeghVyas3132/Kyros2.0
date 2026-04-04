@@ -74,8 +74,12 @@ async def upload_csv(
         try:
             fname = (file.filename or "").lower()
             if fname.endswith((".xlsx", ".xlsm")):
-                sheets = pd.read_excel(BytesIO(content), sheet_name=None)
-                incoming_df = next(iter(sheets.values()))
+                try:
+                    sheets = pd.read_excel(BytesIO(content), sheet_name=None)
+                    incoming_df = next(iter(sheets.values()))
+                except Exception:
+                    # Some user files are CSV content with an .xlsx suffix.
+                    incoming_df = pd.read_csv(BytesIO(content))
             else:
                 incoming_df = pd.read_csv(BytesIO(content))
         except Exception as exc:

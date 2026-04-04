@@ -123,7 +123,13 @@ export interface AllocationReasoning {
   // Demand
   weekly_ros: number;
   raw_weekly_ros: number;
-  ros_source: 'store_historical' | 'cluster_average' | 'grade_average' | 'minimum_presentation' | 'no_history';
+  ros_source:
+    | 'store_historical'
+    | 'cluster_average'
+    | 'grade_average'
+    | 'style_dna_analogue'
+    | 'minimum_presentation'
+    | 'no_history';
   is_stockout_corrected: boolean;
   stockout_week: number | null;
   lost_sales_estimate: number | null;
@@ -166,8 +172,10 @@ export interface AllocationReasoning {
   narrative_cap: string;
   confidence_basis: string;
 
-  // Phase 2 — always null for now
-  style_dna_match: null;
+  style_dna_match: {
+    matched_style_code: string;
+    similarity_score: number | null;
+  } | null;
 
   // Backward compat
   [key: string]: any;

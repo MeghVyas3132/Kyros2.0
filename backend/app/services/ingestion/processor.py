@@ -427,13 +427,14 @@ async def _upsert_sales(
 
     store_map, store_name_map, sku_map = await build_lookup_maps(db, brand_id)
     aggregated_rows: dict[tuple[UUID, UUID, date], dict] = {}
-    synthetic_week_starts = _generate_synthetic_week_starts(SYNTHETIC_SALES_WEEKS)
 
     skipped_store_rows = 0
     skipped_sku_rows = 0
     zero_qty_rows = 0
+    skipped_missing_date = 0
     synthetic_weeking_rows = 0
     used_synthetic_weeking = False
+    synthetic_week_starts: list[date] | None = None
 
     await progress("sales", 0, len(df), "Preparing sales records...")
     for idx, row in enumerate(df.to_dict(orient="records"), start=1):
@@ -463,15 +464,17 @@ async def _upsert_sales(
                 pass
 
         was_on_promotion = _normalise_bool(row.get("was_on_promotion"), False)
-        was_in_stock = _normalise_bool(row.get("was_in_stock"), True)
+        was_in_stock = _normalise_bool(row.get("was_in_stock"), None)
 
         parsed_week = _try_parse_week_start_date(row.get("week_start_date"))
-        if parsed_week is not None:
-            targets = {parsed_week: units_sold}
-        else:
-            used_synthetic_weeking = True
-            synthetic_weeking_rows += 1
+        if parsed_week is None:
+            if synthetic_week_starts is None:
+                synthetic_week_starts = _generate_synthetic_week_starts(SYNTHETIC_SALES_WEEKS)
             targets = _spread_units_across_weeks(units_sold, synthetic_week_starts)
+            synthetic_weeking_rows += 1
+            used_synthetic_weeking = True
+        else:
+            targets = {parsed_week: units_sold}
 
         for week_start_date, split_units in targets.items():
             if split_units <= 0:
@@ -501,10 +504,16 @@ async def _upsert_sales(
                 record["_has_revenue"] = True
 
             record["was_on_promotion"] = record["was_on_promotion"] or was_on_promotion
-            record["was_in_stock"] = record["was_in_stock"] and was_in_stock
+            if was_in_stock is not None:
+                record["was_in_stock"] = (
+                    record["was_in_stock"] and was_in_stock
+                )
+            # if None, leave existing value unchanged
 
         if idx % 10000 == 0:
             await progress("sales", idx, len(df), f"Preparing sales records: {idx:,}/{len(df):,}")
+
+    logger.info("Skipped %d rows: missing week_start_date", skipped_missing_date)
 
     rows: list[dict] = []
     for record in aggregated_rows.values():
@@ -536,6 +545,7 @@ async def _upsert_sales(
             "zero_qty_rows": zero_qty_rows,
             "failed_batches_rows": 0,
             "synthetic_weeking_rows": synthetic_weeking_rows,
+            "skipped_missing_date": skipped_missing_date,
         }
 
     async def _sales_progress(done: int, total: int) -> None:
@@ -569,6 +579,7 @@ async def _upsert_sales(
         "zero_qty_rows": zero_qty_rows,
         "failed_batches_rows": failed_rows,
         "synthetic_weeking_rows": synthetic_weeking_rows,
+        "skipped_missing_date": skipped_missing_date,
     }
 
 
@@ -869,7 +880,7 @@ def _normalise_grade(raw_value: object, grade_mapping: dict[str, str]) -> str | 
     return None
 
 
-def _normalise_bool(value: object, default: bool = False) -> bool:
+def _normalise_bool(value: object, default: bool | None = False) -> bool | None:
     if value is None:
         return default
     text = str(value).strip().lower()

@@ -212,6 +212,8 @@ class AllocationEngine:
 
         total_units = 0
         processed = 0
+        BATCH_SIZE = 500
+        batch = []
 
         for grn_line in grn_lines:
             sku = sku_map.get(grn_line.sku_id)
@@ -285,6 +287,8 @@ class AllocationEngine:
             demand_signals = await asyncio.gather(*demand_tasks)
             store_demands: dict[UUID, int] = {}
             demand_signal_map: dict[UUID, DemandSignal] = {}
+            affinity_adjustment_map: dict[UUID, int] = {}
+            affinity_multiplier_map: dict[UUID, float] = {}
             for store, signal in zip(eligible_stores, demand_signals):
                 style_risk_group = (sku.style_risk_group or "PROVEN").upper()
                 grade = store_grade_map[store.id]
@@ -292,11 +296,22 @@ class AllocationEngine:
                 if cover_target_weeks <= 0:
                     store_demands[store.id] = 0
                     demand_signal_map[store.id] = signal
+                    affinity_adjustment_map[store.id] = 0
+                    affinity_multiplier_map[store.id] = 1.0
                     continue
 
-                raw_target = round(signal.weekly_ros * signal.grade_multiplier * cover_target_weeks)
+                profile = store_profile_map.get(store.id)
+                affinity_multiplier = self._affinity_multiplier(profile, sku)
+
+                # Apply grade and affinity multipliers to weekly_ros for final demand calculation.
+                base_ros_with_grade = signal.weekly_ros * signal.grade_multiplier
+                adjusted_ros = base_ros_with_grade * affinity_multiplier
+                pre_affinity_target = round(base_ros_with_grade * cover_target_weeks)
+                raw_target = round(adjusted_ros * cover_target_weeks)
                 store_demands[store.id] = int(max(raw_target, min_presentation_qty))
                 demand_signal_map[store.id] = signal
+                affinity_adjustment_map[store.id] = int(max(raw_target - pre_affinity_target, 0))
+                affinity_multiplier_map[store.id] = affinity_multiplier
 
             total_raw_demand = sum(store_demands.values())
             base_distribution = self.distribute_units(eligible_scores, available_units, sku, brand_settings)
@@ -318,6 +333,46 @@ class AllocationEngine:
             )
             final_allocations = await self.apply_constraints(final_allocations, available_units, grn_line, db)
             final_allocations = await self.apply_size_curves(final_allocations, sku, brand_id, db)
+
+            # Post-constraints reconciliation to guarantee this SKU never exceeds available units.
+            total_allocated = sum(final_allocations.values())
+            if total_allocated > available_units:
+                logger.warning(
+                    "SKU %s: allocated %d exceeds available %d after constraints. Scaling down.",
+                    sku.id,
+                    total_allocated,
+                    available_units,
+                )
+                if total_allocated > 0:
+                    scale = available_units / total_allocated
+                    scaled_allocations = {
+                        store_id: max(0, round(qty * scale))
+                        for store_id, qty in final_allocations.items()
+                    }
+
+                    rounding_overflow = sum(scaled_allocations.values()) - available_units
+                    if rounding_overflow > 0:
+                        for store_id, qty in sorted(
+                            scaled_allocations.items(),
+                            key=lambda item: item[1],
+                            reverse=True,
+                        ):
+                            if rounding_overflow <= 0:
+                                break
+                            decrement = min(qty, rounding_overflow)
+                            scaled_allocations[store_id] -= decrement
+                            rounding_overflow -= decrement
+
+                    final_allocations = {
+                        store_id: qty for store_id, qty in scaled_allocations.items() if qty > 0
+                    }
+
+            final_allocations, cannibalization_meta = self._apply_story_cannibalization(
+                sku=sku,
+                allocations=final_allocations,
+                existing_line_map=existing_line_map,
+                sku_map=sku_map,
+            )
 
             size_distribution_sources: dict[UUID, str] = {}
 
@@ -392,6 +447,10 @@ class AllocationEngine:
                 reasoning = {
                     **method_reasoning,
                     "weekly_ros": round(signal.weekly_ros, 3),
+                    "raw_weekly_ros": round(
+                        signal.raw_weekly_ros if hasattr(signal, "raw_weekly_ros") else signal.weekly_ros,
+                        3,
+                    ),
                     "store_ros_attribute": f"{signal.weekly_ros:.1f} units/week ({signal.ros_source})",
                     "cluster_avg_ros_attribute": f"{signal.weekly_ros:.1f} units/week (cluster proxy)",
                     "ros_vs_cluster_pct": 0,
@@ -409,12 +468,17 @@ class AllocationEngine:
                     "scale_factor": round(local_scale_factor, 4),
                     "store_grade": signal.grade,
                     "grade_multiplier": signal.grade_multiplier,
-                    "category_affinity": profile.category_affinity if profile else None,
-                    "fabric_affinity": profile.fabric_affinity if profile else None,
-                    "affinity_adjustment_units": None,  # TODO: Phase 2
-                    "cannibalization_factor": None,  # TODO: Phase 2
-                    "cannibalization_reason": None,  # TODO: Phase 2
-                    "colourways_in_story_at_store": None,  # TODO: Phase 2
+                    "category_affinity": profile.category_affinity_score if profile else None,
+                    "fabric_affinity": profile.fabric_affinity_score if profile else None,
+                    "category_affinity_label": profile.category_affinity if profile else None,
+                    "fabric_affinity_label": profile.fabric_affinity if profile else None,
+                    "affinity_adjustment_units": affinity_adjustment_map.get(store_id),
+                    "affinity_multiplier": affinity_multiplier_map.get(store_id, 1.0),
+                    "cannibalization_factor": cannibalization_meta.get(store_id, {}).get("factor"),
+                    "cannibalization_reason": cannibalization_meta.get(store_id, {}).get("reason"),
+                    "colourways_in_story_at_store": cannibalization_meta.get(store_id, {}).get("competing_count"),
+                    "excluded_by_capacity": False,
+                    "exclusion_reason": None,
                     "size_split": size_split,
                     "size_distribution_source": "store_historical"
                     if size_distribution_source == "historical"
@@ -425,7 +489,14 @@ class AllocationEngine:
                     "narrative_cap": self._build_cap_narrative(raw_demand, final_qty, local_scale_factor, available_units),
                     "confidence_basis": self._build_confidence_basis(signal),
                     "data_sample_size": profile.sample_size if profile else signal.data_sample_size,
-                    "style_dna_match": None,  # TODO: Phase 2
+                    "style_dna_match": (
+                        {
+                            "matched_style_code": signal.matched_style_code,
+                            "similarity_score": signal.similarity_score,
+                        }
+                        if signal.ros_source == "style_dna_analogue" and signal.matched_style_code
+                        else None
+                    ),
                     # Backward compatible fields currently used by frontend panel.
                     "current_stock_cover_days": round(weeks_cover * 7, 1),
                     "display_capacity_available": method_reasoning.get("display_capacity_available"),
@@ -444,7 +515,7 @@ class AllocationEngine:
                         sku_id=sku.id,
                         ai_reasoning=reasoning,
                     )
-                    db.add(existing_line)
+                    batch.append(existing_line)
                     existing_line_map[(store_id, sku.id)] = existing_line
                 else:
                     existing_line.ai_reasoning = reasoning
@@ -453,6 +524,12 @@ class AllocationEngine:
                 existing_line.final_qty = final_qty
                 existing_line.ai_confidence = confidence
                 existing_line.ai_projections = projections
+                
+                # Batch commit when batch is full
+                if len(batch) >= BATCH_SIZE:
+                    db.add_all(batch)
+                    await db.commit()
+                    batch.clear()
 
             touched_store_ids = {store.id for store in eligible_stores}
             stale_lines = existing_lines_by_sku.get(sku.id, [])
@@ -464,6 +541,7 @@ class AllocationEngine:
                 stale_line.ai_confidence = "LOW"
                 stale_line.ai_reasoning = {
                     "weekly_ros": 0.0,
+                    "raw_weekly_ros": 0.0,
                     "store_ros_attribute": "0.0 units/week (not eligible)",
                     "cluster_avg_ros_attribute": "0.0 units/week (cluster proxy)",
                     "ros_vs_cluster_pct": 0,
@@ -487,6 +565,8 @@ class AllocationEngine:
                     "cannibalization_factor": None,  # TODO: Phase 2
                     "cannibalization_reason": None,  # TODO: Phase 2
                     "colourways_in_story_at_store": None,  # TODO: Phase 2
+                    "excluded_by_capacity": False,
+                    "exclusion_reason": None,
                     "size_split": {},
                     "size_distribution_source": "brand_size_guide",
                     "size_distribution_season": None,
@@ -975,31 +1055,94 @@ class AllocationEngine:
 
         return constrained
 
-    async def get_available_for_first_allocation(self, grn_line: GRNLine, db: AsyncSession) -> int:
-        totals = await db.execute(
-            select(
-                func.coalesce(func.sum(GRNLineReservation.reserved_qty), 0).label("reserved_sum"),
-                func.count(GRNLineReservation.id).label("reservation_count"),
-            )
-            .join(
-                InventoryReservationType,
-                and_(
-                    InventoryReservationType.id == GRNLineReservation.reservation_type_id,
-                    InventoryReservationType.is_active.is_(True),
-                    InventoryReservationType.deducts_from_first_allocation.is_(True),
-                ),
-            )
-            .where(GRNLineReservation.grn_line_id == grn_line.id)
-        )
-        row = totals.one()
-        reserved_sum = int(row.reserved_sum or 0)
-        reservation_count = int(row.reservation_count or 0)
+    def _affinity_multiplier(self, profile, sku: SKU) -> float:
+        if profile is None:
+            return 1.0
 
-        if reservation_count == 0:
-            reserved_sum = int(grn_line.ecom_reserved_qty or 0) + int(grn_line.ars_reserved_qty or 0)
+        multiplier = 1.0
+        if (
+            profile.category_affinity
+            and sku.category
+            and profile.category_affinity.strip().lower() == sku.category.strip().lower()
+            and profile.category_affinity_score
+            and profile.category_affinity_score > 1.0
+        ):
+            multiplier *= min(float(profile.category_affinity_score), 1.5)
 
-        available = int(grn_line.units_received or 0) - reserved_sum
-        return max(0, available)
+        if (
+            profile.fabric_affinity
+            and sku.fabric
+            and profile.fabric_affinity.strip().lower() == sku.fabric.strip().lower()
+            and profile.fabric_affinity_score
+            and profile.fabric_affinity_score > 1.0
+        ):
+            multiplier *= min(float(profile.fabric_affinity_score), 1.5)
+
+        return min(multiplier, 1.8)
+
+    def _apply_story_cannibalization(
+        self,
+        sku: SKU,
+        allocations: dict[UUID, int],
+        existing_line_map: dict[tuple[UUID, UUID], AllocationLine],
+        sku_map: dict[UUID, SKU],
+    ) -> tuple[dict[UUID, int], dict[UUID, dict[str, object]]]:
+        if not allocations or not sku.story:
+            return allocations, {}
+
+        normalized_story = sku.story.strip().lower()
+        normalized_fabric = (sku.fabric or "").strip().lower()
+        normalized_sub_story = (sku.sub_story or "").strip().lower()
+
+        adjusted: dict[UUID, int] = {}
+        meta: dict[UUID, dict[str, object]] = {}
+
+        for store_id, qty in allocations.items():
+            if qty <= 0:
+                continue
+
+            competing_count = 0
+            for (candidate_store_id, candidate_sku_id), line in existing_line_map.items():
+                if candidate_store_id != store_id or candidate_sku_id == sku.id:
+                    continue
+
+                existing_qty = int(line.final_qty or line.ai_recommended_qty or 0)
+                if existing_qty <= 0:
+                    continue
+
+                candidate_sku = sku_map.get(candidate_sku_id)
+                if candidate_sku is None or not candidate_sku.story:
+                    continue
+
+                if candidate_sku.story.strip().lower() != normalized_story:
+                    continue
+
+                same_fabric = (
+                    normalized_fabric
+                    and candidate_sku.fabric
+                    and candidate_sku.fabric.strip().lower() == normalized_fabric
+                )
+                same_sub_story = (
+                    normalized_sub_story
+                    and candidate_sku.sub_story
+                    and candidate_sku.sub_story.strip().lower() == normalized_sub_story
+                )
+
+                if same_fabric or same_sub_story:
+                    competing_count += 1
+
+            factor = 0.65 if competing_count > 0 else 1.0
+            adjusted_qty = max(0, int(round(qty * factor)))
+            adjusted[store_id] = adjusted_qty
+
+            if factor < 1.0:
+                meta[store_id] = {
+                    "factor": factor,
+                    "competing_count": competing_count,
+                    "reason": f"Story concentration detected ({competing_count} competing colourways).",
+                }
+
+        return adjusted, meta
 
     async def generate_reasoning(
         self,

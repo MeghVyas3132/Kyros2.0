@@ -94,7 +94,6 @@ async def load_historical_size_ratios(
             SalesData.brand_id == brand_id,
             SalesData.store_id == store_id,
             SKU.category == product_category,
-            *( [SalesData.season_id == historical_season_id] if historical_season_id is not None else [] ),
         )
         .group_by(SKU.size)
     )
@@ -117,7 +116,6 @@ async def load_historical_size_ratios(
                 SalesData.brand_id == brand_id,
                 Store.cluster_id == cluster_id,
                 SKU.category == product_category,
-                *( [SalesData.season_id == historical_season_id] if historical_season_id is not None else [] ),
             )
             .group_by(SKU.size)
         )
@@ -131,7 +129,6 @@ async def load_historical_size_ratios(
         .where(
             SalesData.brand_id == brand_id,
             SKU.category == product_category,
-            *( [SalesData.season_id == historical_season_id] if historical_season_id is not None else [] ),
         )
         .group_by(SKU.size)
     )
