@@ -138,6 +138,10 @@ async def refresh_store_profiles(brand_id: UUID, db: AsyncSession, lookback_week
         )
     ).all()
 
+    # Fallback: if zero rows, expand window to 26 weeks
+    if not category_rows and not fabric_rows and lookback_weeks < 26:
+        return await refresh_store_profiles(brand_id=brand_id, db=db, lookback_weeks=26)
+
     by_store_category: dict[UUID, dict[str, float]] = defaultdict(dict)
     by_store_fabric: dict[UUID, dict[str, float]] = defaultdict(dict)
 
@@ -220,7 +224,8 @@ async def build_all_store_profiles(
 ) -> int:
     """
     Build store behavior profiles for all active stores in a season.
-    Uses seasonal sales history and writes one profile row per active store.
+    Scopes to a season by joining SalesData → SKU → season_id.
+    SalesData has no season field; SKU does.
     """
     active_store_rows = (
         await db.execute(
@@ -232,6 +237,7 @@ async def build_all_store_profiles(
     if not active_store_ids:
         return 0
 
+    # Scope to season via SKU.season_id (not the sales table).
     category_rows = (
         await db.execute(
             select(
@@ -242,7 +248,7 @@ async def build_all_store_profiles(
             .join(SKU, SKU.id == SalesData.sku_id)
             .where(
                 SalesData.brand_id == brand_id,
-                SalesData.season_id == season_id,
+                SKU.season_id == season_id,  # ← join through SKU
                 SalesData.store_id.in_(active_store_ids),
             )
             .group_by(SalesData.store_id, SKU.category)
@@ -259,7 +265,7 @@ async def build_all_store_profiles(
             .join(SKU, SKU.id == SalesData.sku_id)
             .where(
                 SalesData.brand_id == brand_id,
-                SalesData.season_id == season_id,
+                SKU.season_id == season_id,  # ← join through SKU
                 SalesData.store_id.in_(active_store_ids),
             )
             .group_by(SalesData.store_id, SKU.fabric)
@@ -273,9 +279,10 @@ async def build_all_store_profiles(
                 SalesData.week_start_date,
                 func.coalesce(func.sum(SalesData.units_sold), 0).label("units"),
             )
+            .join(SKU, SKU.id == SalesData.sku_id)
             .where(
                 SalesData.brand_id == brand_id,
-                SalesData.season_id == season_id,
+                SKU.season_id == season_id,  # ← join through SKU
                 SalesData.store_id.in_(active_store_ids),
             )
             .group_by(SalesData.store_id, SalesData.week_start_date)
@@ -289,9 +296,10 @@ async def build_all_store_profiles(
                 SalesData.store_id,
                 func.count().label("row_count"),
             )
+            .join(SKU, SKU.id == SalesData.sku_id)
             .where(
                 SalesData.brand_id == brand_id,
-                SalesData.season_id == season_id,
+                SKU.season_id == season_id,  # ← join through SKU
                 SalesData.store_id.in_(active_store_ids),
             )
             .group_by(SalesData.store_id)

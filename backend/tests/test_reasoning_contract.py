@@ -124,3 +124,14 @@ def test_confidence_basis_varies_by_sample():
     ))
     assert 'High' in high['confidence_basis'] or 'high' in high['confidence_basis'].lower()
     assert 'Low' in low['confidence_basis'] or 'low' in low['confidence_basis'].lower() or high != low
+
+
+def test_both_cover_field_name_variants_present():
+    """Both pct and non-pct cover field names must be in the payload."""
+    r = base_reasoning()
+    assert "weeks_cover_minus_25pct" in r
+    assert "weeks_cover_plus_25pct" in r
+    assert "weeks_cover_minus_25" in r
+    assert "weeks_cover_plus_25" in r
+    assert r["weeks_cover_minus_25pct"] == r["weeks_cover_minus_25"]
+    assert r["weeks_cover_plus_25pct"] == r["weeks_cover_plus_25"]

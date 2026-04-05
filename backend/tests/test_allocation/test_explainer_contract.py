@@ -1,12 +1,16 @@
 from app.services.allocation.explainer import normalize_projections, normalize_reasoning
 
 
-def test_normalize_reasoning_handles_legacy_payload() -> None:
+def test_normalize_reasoning_handles_cover_fields() -> None:
     payload = {
         "store_grade": "A",
         "store_ros_attribute": 2.4,
         "cluster_avg_ros_attribute": 1.8,
         "ros_vs_cluster_pct": 33,
+        "weeks_cover_minus_25pct": 2.1,
+        "weeks_cover_plus_25pct": 3.6,
+        "weeks_cover_minus_25": 2.1,
+        "weeks_cover_plus_25": 3.6,
         "weeks_cover_at_minus_25pct": 2.1,
         "weeks_cover_at_plus_25pct": 3.6,
         "current_stock_cover_days": 14,
@@ -22,6 +26,8 @@ def test_normalize_reasoning_handles_legacy_payload() -> None:
 
     assert normalized["store_grade"] == "A"
     assert normalized["weekly_ros"] == 2.4
+    assert normalized["weeks_cover_minus_25pct"] == 2.1
+    assert normalized["weeks_cover_plus_25pct"] == 3.6
     assert normalized["weeks_cover_minus_25"] == 2.1
     assert normalized["weeks_cover_plus_25"] == 3.6
     assert normalized["weeks_cover_at_minus_25pct"] == 2.1

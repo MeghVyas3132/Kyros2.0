@@ -3,7 +3,7 @@ from uuid import UUID
 
 import logging
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import Response
 from sqlalchemy import desc, func, select
@@ -42,7 +42,12 @@ logger = logging.getLogger(__name__)
 
 
 async def _load_session_lines(
-    session_id: UUID, brand_id: UUID, db: AsyncSession
+    session_id: UUID,
+    brand_id: UUID,
+    db: AsyncSession,
+    *,
+    line_limit: int | None = None,
+    line_offset: int = 0,
 ) -> list[dict]:
     session = await db.get(AllocationSession, session_id)
     if session is None:
@@ -85,7 +90,7 @@ async def _load_session_lines(
                 }
             )
 
-    rows = await db.execute(
+    line_query = (
         select(AllocationLine, Store, SKU)
         .join(Store, Store.id == AllocationLine.store_id)
         .join(SKU, SKU.id == AllocationLine.sku_id)
@@ -96,7 +101,12 @@ async def _load_session_lines(
             SKU.brand_id == brand_id,
         )
         .order_by(Store.store_name.asc(), SKU.style_name.asc(), SKU.size.asc())
+        .offset(max(0, int(line_offset)))
     )
+    if line_limit is not None:
+        line_query = line_query.limit(int(line_limit))
+
+    rows = await db.execute(line_query)
     records: list[dict] = []
     for line, store, sku in rows.all():
         grn_line = grn_line_by_sku.get(sku.id)
@@ -283,6 +293,8 @@ async def get_session_by_grn(
 @router.get("/sessions/{session_id}")
 async def get_session(
     session_id: UUID,
+    line_limit: int | None = Query(default=None, ge=1, le=20000),
+    line_offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict:
@@ -290,8 +302,33 @@ async def get_session(
     if session is None or session.brand_id != current_user.brand_id:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Session not found"})
 
-    lines = await _load_session_lines(session_id, current_user.brand_id, db)
-    return envelope({"session": session, "lines": lines})
+    lines = await _load_session_lines(
+        session_id,
+        current_user.brand_id,
+        db,
+        line_limit=line_limit,
+        line_offset=line_offset,
+    )
+
+    payload: dict = {"session": session, "lines": lines}
+    if line_limit is not None:
+        total_lines = await db.scalar(
+            select(func.count(AllocationLine.id)).where(
+                AllocationLine.session_id == session_id,
+                AllocationLine.brand_id == current_user.brand_id,
+            )
+        )
+        total = int(total_lines or 0)
+        payload.update(
+            {
+                "lines_total": total,
+                "lines_returned": len(lines),
+                "lines_offset": line_offset,
+                "lines_has_more": (line_offset + len(lines)) < total,
+            }
+        )
+
+    return envelope(payload)
 
 
 @router.post("/sessions/{session_id}/recover")
@@ -450,6 +487,7 @@ async def approve_session(
 @router.get("/sessions/{session_id}/export")
 async def export_session(
     session_id: UUID,
+    include_zero: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -462,6 +500,14 @@ async def export_session(
     records = []
     grn = await db.get(GRN, session.grn_id)
     for line in lines:
+        qty = (
+            line.get("final_qty")
+            if line.get("final_qty") is not None
+            else line.get("ai_recommended_qty", 0)
+        )
+        if not include_zero and int(qty or 0) <= 0:
+            continue
+
         records.append(
             {
                 "GRN Code": grn.grn_code if grn else "",
@@ -471,9 +517,7 @@ async def export_session(
                 "Store Code": line.get("store_code", ""),
                 "Store Name": line.get("store_name", ""),
                 "City": line.get("store_city", ""),
-                "Quantity": line.get("final_qty")
-                if line.get("final_qty") is not None
-                else line.get("ai_recommended_qty", 0),
+                "Quantity": qty,
             }
         )
 
@@ -507,7 +551,18 @@ async def get_allocation_insights(
     lines = result.scalars().all()
     
     if not lines:
-        raise HTTPException(status_code=404, detail="No allocation lines found")
+        return envelope({
+            "lost_sales_correction": {
+                "stores_corrected": 0,
+                "estimated_recovered_units": 0,
+                "headline": "No allocation lines found for this session.",
+                "subtext": "",
+            },
+            "under_covered_stores": {"count": 0, "headline": ""},
+            "confidence_breakdown": {"high": 0, "moderate": 0, "low": 0},
+            "total_lines": 0,
+            "total_units_allocated": 0,
+        })
     
     # Calculate metrics from reasoning payload
     corrected_lines = [

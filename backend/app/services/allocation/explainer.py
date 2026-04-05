@@ -41,8 +41,6 @@ def normalize_reasoning(raw: dict[str, Any] | None) -> dict[str, Any]:
 
 	weekly_ros = _to_float(payload.get("weekly_ros"), _to_float(payload.get("store_ros_attribute"), 0.0))
 	cluster_ros = _to_float(payload.get("cluster_avg_ros_attribute"), weekly_ros)
-	minus_cover = _to_float(payload.get("weeks_cover_minus_25"), _to_float(payload.get("weeks_cover_at_minus_25pct"), 0.0))
-	plus_cover = _to_float(payload.get("weeks_cover_plus_25"), _to_float(payload.get("weeks_cover_at_plus_25pct"), 0.0))
 
 	normalized = {
 		"weekly_ros": weekly_ros,
@@ -63,13 +61,18 @@ def normalize_reasoning(raw: dict[str, Any] | None) -> dict[str, Any]:
 		"store_grade": str(payload.get("store_grade") or "C"),
 		"grade_multiplier": _to_float(payload.get("grade_multiplier"), 1.0),
 		"weeks_cover_at_recommended": _to_float(payload.get("weeks_cover_at_recommended"), 0.0),
-		"weeks_cover_minus_25": minus_cover,
-		"weeks_cover_plus_25": plus_cover,
-		"weeks_cover_at_minus_25pct": minus_cover,
-		"weeks_cover_at_plus_25pct": plus_cover,
+		"weeks_cover_minus_25pct": _to_float(payload.get("weeks_cover_minus_25pct"), 0.0),
+		"weeks_cover_plus_25pct": _to_float(payload.get("weeks_cover_plus_25pct"), 0.0),
+		"weeks_cover_minus_25": _to_float(payload.get("weeks_cover_minus_25"), 0.0),
+		"weeks_cover_plus_25": _to_float(payload.get("weeks_cover_plus_25"), 0.0),
+		"weeks_cover_at_minus_25pct": _to_float(payload.get("weeks_cover_at_minus_25pct"), 0.0),
+		"weeks_cover_at_plus_25pct": _to_float(payload.get("weeks_cover_at_plus_25pct"), 0.0),
 		"category_affinity": payload.get("category_affinity"),
 		"fabric_affinity": payload.get("fabric_affinity"),
+		"category_affinity_label": payload.get("category_affinity_label"),
+		"fabric_affinity_label": payload.get("fabric_affinity_label"),
 		"affinity_adjustment_units": payload.get("affinity_adjustment_units"),
+		"affinity_multiplier": payload.get("affinity_multiplier"),
 		"cannibalization_factor": payload.get("cannibalization_factor"),
 		"cannibalization_reason": payload.get("cannibalization_reason"),
 		"colourways_in_story_at_store": payload.get("colourways_in_story_at_store"),

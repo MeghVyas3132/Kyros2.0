@@ -10,7 +10,7 @@ import { StatusBadge } from "@/components/shared/StatusBadge";
 import { apiRequest } from "@/lib/api";
 import { useGRN } from "@/lib/hooks/useGrns";
 import { useAllocationSession } from "@/lib/hooks/useAllocation";
-import { AllocationLine, AllocationSession, SimulationResult, StoryConcentration } from "@/types";
+import { AllocationLine, AllocationSession, AllocationInsights, SimulationResult, StoryConcentration } from "@/types";
 
 const FRIENDLY_STATUS: Record<string, string> = {
   DRAFT: "Draft",
@@ -28,18 +28,28 @@ export default function GRNDetailPage() {
   const { data: grn } = useGRN(grnId);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionStatus, setSessionStatus] = useState<string | null>(null);
-  const { data: allocation, mutate } = useAllocationSession(sessionId);
+  const [lineLimit, setLineLimit] = useState(2000);
+  const {
+    data: allocation,
+    error: allocationError,
+    mutate,
+  } = useAllocationSession(sessionId, { lineLimit, lineOffset: 0 });
 
   const [selectedLine, setSelectedLine] = useState<AllocationLine | null>(null);
   const [quantities, setQuantities] = useState<Record<string, number>>({});
   const [simulations, setSimulations] = useState<Record<string, SimulationResult>>({});
   const [storyConcentration, setStoryConcentration] = useState<StoryConcentration[]>([]);
+  const [insights, setInsights] = useState<AllocationInsights | null>(null);
   const [loading, setLoading] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);
   const simTimerRef = useRef<number | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const status = allocation?.session?.status ?? sessionStatus ?? (grn?.status === "RECEIVED" ? "DRAFT" : "UNDER_REVIEW");
+
+  useEffect(() => {
+    setLineLimit(2000);
+  }, [sessionId]);
 
   // Poll for session status while GENERATING
   useEffect(() => {
@@ -83,6 +93,17 @@ export default function GRNDetailPage() {
         setCheckingSession(false);
       });
   }, [grnId]);
+
+  // Fetch insights when session is under review or approved
+  useEffect(() => {
+    if (!sessionId) return;
+    if (!["UNDER_REVIEW", "APPROVED"].includes(status)) return;
+    let cancelled = false;
+    void apiRequest<AllocationInsights>(`/api/v1/allocation/${sessionId}/insights`)
+      .then((data) => { if (!cancelled) setInsights(data); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [sessionId, status]);
 
   useEffect(() => {
     if (!allocation?.lines) return;
@@ -320,7 +341,91 @@ export default function GRNDetailPage() {
           </p>
         </div>
       ) : (
-        <div className="grid grid-cols-12 gap-4">
+        <div className="space-y-4">
+          {allocationError ? (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+              <p className="text-sm font-medium text-amber-900">Could not load allocation lines yet.</p>
+              <p className="mt-1 text-xs text-amber-700">
+                {allocationError instanceof Error
+                  ? allocationError.message
+                  : "The response is taking too long. Try loading a smaller page of lines."}
+              </p>
+            </div>
+          ) : null}
+
+          {allocation?.lines_total != null && allocation.lines_total > (allocation.lines?.length ?? 0) ? (
+            <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
+              <p className="text-xs text-slate-700">
+                Showing {allocation.lines.length.toLocaleString()} of {allocation.lines_total.toLocaleString()} lines.
+              </p>
+              {allocation.lines_has_more ? (
+                <button
+                  onClick={() => setLineLimit((prev) => prev + 2000)}
+                  className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                >
+                  Load 2,000 More
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+
+          {/* Insights cards */}
+          {insights && (
+            <div className="grid grid-cols-3 gap-3">
+              <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-amber-800 mb-1">
+                  Stockout correction
+                </p>
+                <p className="text-2xl font-bold text-amber-900">
+                  +{insights.lost_sales_correction.estimated_recovered_units} units
+                </p>
+                <p className="text-xs text-amber-700 mt-1">
+                  {insights.lost_sales_correction.headline}
+                </p>
+                <p className="text-xs text-amber-600 mt-0.5">
+                  {insights.lost_sales_correction.subtext}
+                </p>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-white p-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                  Constrained stores
+                </p>
+                <p className="text-2xl font-bold text-slate-900">
+                  {insights.under_covered_stores.count}
+                </p>
+                <p className="text-xs text-slate-500 mt-1">
+                  {insights.under_covered_stores.headline}
+                </p>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-white p-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                  Signal confidence
+                </p>
+                <div className="flex items-center gap-4 mt-2">
+                  <span className="text-sm">
+                    <span className="text-xl font-bold text-emerald-700">
+                      {insights.confidence_breakdown.high}
+                    </span>
+                    <span className="text-xs text-slate-500 ml-1">high</span>
+                  </span>
+                  <span className="text-sm">
+                    <span className="text-xl font-bold text-amber-600">
+                      {insights.confidence_breakdown.moderate}
+                    </span>
+                    <span className="text-xs text-slate-500 ml-1">moderate</span>
+                  </span>
+                  <span className="text-sm">
+                    <span className="text-xl font-bold text-red-500">
+                      {insights.confidence_breakdown.low}
+                    </span>
+                    <span className="text-xs text-slate-500 ml-1">low</span>
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="grid grid-cols-12 gap-4">
           <div className="col-span-8">
             <AllocationTable
               lines={allocation?.lines ?? []}
@@ -345,6 +450,7 @@ export default function GRNDetailPage() {
               </>
             ) : null}
           </div>
+        </div>
         </div>
       )}
     </div>

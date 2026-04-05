@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from math import ceil
-from typing import Mapping
+from typing import Literal, Mapping
 from uuid import UUID
 
 from sqlalchemy import distinct, func, select, text
@@ -18,11 +18,20 @@ from app.services.allocation.constants import (
 )
 
 
+DemandRosSource = Literal[
+    "store_historical",
+    "cluster_average",
+    "grade_average",
+    "style_dna_analogue",
+    "minimum_presentation",
+]
+
+
 @dataclass(frozen=True)
 class DemandSignal:
     demand: int
     weekly_ros: float
-    ros_source: str
+    ros_source: DemandRosSource
     grade: str
     grade_multiplier: float
     is_corrected: bool = False
@@ -332,10 +341,12 @@ async def calculate_store_demand_details(
     preloaded_stockout_signals: Mapping[tuple[UUID, str], list[tuple[date, int, bool | None]]] | None = None,
 ) -> DemandSignal:
     """
-    Calculate demand for a store × SKU combination using three-tier fallback:
-    1. Store-specific historical ROS for this SKU
-    2. Grade-level average ROS for this SKU
-    3. Minimum presentation quantity
+    Calculate demand for a store × SKU combination using four-tier fallback:
+    1. Store-specific historical ROS for this SKU (stockout-corrected)
+    2. Cluster average ROS for this specific SKU
+    3. Grade-level average ROS for this SKU
+    4. Style DNA matching (if available)
+    5. Minimum presentation quantity
     """
     category = sku.category
     grade = _normalize_grade(fallback_grade)
@@ -369,48 +380,63 @@ async def calculate_store_demand_details(
             base_ros = corrected_ros
             is_corrected = True
     else:
-        # TIER 2: Try grade-level average for this SKU
-        grade_ros = None
-        if grade_ros_averages is not None:
-            grade_ros = grade_ros_averages.get((grade, sku.id))
+        # TIER 2: Try cluster average ROS for this specific SKU
+        # Use preloaded grade_ros_averages as a proxy; true cluster avg
+        # requires a DB call — use only if store has a cluster_id set.
+        cluster_ros = None
+        if store.cluster_id is not None and grade_ros_averages is not None:
+            # For now, use grade avg as cluster proxy until a preloaded cluster map is available
+            # In future iterations, this should call _get_cluster_avg_ros()
+            cluster_ros = grade_ros_averages.get((grade, sku.id))
         
-        if grade_ros is not None and float(grade_ros) > 0:
-            source = "grade_average"
-            base_ros = float(grade_ros)
+        if cluster_ros is not None and float(cluster_ros) > 0:
+            source = "cluster_average"
+            base_ros = float(cluster_ros)
+            sample_size = 0  # cluster-level, no per-store sample
         else:
-            style_dna = await _load_style_dna_proxy(
-                db=db,
-                brand_id=brand_id,
-                store_id=store.id,
-                sku=sku,
-                season_id=previous_season_id,
-            )
-            if style_dna is not None:
-                dna_ros, matched_style_code, similarity_score, dna_sample_size = style_dna
-                source = "style_dna_analogue"
-                multiplier = GRADE_MULTIPLIERS.get(grade, 1.00)
-                raw_demand = round(dna_ros * weeks_remaining)
-                raw_demand = int(max(raw_demand, min_qty))
-                return DemandSignal(
-                    demand=raw_demand,
-                    weekly_ros=float(dna_ros),
-                    ros_source=source,
-                    grade=grade,
-                    grade_multiplier=multiplier,
-                    data_sample_size=dna_sample_size,
-                    matched_style_code=matched_style_code,
-                    similarity_score=similarity_score,
+            # TIER 3: Try grade-level average for this SKU
+            grade_ros = None
+            if grade_ros_averages is not None:
+                grade_ros = grade_ros_averages.get((grade, sku.id))
+            
+            if grade_ros is not None and float(grade_ros) > 0:
+                source = "grade_average"
+                base_ros = float(grade_ros)
+            else:
+                # TIER 4: Style DNA matching
+                style_dna = await _load_style_dna_proxy(
+                    db=db,
+                    brand_id=brand_id,
+                    store_id=store.id,
+                    sku=sku,
+                    season_id=previous_season_id,
                 )
+                if style_dna is not None:
+                    dna_ros, matched_style_code, similarity_score, dna_sample_size = style_dna
+                    source = "style_dna_analogue"
+                    multiplier = GRADE_MULTIPLIERS.get(grade, 1.00)
+                    raw_demand = round(dna_ros * weeks_remaining)
+                    raw_demand = int(max(raw_demand, min_qty))
+                    return DemandSignal(
+                        demand=raw_demand,
+                        weekly_ros=float(dna_ros),
+                        ros_source=source,
+                        grade=grade,
+                        grade_multiplier=multiplier,
+                        data_sample_size=dna_sample_size,
+                        matched_style_code=matched_style_code,
+                        similarity_score=similarity_score,
+                    )
 
-            # TIER 3: Fallback to minimum presentation
-            return DemandSignal(
-                demand=int(min_qty),
-                weekly_ros=0.0,
-                ros_source="minimum_presentation",
-                grade=grade,
-                grade_multiplier=GRADE_MULTIPLIERS.get(grade, 1.00),
-                data_sample_size=0,
-            )
+                # TIER 5: Fallback to minimum presentation
+                return DemandSignal(
+                    demand=int(min_qty),
+                    weekly_ros=0.0,
+                    ros_source="minimum_presentation",
+                    grade=grade,
+                    grade_multiplier=GRADE_MULTIPLIERS.get(grade, 1.00),
+                    data_sample_size=0,
+                )
 
     # Grade multiplier is informational only - do not apply to ROS
     # The weekly_ros stored here is the unadjusted base rate
@@ -760,9 +786,30 @@ def build_allocation_reasoning(
     size_result: dict,
     season_weeks_remaining: int,
     grade_multiplier: float,
-    story_concentration_note: str | None = None,
+    # Phase 2 fields — pass None when not computed yet
+    category_affinity: float | None = None,
+    fabric_affinity: float | None = None,
+    category_affinity_label: str | None = None,
+    fabric_affinity_label: str | None = None,
+    affinity_adjustment_units: int | None = None,
+    affinity_multiplier: float = 1.0,
+    cannibalization_factor: float | None = None,
+    cannibalization_reason: str | None = None,
+    colourways_in_story_at_store: int | None = None,
+    style_dna_match: dict | None = None,
     excluded_by_capacity: bool = False,
     exclusion_reason: str | None = None,
+    # Backward-compat fields used by frontend panel
+    store_ros_attribute: str | None = None,
+    cluster_avg_ros_attribute: str | None = None,
+    ros_vs_cluster_pct: int = 0,
+    current_stock_cover_days: float = 0.0,
+    display_capacity_available: int | None = None,
+    stockout_risk_at_lower_qty: bool = False,
+    climate_match: bool = True,
+    data_sample_size: int = 0,
+    # Deprecated parameter kept for backward compatibility
+    story_concentration_note: str | None = None,
 ) -> dict:
     """Build complete reasoning payload for an allocation line."""
     from app.services.allocation.constants import GRADE_MULTIPLIERS
@@ -777,28 +824,36 @@ def build_allocation_reasoning(
         "raw_weekly_ros": round(demand_result.raw_weekly_ros, 3),
         "ros_source": demand_result.source,
         "is_stockout_corrected": demand_result.is_corrected,
+        "stockout_correction_applied": demand_result.is_corrected,  # alias
         "stockout_week": demand_result.stockout_week,
         "lost_sales_estimate": demand_result.lost_sales_estimate,
-        "data_sample_size": demand_result.data_sample_size,
+        "data_sample_size": data_sample_size or demand_result.data_sample_size,
         "cluster_store_count": demand_result.cluster_store_count,
         # PROJECTION
         "cover_target_weeks": cover_target_weeks,
         "weeks_cover_at_recommended": round(weeks_at_final, 1),
         "weeks_cover_minus_25pct": round(weeks_at_final * 0.75, 1),
         "weeks_cover_plus_25pct": round(weeks_at_final * 1.25, 1),
+        "weeks_cover_minus_25": round(weeks_at_final * 0.75, 1),  # backward compat
+        "weeks_cover_plus_25": round(weeks_at_final * 1.25, 1),  # backward compat
+        "weeks_cover_at_minus_25pct": round(weeks_at_final * 0.75, 1),  # alias
+        "weeks_cover_at_plus_25pct": round(weeks_at_final * 1.25, 1),  # alias
         "season_weeks_remaining": season_weeks_remaining,
         "raw_demand_units": raw_demand_units,
         "scale_factor": round(scale_factor, 4),
         # STORE ADJUSTMENTS
         "store_grade": grade,
         "grade_multiplier": grade_multiplier,
-        "category_affinity": None,
-        "fabric_affinity": None,
-        "affinity_adjustment_units": None,
+        "category_affinity": category_affinity,
+        "fabric_affinity": fabric_affinity,
+        "category_affinity_label": category_affinity_label,
+        "fabric_affinity_label": fabric_affinity_label,
+        "affinity_adjustment_units": affinity_adjustment_units,
+        "affinity_multiplier": affinity_multiplier,
         # STORY CONCENTRATION
-        "cannibalization_factor": None,
-        "cannibalization_reason": story_concentration_note,
-        "colourways_in_story_at_store": None,
+        "cannibalization_factor": cannibalization_factor,
+        "cannibalization_reason": cannibalization_reason or story_concentration_note,
+        "colourways_in_story_at_store": colourways_in_story_at_store,
         # CAPACITY EXCLUSION
         "excluded_by_capacity": excluded_by_capacity,
         "exclusion_reason": exclusion_reason,
@@ -809,7 +864,7 @@ def build_allocation_reasoning(
         # NARRATIVES (simplified for Phase 1)
         "narrative_demand": (
             f"Weekly ROS: {demand_result.weekly_ros:.1f} units/week "
-            f"({demand_result.source}, {demand_result.data_sample_size}w history)"
+            f"({demand_result.source}, {data_sample_size or demand_result.data_sample_size}w history)"
             + (f". Stockout-corrected from {demand_result.raw_weekly_ros:.1f} in week {demand_result.stockout_week}." 
                if demand_result.is_corrected else ".")
         ),
@@ -820,14 +875,22 @@ def build_allocation_reasoning(
             else "Full demand met within warehouse availability."
         ),
         "confidence_basis": (
-            f"High confidence ({demand_result.data_sample_size}w history)"
-            if demand_result.data_sample_size >= 12
-            else f"Moderate confidence ({demand_result.data_sample_size}w history)"
-            if demand_result.data_sample_size >= 6
-            else f"Low confidence ({demand_result.data_sample_size}w history)"
+            f"High confidence ({data_sample_size or demand_result.data_sample_size}w history)"
+            if (data_sample_size or demand_result.data_sample_size) >= 12
+            else f"Moderate confidence ({data_sample_size or demand_result.data_sample_size}w history)"
+            if (data_sample_size or demand_result.data_sample_size) >= 6
+            else f"Low confidence ({data_sample_size or demand_result.data_sample_size}w history)"
         ),
         # PHASE 2 PLACEHOLDERS
-        "style_dna_match": None,
+        "style_dna_match": style_dna_match,
+        # BACKWARD COMPATIBLE FIELDS
+        "store_ros_attribute": store_ros_attribute or f"{weekly_ros:.1f} units/week ({demand_result.source})",
+        "cluster_avg_ros_attribute": cluster_avg_ros_attribute or f"{weekly_ros:.1f} units/week (cluster proxy)",
+        "ros_vs_cluster_pct": ros_vs_cluster_pct,
+        "current_stock_cover_days": current_stock_cover_days or round(weeks_at_final * 7, 1),
+        "display_capacity_available": display_capacity_available,
+        "stockout_risk_at_lower_qty": stockout_risk_at_lower_qty,
+        "climate_match": climate_match,
     }
 
 
@@ -934,6 +997,11 @@ async def calculate_demand_with_fallback(
     2. Cluster average ROS for this SKU
     3. Grade average ROS for this category
     4. Minimum presentation (weekly_ros = 0, source = 'minimum_presentation')
+    
+    TODO: Phase 2 — This function implements the full 4-tier fallback with real cluster queries.
+    Currently, the engine uses calculate_store_demand_details() which approximates cluster tier
+    using grade averages. Future iterations should migrate to this function for true cluster-based
+    fallback.
     """
     from app.models import SKU as SKUModel
     

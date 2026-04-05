@@ -117,10 +117,89 @@ export function ExplainabilityPanel({ line, skuName, styleRiskGroup }: Props) {
         </div>
       )}
 
-      <div className="space-y-2 border-t pt-4 opacity-50">
-        <p className="text-xs uppercase tracking-wide text-slate-500">Coming next</p>
-        <p className="text-xs text-slate-500">Style DNA matching · Category and fabric affinity · Cannibalization scoring</p>
-      </div>
+      {/* Affinity signals — show when populated by Phase 2 engine */}
+      {(r.category_affinity != null || r.fabric_affinity != null) && (
+        <div className="border-t pt-4 space-y-2">
+          <p className="text-xs uppercase tracking-wide text-slate-500">Store affinity</p>
+          {r.category_affinity != null && (
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-slate-600">
+                {r.category_affinity_label ?? "Category"} affinity
+              </span>
+              <span className={`font-semibold ${
+                r.category_affinity > 1.1 ? "text-emerald-700" :
+                r.category_affinity < 0.9 ? "text-amber-700" : "text-slate-700"
+              }`}>
+                {r.category_affinity.toFixed(2)}×
+              </span>
+            </div>
+          )}
+          {r.fabric_affinity != null && (
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-slate-600">
+                {r.fabric_affinity_label ?? "Fabric"} affinity
+              </span>
+              <span className={`font-semibold ${
+                r.fabric_affinity > 1.1 ? "text-emerald-700" :
+                r.fabric_affinity < 0.9 ? "text-amber-700" : "text-slate-700"
+              }`}>
+                {r.fabric_affinity.toFixed(2)}×
+              </span>
+            </div>
+          )}
+          {r.affinity_adjustment_units != null && r.affinity_adjustment_units !== 0 && (
+            <p className="text-xs text-slate-500">
+              Affinity adjusted demand by {r.affinity_adjustment_units > 0 ? "+" : ""}
+              {r.affinity_adjustment_units} units
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Style DNA match — show when populated */}
+      {r.style_dna_match && (
+        <div className="border-t pt-4 space-y-1">
+          <p className="text-xs uppercase tracking-wide text-slate-500">Style DNA match</p>
+          <p className="text-sm text-slate-700">
+            Matched to <span className="font-medium font-mono text-slate-900">
+              {r.style_dna_match.matched_style_code}
+            </span>
+          </p>
+          {r.style_dna_match.similarity_score != null && (
+            <p className="text-xs text-slate-500">
+              {Math.round(r.style_dna_match.similarity_score * 100)}% similar
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Cannibalization — show when applied */}
+      {r.cannibalization_factor != null && r.cannibalization_factor < 1 && (
+        <div className="rounded-md border border-slate-200 bg-slate-50 p-3 border-t mt-2">
+          <p className="text-xs font-medium uppercase tracking-wide text-slate-600 mb-1">
+            Story concentration
+          </p>
+          <p className="text-xs text-slate-700">{r.cannibalization_reason}</p>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Factor applied: {r.cannibalization_factor.toFixed(2)}×
+            {r.colourways_in_story_at_store != null
+              ? ` (${r.colourways_in_story_at_store} competing colourways)`
+              : ""}
+          </p>
+        </div>
+      )}
+
+      {/* Placeholder — only shown when nothing above is populated */}
+      {r.category_affinity == null &&
+       r.fabric_affinity == null &&
+       !r.style_dna_match &&
+       r.cannibalization_factor == null && (
+        <div className="border-t pt-4 opacity-40">
+          <p className="text-xs text-slate-500">
+            Affinity and DNA signals will appear here once store profiles are built.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

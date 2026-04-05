@@ -38,6 +38,8 @@ from app.services.allocation.constants import (
 )
 from app.services.allocation.demand import (
     DemandSignal,
+    TrueDemandResult,
+    build_allocation_reasoning,
     calculate_store_demand_details,
     get_min_presentation_qty,
     get_previous_season_id,
@@ -325,6 +327,15 @@ class AllocationEngine:
             if total_raw_demand <= 0:
                 continue
 
+            # Apply cannibalization to demand BEFORE capping so reduced units
+            # are redistributed rather than wasted.
+            store_demands, cannibalization_meta = self._apply_story_cannibalization(
+                sku=sku,
+                allocations=store_demands,
+                existing_line_map=existing_line_map,
+                sku_map=sku_map,
+            )
+
             final_allocations = apply_inventory_cap(
                 store_demands=store_demands,
                 available_qty=available_units,
@@ -332,7 +343,7 @@ class AllocationEngine:
                 store_grades=store_grade_map,
             )
             final_allocations = await self.apply_constraints(final_allocations, available_units, grn_line, db)
-            final_allocations = await self.apply_size_curves(final_allocations, sku, brand_id, db)
+            final_allocations = await self.filter_stores_by_size_eligibility(final_allocations, sku, brand_id, db)
 
             # Post-constraints reconciliation to guarantee this SKU never exceeds available units.
             total_allocated = sum(final_allocations.values())
@@ -366,13 +377,6 @@ class AllocationEngine:
                     final_allocations = {
                         store_id: qty for store_id, qty in scaled_allocations.items() if qty > 0
                     }
-
-            final_allocations, cannibalization_meta = self._apply_story_cannibalization(
-                sku=sku,
-                allocations=final_allocations,
-                existing_line_map=existing_line_map,
-                sku_map=sku_map,
-            )
 
             size_distribution_sources: dict[UUID, str] = {}
 
@@ -436,60 +440,48 @@ class AllocationEngine:
                     ros_data=ros_by_attribute,
                     db=db,
                 )
+                cluster_avg = float(method_reasoning.get("cluster_avg_ros_attribute") or 0.0)
 
-                projections = {
-                    "size_split": size_split,
-                    "size_distribution_source": size_distribution_source,
-                    "cap_scale_factor": round(local_scale_factor, 4),
-                    "total_demand_before_cap": int(total_raw_demand),
-                    "available_qty": int(available_units),
-                }
-                reasoning = {
-                    **method_reasoning,
-                    "weekly_ros": round(signal.weekly_ros, 3),
-                    "raw_weekly_ros": round(
-                        signal.raw_weekly_ros if hasattr(signal, "raw_weekly_ros") else signal.weekly_ros,
-                        3,
-                    ),
-                    "store_ros_attribute": f"{signal.weekly_ros:.1f} units/week ({signal.ros_source})",
-                    "cluster_avg_ros_attribute": f"{signal.weekly_ros:.1f} units/week (cluster proxy)",
-                    "ros_vs_cluster_pct": 0,
-                    "ros_source": signal.ros_source,
-                    "is_stockout_corrected": signal.is_corrected,
-                    "stockout_correction_applied": signal.is_corrected,
-                    "stockout_week": signal.stockout_week,
-                    "lost_sales_estimate": signal.lost_sales_estimate,
-                    "cover_target_weeks": cover_target_weeks,
-                    "weeks_cover_at_recommended": round(weeks_cover, 1),
-                    "weeks_cover_minus_25": round(weeks_cover * 0.75, 1),
-                    "weeks_cover_plus_25": round(weeks_cover * 1.25, 1),
-                    "season_weeks_remaining": season_weeks_remaining,
-                    "raw_demand_units": raw_demand,
-                    "scale_factor": round(local_scale_factor, 4),
-                    "store_grade": signal.grade,
-                    "grade_multiplier": signal.grade_multiplier,
-                    "category_affinity": profile.category_affinity_score if profile else None,
-                    "fabric_affinity": profile.fabric_affinity_score if profile else None,
-                    "category_affinity_label": profile.category_affinity if profile else None,
-                    "fabric_affinity_label": profile.fabric_affinity if profile else None,
-                    "affinity_adjustment_units": affinity_adjustment_map.get(store_id),
-                    "affinity_multiplier": affinity_multiplier_map.get(store_id, 1.0),
-                    "cannibalization_factor": cannibalization_meta.get(store_id, {}).get("factor"),
-                    "cannibalization_reason": cannibalization_meta.get(store_id, {}).get("reason"),
-                    "colourways_in_story_at_store": cannibalization_meta.get(store_id, {}).get("competing_count"),
-                    "excluded_by_capacity": False,
-                    "exclusion_reason": None,
-                    "size_split": size_split,
-                    "size_distribution_source": "store_historical"
-                    if size_distribution_source == "historical"
-                    else "brand_size_guide",
-                    "size_distribution_season": str(previous_season_id) if previous_season_id else None,
-                    "narrative_demand": self._build_demand_narrative(signal),
-                    "narrative_adjustments": self._build_adjustment_narrative(signal.grade, signal.grade_multiplier),
-                    "narrative_cap": self._build_cap_narrative(raw_demand, final_qty, local_scale_factor, available_units),
-                    "confidence_basis": self._build_confidence_basis(signal),
-                    "data_sample_size": profile.sample_size if profile else signal.data_sample_size,
-                    "style_dna_match": (
+                # Convert DemandSignal to TrueDemandResult for the unified builder
+                true_demand = TrueDemandResult(
+                    weekly_ros=signal.weekly_ros,
+                    raw_weekly_ros=signal.weekly_ros,
+                    source=signal.ros_source,
+                    is_corrected=signal.is_corrected,
+                    stockout_week=signal.stockout_week,
+                    lost_sales_estimate=signal.lost_sales_estimate,
+                    data_sample_size=signal.data_sample_size,
+                    cluster_store_count=signal.cluster_store_count,
+                )
+
+                cannibal_meta = cannibalization_meta.get(store_id, {})
+
+                reasoning = build_allocation_reasoning(
+                    store_id=str(store_id),
+                    sku_id=str(sku.id),
+                    grade=store_grade_map.get(store_id, DEFAULT_GRADE),
+                    demand_result=true_demand,
+                    cover_target_weeks=cover_target_weeks,
+                    raw_demand_units=raw_demand,
+                    final_qty=final_qty,
+                    available_qty=int(available_units),
+                    size_result={
+                        "size_split": size_split,
+                        "source": "store_historical" if size_distribution_source == "historical" else "brand_size_guide",
+                        "season_code": str(previous_season_id) if previous_season_id else None,
+                    },
+                    season_weeks_remaining=season_weeks_remaining,
+                    grade_multiplier=signal.grade_multiplier,
+                    category_affinity=profile.category_affinity_score if profile else None,
+                    fabric_affinity=profile.fabric_affinity_score if profile else None,
+                    category_affinity_label=profile.category_affinity if profile else None,
+                    fabric_affinity_label=profile.fabric_affinity if profile else None,
+                    affinity_adjustment_units=affinity_adjustment_map.get(store_id),
+                    affinity_multiplier=affinity_multiplier_map.get(store_id, 1.0),
+                    cannibalization_factor=cannibal_meta.get("factor"),
+                    cannibalization_reason=cannibal_meta.get("reason"),
+                    colourways_in_story_at_store=cannibal_meta.get("competing_count"),
+                    style_dna_match=(
                         {
                             "matched_style_code": signal.matched_style_code,
                             "similarity_score": signal.similarity_score,
@@ -497,13 +489,28 @@ class AllocationEngine:
                         if signal.ros_source == "style_dna_analogue" and signal.matched_style_code
                         else None
                     ),
-                    # Backward compatible fields currently used by frontend panel.
-                    "current_stock_cover_days": round(weeks_cover * 7, 1),
-                    "display_capacity_available": method_reasoning.get("display_capacity_available"),
-                    "stockout_risk_at_lower_qty": (weeks_cover * 0.75) < max(season_weeks_remaining * 0.7, 1),
-                    "climate_match": method_reasoning.get("climate_match", True),
-                    "weeks_cover_at_minus_25pct": round(weeks_cover * 0.75, 1),
-                    "weeks_cover_at_plus_25pct": round(weeks_cover * 1.25, 1),
+                    excluded_by_capacity=False,
+                    exclusion_reason=None,
+                    store_ros_attribute=f"{signal.weekly_ros:.1f} units/week ({signal.ros_source})",
+                    cluster_avg_ros_attribute=f"{cluster_avg:.1f} units/week (cluster proxy)",
+                    ros_vs_cluster_pct=(
+                        round(((signal.weekly_ros - cluster_avg) / max(cluster_avg, 0.01)) * 100)
+                        if cluster_avg > 0
+                        else 0
+                    ),
+                    current_stock_cover_days=round(weeks_cover * 7, 1),
+                    display_capacity_available=method_reasoning.get("display_capacity_available"),
+                    stockout_risk_at_lower_qty=(weeks_cover * 0.75) < max(season_weeks_remaining * 0.7, 1),
+                    climate_match=method_reasoning.get("climate_match", True),
+                    data_sample_size=profile.sample_size if profile else signal.data_sample_size,
+                )
+
+                projections = {
+                    "size_split": size_split,
+                    "size_distribution_source": size_distribution_source,
+                    "cap_scale_factor": round(local_scale_factor, 4),
+                    "total_demand_before_cap": int(total_raw_demand),
+                    "available_qty": int(available_units),
                 }
 
                 existing_line = existing_line_map.get((store_id, sku.id))
@@ -536,53 +543,45 @@ class AllocationEngine:
             for stale_line in stale_lines:
                 if stale_line.store_id in touched_store_ids:
                     continue
+                
+                # Use unified reasoning builder for stale lines too
+                stale_reasoning = build_allocation_reasoning(
+                    store_id=str(stale_line.store_id),
+                    sku_id=str(sku.id),
+                    grade=grade_map.get((stale_line.store_id, sku.category), DEFAULT_GRADE),
+                    demand_result=TrueDemandResult(
+                        weekly_ros=0.0,
+                        raw_weekly_ros=0.0,
+                        source="minimum_presentation",
+                        is_corrected=False,
+                        stockout_week=None,
+                        lost_sales_estimate=None,
+                        data_sample_size=0,
+                        cluster_store_count=0,
+                    ),
+                    cover_target_weeks=0,
+                    raw_demand_units=0,
+                    final_qty=0,
+                    available_qty=int(available_units),
+                    size_result={"size_split": {}, "source": "brand_size_guide", "season_code": None},
+                    season_weeks_remaining=season_weeks_remaining,
+                    grade_multiplier=1.0,
+                    store_ros_attribute="0.0 units/week (not eligible)",
+                    cluster_avg_ros_attribute="0.0 units/week (cluster proxy)",
+                    ros_vs_cluster_pct=0,
+                    current_stock_cover_days=0.0,
+                    data_sample_size=0,
+                )
+                # Override narratives for clarity
+                stale_reasoning["narrative_demand"] = "This line is not eligible under current store group or constraints."
+                stale_reasoning["narrative_adjustments"] = "No adjustments applied."
+                stale_reasoning["narrative_cap"] = "No scaling required."
+                stale_reasoning["confidence_basis"] = "No historical demand available for this store/style context."
+                
                 stale_line.ai_recommended_qty = 0
                 stale_line.final_qty = 0
                 stale_line.ai_confidence = "LOW"
-                stale_line.ai_reasoning = {
-                    "weekly_ros": 0.0,
-                    "raw_weekly_ros": 0.0,
-                    "store_ros_attribute": "0.0 units/week (not eligible)",
-                    "cluster_avg_ros_attribute": "0.0 units/week (cluster proxy)",
-                    "ros_vs_cluster_pct": 0,
-                    "ros_source": "minimum_presentation",
-                    "is_stockout_corrected": False,
-                    "stockout_correction_applied": False,
-                    "stockout_week": None,
-                    "lost_sales_estimate": None,
-                    "cover_target_weeks": 0,
-                    "weeks_cover_at_recommended": 0.0,
-                    "weeks_cover_minus_25": 0.0,
-                    "weeks_cover_plus_25": 0.0,
-                    "season_weeks_remaining": season_weeks_remaining,
-                    "raw_demand_units": 0,
-                    "scale_factor": 1.0,
-                    "store_grade": grade_map.get((stale_line.store_id, sku.category), DEFAULT_GRADE),
-                    "grade_multiplier": 1.0,
-                    "category_affinity": None,  # TODO: Phase 2
-                    "fabric_affinity": None,  # TODO: Phase 2
-                    "affinity_adjustment_units": None,  # TODO: Phase 2
-                    "cannibalization_factor": None,  # TODO: Phase 2
-                    "cannibalization_reason": None,  # TODO: Phase 2
-                    "colourways_in_story_at_store": None,  # TODO: Phase 2
-                    "excluded_by_capacity": False,
-                    "exclusion_reason": None,
-                    "size_split": {},
-                    "size_distribution_source": "brand_size_guide",
-                    "size_distribution_season": None,
-                    "narrative_demand": "This line is not eligible under current store group or constraints.",
-                    "narrative_adjustments": "No adjustments applied.",
-                    "narrative_cap": "No scaling required.",
-                    "confidence_basis": "No historical demand available for this store/style context.",
-                    "data_sample_size": 0,
-                    "style_dna_match": None,  # TODO: Phase 2
-                    "current_stock_cover_days": 0.0,
-                    "display_capacity_available": None,
-                    "stockout_risk_at_lower_qty": False,
-                    "climate_match": True,
-                    "weeks_cover_at_minus_25pct": 0.0,
-                    "weeks_cover_at_plus_25pct": 0.0,
-                }
+                stale_line.ai_reasoning = stale_reasoning
                 stale_line.ai_projections = {
                     "size_split": {},
                     "size_distribution_source": size_distribution_sources.get(stale_line.store_id, "size_guide"),
@@ -605,6 +604,11 @@ class AllocationEngine:
             processed += 1
             if processed % 100 == 0:
                 logger.info("Allocation progress: %d / %d GRN lines processed", processed, len(grn_lines))
+
+        if batch:
+            db.add_all(batch)
+            await db.flush()
+            batch.clear()
 
         logger.info(
             "Allocation complete: %d total units across %d stores",
@@ -906,18 +910,24 @@ class AllocationEngine:
             return {}
 
         risk_level = (sku.resolved_risk_level or "PROVEN").upper()
+        allocation_cfg = brand_settings.get("allocation", {})
         if risk_level == "EXPERIMENTAL":
-            allocation_cfg = brand_settings.get("allocation", {})
             max_stores = int(allocation_cfg.get("experimental_max_stores", 5))
             min_units = int(allocation_cfg.get("experimental_min_units_per_store", 6))
             return self._distribute_concentrated(eligible_stores, available_units, max_stores, min_units)
 
-        return self._distribute_standard(eligible_stores, available_units)
+        standard_min_units = int(allocation_cfg.get("standard_min_units_per_store", MINIMUM_ALLOCATION_QTY))
+        return self._distribute_standard(
+            eligible_stores,
+            available_units,
+            min_units_per_store=standard_min_units,
+        )
 
     def _distribute_standard(
         self,
         eligible_stores: dict[UUID, ScoreData],
         available_units: int,
+        min_units_per_store: int = MINIMUM_ALLOCATION_QTY,
     ) -> dict[UUID, int]:
         total_score = sum(score.score for score in eligible_stores.values())
         if total_score <= 0:
@@ -929,10 +939,36 @@ class AllocationEngine:
             proportion = score_data.score / total_score
             raw_distribution[store_id] = max(0, round(available_units * proportion))
 
+        # Keep rounded distribution sum aligned with available units.
+        current_total = sum(raw_distribution.values())
+        diff = available_units - current_total
+        if diff > 0:
+            top_store = max(eligible_stores.keys(), key=lambda sid: eligible_stores[sid].score)
+            raw_distribution[top_store] += diff
+        elif diff < 0:
+            remaining = abs(diff)
+            ranked = sorted(raw_distribution.items(), key=lambda item: item[1], reverse=True)
+            for store_id, qty in ranked:
+                if remaining <= 0:
+                    break
+                if qty <= 0:
+                    continue
+                decrement = min(qty, remaining)
+                raw_distribution[store_id] -= decrement
+                remaining -= decrement
+
+        min_units = max(1, int(min_units_per_store))
+
+        # If inventory cannot support minimum units for every eligible store,
+        # preserve proportional spread instead of collapsing to one/few stores.
+        required_for_minimums = len(eligible_stores) * min_units
+        if available_units < required_for_minimums:
+            return {store_id: qty for store_id, qty in raw_distribution.items() if qty > 0}
+
         final: dict[UUID, int] = {}
         below_min: list[UUID] = []
         for store_id, qty in raw_distribution.items():
-            if qty >= MINIMUM_ALLOCATION_QTY:
+            if qty >= min_units:
                 final[store_id] = qty
             else:
                 below_min.append(store_id)
@@ -989,13 +1025,21 @@ class AllocationEngine:
             return store_grade in {"A+", "A", "B"}
         return True
 
-    async def apply_size_curves(
+    async def filter_stores_by_size_eligibility(
         self,
         allocation: dict[UUID, int],
         sku: SKU,
         brand_id: UUID,
         db: AsyncSession,
     ) -> dict[UUID, int]:
+        """
+        Remove stores that cannot receive this SKU's size based on the size guide.
+        A size guide entry with min_max_ratio=0 means this size is never allocated.
+        A size guide entry with applies_to_grades restricts which store grades receive it.
+        
+        This does NOT distribute units across sizes — that happens per-store later
+        via calculate_size_distribution() in the main loop.
+        """
         if not allocation:
             return {}
         if not sku.size:

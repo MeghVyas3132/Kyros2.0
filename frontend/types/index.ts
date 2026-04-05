@@ -150,6 +150,8 @@ export interface AllocationReasoning {
   grade_multiplier: number;
   category_affinity: number | null;
   fabric_affinity: number | null;
+  category_affinity_label: string | null;
+  fabric_affinity_label: string | null;
   affinity_adjustment_units: number | null;
 
   // Story concentration
@@ -239,4 +241,24 @@ export interface StoryConcentration {
   story: string;
   style_count: number;
   is_high: boolean;
+}
+
+export interface AllocationInsights {
+  lost_sales_correction: {
+    stores_corrected: number;
+    estimated_recovered_units: number;
+    headline: string;
+    subtext: string;
+  };
+  under_covered_stores: {
+    count: number;
+    headline: string;
+  };
+  confidence_breakdown: {
+    high: number;
+    moderate: number;
+    low: number;
+  };
+  total_lines: number;
+  total_units_allocated: number;
 }
