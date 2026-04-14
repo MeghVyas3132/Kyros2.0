@@ -418,10 +418,11 @@ async def _upsert_sales(
 ) -> tuple[int, dict[str, int]]:
     _require_columns(df, ["store_code", "sku_code", "units_sold"], "SS25 SALES HISTORY")
 
+    # Sales uploads are treated as full refreshes for a brand.
+    # Delete prior rows first so removed SKUs/stores/weeks don't persist silently.
     await db.execute(
         delete(SalesData).where(
             SalesData.brand_id == brand_id,
-            SalesData.upload_id == upload_id,
         )
     )
 
@@ -557,6 +558,7 @@ async def _upsert_sales(
         return stmt.on_conflict_do_update(
             constraint="uq_sales_brand_store_sku_week",
             set_={
+                "upload_id": stmt.excluded.upload_id,
                 "units_sold": stmt.excluded.units_sold,
                 "revenue": stmt.excluded.revenue,
                 "was_on_promotion": stmt.excluded.was_on_promotion,

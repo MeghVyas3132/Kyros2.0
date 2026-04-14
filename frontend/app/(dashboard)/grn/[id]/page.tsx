@@ -7,10 +7,16 @@ import { AllocationTable } from "@/components/allocation/AllocationTable";
 import { ExplainabilityPanel } from "@/components/allocation/ExplainabilityPanel";
 import { ScenarioSimulator } from "@/components/allocation/ScenarioSimulator";
 import { StatusBadge } from "@/components/shared/StatusBadge";
-import { apiRequest } from "@/lib/api";
+import { ApiError, apiRequest } from "@/lib/api";
 import { useGRN } from "@/lib/hooks/useGrns";
 import { useAllocationSession } from "@/lib/hooks/useAllocation";
-import { AllocationLine, AllocationSession, AllocationInsights, SimulationResult, StoryConcentration } from "@/types";
+import {
+  AllocationBenchmarkReport,
+  AllocationInsights,
+  AllocationLine,
+  AllocationSession,
+  SimulationResult,
+} from "@/types";
 
 const FRIENDLY_STATUS: Record<string, string> = {
   DRAFT: "Draft",
@@ -20,6 +26,12 @@ const FRIENDLY_STATUS: Record<string, string> = {
   APPROVED: "Approved",
   DISPATCHED: "Dispatched",
 };
+
+function errorMessage(error: unknown, fallback: string): string {
+  if (error instanceof ApiError) return error.message;
+  if (error instanceof Error && error.message) return error.message;
+  return fallback;
+}
 
 export default function GRNDetailPage() {
   const params = useParams<{ id: string }>();
@@ -38,10 +50,12 @@ export default function GRNDetailPage() {
   const [selectedLine, setSelectedLine] = useState<AllocationLine | null>(null);
   const [quantities, setQuantities] = useState<Record<string, number>>({});
   const [simulations, setSimulations] = useState<Record<string, SimulationResult>>({});
-  const [storyConcentration, setStoryConcentration] = useState<StoryConcentration[]>([]);
   const [insights, setInsights] = useState<AllocationInsights | null>(null);
+  const [benchmark, setBenchmark] = useState<AllocationBenchmarkReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [statusRefreshError, setStatusRefreshError] = useState<string | null>(null);
   const simTimerRef = useRef<number | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -64,13 +78,16 @@ export default function GRNDetailPage() {
       void apiRequest<{ id: string; status: string }>(`/api/v1/allocation/sessions/by-grn/${grnId}`)
         .then((session) => {
           setCheckingSession(false);
+          setStatusRefreshError(null);
           setSessionStatus(session.status);
           if (session.status !== "GENERATING") {
             void mutate();
             if (pollRef.current) clearInterval(pollRef.current);
           }
         })
-        .catch(() => {});
+        .catch((error) => {
+          setStatusRefreshError(errorMessage(error, "Could not refresh allocation status. Retrying..."));
+        });
     }, 3000);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
@@ -84,12 +101,21 @@ export default function GRNDetailPage() {
       .then((session) => {
         setSessionId(session.id);
         setSessionStatus(session.status);
+        setStatusRefreshError(null);
+        setActionError(null);
         setCheckingSession(false);
       })
-      .catch(() => {
-        // No session exists yet - this is normal for newly received stock
-        setSessionId(null);
-        setSessionStatus(null);
+      .catch((error) => {
+        const message = errorMessage(error, "Could not check allocation session status.");
+        const isMissingSession = error instanceof ApiError && error.code === "HTTP_404";
+        if (isMissingSession) {
+          // No session exists yet - this is normal for newly received stock
+          setSessionId(null);
+          setSessionStatus(null);
+          setActionError(null);
+        } else {
+          setActionError(message);
+        }
         setCheckingSession(false);
       });
   }, [grnId]);
@@ -100,8 +126,28 @@ export default function GRNDetailPage() {
     if (!["UNDER_REVIEW", "APPROVED"].includes(status)) return;
     let cancelled = false;
     void apiRequest<AllocationInsights>(`/api/v1/allocation/${sessionId}/insights`)
-      .then((data) => { if (!cancelled) setInsights(data); })
-      .catch(() => {});
+      .then((data) => {
+        if (!cancelled) setInsights(data);
+      })
+      .catch(() => {
+        if (!cancelled) setInsights(null);
+      });
+    return () => { cancelled = true; };
+  }, [sessionId, status]);
+
+  useEffect(() => {
+    if (!sessionId || !["UNDER_REVIEW", "APPROVED", "DISPATCHED"].includes(status)) {
+      setBenchmark(null);
+      return;
+    }
+    let cancelled = false;
+    void apiRequest<AllocationBenchmarkReport>(`/api/v1/allocation/sessions/${sessionId}/benchmark`)
+      .then((data) => {
+        if (!cancelled) setBenchmark(data);
+      })
+      .catch(() => {
+        if (!cancelled) setBenchmark(null);
+      });
     return () => { cancelled = true; };
   }, [sessionId, status]);
 
@@ -123,18 +169,6 @@ export default function GRNDetailPage() {
     []
   );
 
-  useEffect(() => {
-    if (!sessionId || !selectedLine) {
-      setStoryConcentration([]);
-      return;
-    }
-    void apiRequest<StoryConcentration[]>(
-      `/api/v1/allocation/sessions/${sessionId}/stores/${selectedLine.store_id}/story-concentration`
-    )
-      .then((rows) => setStoryConcentration(rows))
-      .catch(() => setStoryConcentration([]));
-  }, [sessionId, selectedLine]);
-
   const handleGenerate = async () => {
     if (!grnId) return;
     setLoading(true);
@@ -148,10 +182,13 @@ export default function GRNDetailPage() {
       );
       setSessionId(session.id);
       setSessionStatus(session.status);
+      setActionError(null);
       // We already have a concrete session now, so stop showing the
       // "checking existing allocations" state even if initial lookup lags.
       setCheckingSession(false);
       // polling useEffect will take over from here
+    } catch (error) {
+      setActionError(errorMessage(error, "Could not start allocation generation."));
     } finally {
       setLoading(false);
     }
@@ -186,7 +223,14 @@ export default function GRNDetailPage() {
           override_reason: qty !== line.ai_recommended_qty ? line.override_reason ?? "STORE_REQUEST" : null,
           override_notes: line.override_notes,
         }),
-      }).then(() => mutate());
+      })
+        .then(() => {
+          setActionError(null);
+          void mutate();
+        })
+        .catch((error) => {
+          setActionError(errorMessage(error, "Could not save quantity override."));
+        });
     },
     [mutate, runSimulation]
   );
@@ -201,15 +245,27 @@ export default function GRNDetailPage() {
           override_reason: reason,
           override_notes: line.override_notes,
         }),
-      }).then(() => mutate());
+      })
+        .then(() => {
+          setActionError(null);
+          void mutate();
+        })
+        .catch((error) => {
+          setActionError(errorMessage(error, "Could not save override reason."));
+        });
     },
     [mutate, quantities]
   );
 
   const handleApprove = async () => {
     if (!sessionId) return;
-    await apiRequest(`/api/v1/allocation/sessions/${sessionId}/approve`, { method: "POST" });
-    await mutate();
+    try {
+      await apiRequest(`/api/v1/allocation/sessions/${sessionId}/approve`, { method: "POST" });
+      setActionError(null);
+      await mutate();
+    } catch (error) {
+      setActionError(errorMessage(error, "Could not approve this allocation session."));
+    }
   };
 
   const canExport = status === "APPROVED" && !!sessionId;
@@ -217,20 +273,28 @@ export default function GRNDetailPage() {
   const handleExport = async () => {
     if (!sessionId) return;
     const token = localStorage.getItem("kyros_access_token");
-    const response = await fetch(
-      `${process.env.NEXT_PUBLIC_API_URL}/api/v1/allocation/sessions/${sessionId}/export`,
-      { headers: token ? { Authorization: `Bearer ${token}` } : {} }
-    );
-    if (!response.ok) return;
-    const blob = await response.blob();
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `allocation-${sessionId}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    window.URL.revokeObjectURL(url);
+    try {
+      const response = await fetch(
+        `${process.env.NEXT_PUBLIC_API_URL}/api/v1/allocation/sessions/${sessionId}/export`,
+        { headers: token ? { Authorization: `Bearer ${token}` } : {} }
+      );
+      if (!response.ok) {
+        setActionError("Could not export transfer list.");
+        return;
+      }
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `allocation-${sessionId}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      setActionError(null);
+    } catch {
+      setActionError("Could not export transfer list.");
+    }
   };
 
   return (
@@ -286,6 +350,13 @@ export default function GRNDetailPage() {
         </div>
       </div>
 
+      {actionError ? (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3">
+          <p className="text-sm font-medium text-red-900">Action failed</p>
+          <p className="mt-1 text-xs text-red-700">{actionError}</p>
+        </div>
+      ) : null}
+
       {/* Allocation content */}
       {checkingSession ? (
         <div className="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-16 text-center">
@@ -312,6 +383,9 @@ export default function GRNDetailPage() {
           <div className="mx-auto mt-4 h-1.5 w-48 overflow-hidden rounded-full bg-blue-100">
             <div className="h-full w-1/3 animate-pulse rounded-full bg-blue-500" />
           </div>
+          {statusRefreshError ? (
+            <p className="mt-3 text-xs text-blue-700">{statusRefreshError}</p>
+          ) : null}
         </div>
       ) : status === "FAILED" ? (
         <div className="rounded-xl border border-dashed border-red-300 bg-red-50 px-6 py-16 text-center">
@@ -424,6 +498,46 @@ export default function GRNDetailPage() {
               </div>
             </div>
           )}
+
+          {benchmark ? (
+            <div className="rounded-lg border border-slate-200 bg-white p-4">
+              <div className="grid grid-cols-4 gap-3">
+                <div className={`rounded-md border px-3 py-2 ${benchmark.acceptance.overall_pass ? "border-emerald-200 bg-emerald-50" : "border-amber-200 bg-amber-50"}`}>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">MVP Gate</p>
+                  <p className={`mt-1 text-sm font-semibold ${benchmark.acceptance.overall_pass ? "text-emerald-700" : "text-amber-700"}`}>
+                    {benchmark.acceptance.overall_pass ? "Pass" : "Needs tuning"}
+                  </p>
+                </div>
+                <div className="rounded-md border border-slate-200 px-3 py-2">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Quality score</p>
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                    {benchmark.summary.quality_score.toFixed(1)} / 100
+                  </p>
+                </div>
+                <div className="rounded-md border border-slate-200 px-3 py-2">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Override rate</p>
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                    {(benchmark.summary.override_rate * 100).toFixed(1)}%
+                  </p>
+                </div>
+                <div className="rounded-md border border-slate-200 px-3 py-2">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Inventory utilization</p>
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                    {(benchmark.summary.inventory_utilization_rate * 100).toFixed(1)}%
+                  </p>
+                </div>
+              </div>
+              {benchmark.demand_source_mix.length > 0 ? (
+                <p className="mt-3 text-xs text-slate-500">
+                  Demand signal mix:{" "}
+                  {benchmark.demand_source_mix
+                    .slice(0, 3)
+                    .map((item) => `${item.source} ${(item.share * 100).toFixed(0)}%`)
+                    .join(" · ")}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
 
           <div className="grid grid-cols-12 gap-4">
           <div className="col-span-8">

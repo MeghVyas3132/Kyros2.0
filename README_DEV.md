@@ -15,21 +15,16 @@ In a new terminal:
 make migrate
 ```
 
-## 3. Load pilot data
-```bash
-make load-pilot
-```
-
-Use one of these real-data paths:
-- Restore your PostgreSQL dump into `kyros_dev`
-- Upload pilot CSVs through `/api/v1/ingestion/upload`
-
-## 4. Open app
+## 3. Open app
 - Frontend: http://localhost:3000
 - Backend: http://localhost:8000/docs
 
-## Authentication
-Use real pilot user credentials present in your loaded dataset.
+On first run with an empty database, open `/login` and create the first admin/brand from the UI bootstrap form.
+
+## 4. Load your data
+Use one of these paths:
+- Upload CSVs through `/api/v1/ingestion/upload`
+- Restore your PostgreSQL dump into `kyros_dev`
 
 ## Useful commands
 - Run all jobs manually: `make jobs`

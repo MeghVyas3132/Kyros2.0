@@ -6,7 +6,7 @@ import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import Response
-from sqlalchemy import desc, func, select
+from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -30,6 +30,7 @@ from app.schemas.allocation import (
     AllocationLineUpdate,
     AllocationSimulateRequest,
 )
+from app.services.allocation.benchmark import BenchmarkLine, build_benchmark_report
 from app.services.allocation.engine import AllocationEngine
 from app.services.allocation.explainer import normalize_projections, normalize_reasoning
 from app.services.allocation.simulator import simulate_quantity
@@ -347,13 +348,13 @@ async def recover_stuck_session(
             detail=f"Session is {session.status}, not GENERATING.",
         )
 
-    # Only recover if session has been stuck for >30 minutes.
+    # Only recover if session has been stuck for >45 minutes.
     stuck_since = session.updated_at or session.created_at
-    if (datetime.utcnow() - stuck_since).total_seconds() < 1800:
+    if (datetime.utcnow() - stuck_since).total_seconds() < 2700:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Session has been GENERATING for less than 30 minutes. "
+                "Session has been GENERATING for less than 45 minutes. "
                 "Wait before recovering."
             ),
         )
@@ -611,6 +612,125 @@ async def get_allocation_insights(
         "total_lines": len(lines),
         "total_units_allocated": sum(l.final_qty for l in lines if l.final_qty),
     })
+
+
+@router.get("/sessions/{session_id}/benchmark")
+async def get_session_benchmark(
+    session_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    session = await db.get(AllocationSession, session_id)
+    if session is None or session.brand_id != current_user.brand_id:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Session not found"})
+
+    line_rows = await db.execute(
+        select(AllocationLine, SKU)
+        .join(SKU, SKU.id == AllocationLine.sku_id)
+        .where(
+            AllocationLine.session_id == session_id,
+            AllocationLine.brand_id == current_user.brand_id,
+            SKU.brand_id == current_user.brand_id,
+        )
+    )
+
+    grn_lines = (
+        await db.execute(
+            select(GRNLine).where(
+                GRNLine.grn_id == session.grn_id,
+                GRNLine.brand_id == current_user.brand_id,
+            )
+        )
+    ).scalars().all()
+    grn_line_ids = [line.id for line in grn_lines]
+
+    reservation_map: dict[UUID, int] = {}
+    if grn_line_ids:
+        reservation_rows = await db.execute(
+            select(
+                GRNLineReservation.grn_line_id,
+                func.coalesce(func.sum(GRNLineReservation.reserved_qty), 0).label("reserved_sum"),
+            )
+            .join(
+                InventoryReservationType,
+                and_(
+                    InventoryReservationType.id == GRNLineReservation.reservation_type_id,
+                    InventoryReservationType.brand_id == current_user.brand_id,
+                    InventoryReservationType.is_active.is_(True),
+                    InventoryReservationType.deducts_from_first_allocation.is_(True),
+                ),
+            )
+            .where(
+                GRNLineReservation.grn_line_id.in_(grn_line_ids),
+                GRNLineReservation.brand_id == current_user.brand_id,
+            )
+            .group_by(GRNLineReservation.grn_line_id)
+        )
+        reservation_map = {row.grn_line_id: int(row.reserved_sum or 0) for row in reservation_rows.all()}
+
+    available_units_total = 0
+    for grn_line in grn_lines:
+        reserved = reservation_map.get(grn_line.id)
+        if reserved is None:
+            reserved = int(grn_line.ecom_reserved_qty or 0) + int(grn_line.ars_reserved_qty or 0)
+        available_units_total += max(0, int(grn_line.units_received or 0) - reserved)
+
+    def _safe_float(value: object | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    benchmark_lines: list[BenchmarkLine] = []
+    for line, sku in line_rows.all():
+        reasoning = normalize_reasoning(line.ai_reasoning)
+        resolved_final_qty = int(
+            line.final_qty if line.final_qty is not None else (line.ai_recommended_qty or 0)
+        )
+
+        benchmark_lines.append(
+            BenchmarkLine(
+                final_qty=resolved_final_qty,
+                ai_recommended_qty=int(line.ai_recommended_qty or 0),
+                was_overridden=bool(line.was_overridden),
+                ai_confidence=(line.ai_confidence or None),
+                ros_source=(reasoning.get("ros_source") if isinstance(reasoning, dict) else None),
+                cover_target_weeks=(
+                    _safe_float(reasoning.get("cover_target_weeks"))
+                    if isinstance(reasoning, dict)
+                    else None
+                ),
+                weeks_cover_at_recommended=(
+                    _safe_float(reasoning.get("weeks_cover_at_recommended"))
+                    if isinstance(reasoning, dict)
+                    else None
+                ),
+                store_grade=(
+                    str(
+                        (reasoning.get("store_grade") or reasoning.get("grade") or "")
+                        if isinstance(reasoning, dict)
+                        else ""
+                    )
+                    or None
+                ),
+                required_min_grade=sku.resolved_min_grade,
+                style_risk_group=sku.style_risk_group,
+            )
+        )
+
+    report = build_benchmark_report(
+        lines=benchmark_lines,
+        available_units_total=available_units_total,
+    )
+    report.update(
+        {
+            "session_id": str(session.id),
+            "session_status": session.status.value if isinstance(session.status, AllocationStatus) else str(session.status),
+        }
+    )
+    return envelope(report)
 
 
 @router.get("/sessions/{session_id}/stores/{store_id}/story-concentration")

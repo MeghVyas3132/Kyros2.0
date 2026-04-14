@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from math import ceil
-from typing import Literal, Mapping
+from typing import Literal, Mapping, MutableMapping
 from uuid import UUID
 
 from sqlalchemy import distinct, func, select, text
@@ -25,6 +25,9 @@ DemandRosSource = Literal[
     "style_dna_analogue",
     "minimum_presentation",
 ]
+
+StyleDnaCacheKey = tuple[UUID, str, str, str, str, str, str, str, UUID | None]
+StyleDnaProxy = tuple[float, str, float, int]
 
 
 @dataclass(frozen=True)
@@ -211,7 +214,7 @@ async def preload_stockout_signals(
     for store_id, category, week_start_date, units, all_in_stock in rows.all():
         if category is None:
             continue
-        signal_map.setdefault((store_id, category), []).append(
+        signal_map.setdefault((store_id, _normalize_category(category)), []).append(
             (week_start_date, int(units or 0), all_in_stock)
         )
     return signal_map
@@ -231,7 +234,7 @@ async def load_grade_map(db: AsyncSession, brand_id: UUID) -> dict[tuple[UUID, s
     for store_id, product_category, grade in rows.all():
         if product_category is None:
             continue
-        key = (store_id, product_category)
+        key = (store_id, _normalize_category(product_category))
         current = result.get(key)
         if current is None or _grade_rank(grade) > _grade_rank(current):
             result[key] = _normalize_grade(grade)
@@ -281,7 +284,10 @@ async def load_grade_ros_averages(
         .join(
             store_ros_subquery,
             (store_ros_subquery.c.store_id == StoreProductGrade.store_id)
-            & (store_ros_subquery.c.category == StoreProductGrade.product_category),
+            & (
+                func.lower(func.trim(store_ros_subquery.c.category))
+                == func.lower(func.trim(StoreProductGrade.product_category))
+            ),
         )
         .where(StoreProductGrade.brand_id == brand_id)
         .group_by(StoreProductGrade.grade, store_ros_subquery.c.sku_id)
@@ -298,6 +304,62 @@ async def load_grade_ros_averages(
     return result
 
 
+async def load_cluster_ros_averages(
+    db: AsyncSession,
+    brand_id: UUID,
+    season_id: UUID | None,
+) -> dict[tuple[UUID, UUID], float]:
+    """Return cluster x SKU average weekly ROS (average of store-level ROS)."""
+    date_range = await _season_date_range(db, brand_id, season_id)
+    if date_range is None:
+        return {}
+
+    start_date, end_date = date_range
+    store_cluster_ros_subquery = (
+        select(
+            Store.cluster_id.label("cluster_id"),
+            SalesData.store_id.label("store_id"),
+            SalesData.sku_id.label("sku_id"),
+            (
+                func.sum(SalesData.units_sold)
+                / func.nullif(func.count(distinct(SalesData.week_start_date)), 0)
+            ).label("store_weekly_ros"),
+        )
+        .join(Store, Store.id == SalesData.store_id)
+        .where(
+            SalesData.brand_id == brand_id,
+            Store.brand_id == brand_id,
+            Store.is_active.is_(True),
+            Store.cluster_id.is_not(None),
+            SalesData.week_start_date >= start_date,
+            SalesData.week_start_date <= end_date,
+        )
+        .group_by(Store.cluster_id, SalesData.store_id, SalesData.sku_id)
+        .subquery()
+    )
+
+    rows = await db.execute(
+        select(
+            store_cluster_ros_subquery.c.cluster_id,
+            store_cluster_ros_subquery.c.sku_id,
+            func.avg(store_cluster_ros_subquery.c.store_weekly_ros).label("cluster_avg_ros"),
+        ).group_by(
+            store_cluster_ros_subquery.c.cluster_id,
+            store_cluster_ros_subquery.c.sku_id,
+        )
+    )
+
+    result: dict[tuple[UUID, UUID], float] = {}
+    for cluster_id, sku_id, cluster_avg_ros in rows.all():
+        if cluster_id is None or sku_id is None:
+            continue
+        value = float(cluster_avg_ros or 0.0)
+        if value <= 0:
+            continue
+        result[(cluster_id, sku_id)] = value
+    return result
+
+
 async def calculate_store_demand(
     db: AsyncSession,
     brand_id: UUID,
@@ -308,8 +370,10 @@ async def calculate_store_demand(
     *,
     sales_by_store_category: Mapping[tuple[UUID, UUID], float] | None = None,
     grade_ros_averages: Mapping[tuple[str, UUID], float] | None = None,
+    cluster_ros_averages: Mapping[tuple[UUID, UUID], float] | None = None,
     min_presentation_qty: int | None = None,
     previous_season_id: UUID | None = None,
+    style_dna_cache: MutableMapping[StyleDnaCacheKey, StyleDnaProxy | None] | None = None,
 ) -> int:
     signal = await calculate_store_demand_details(
         db=db,
@@ -320,8 +384,10 @@ async def calculate_store_demand(
         fallback_grade=fallback_grade,
         sales_by_store_category=sales_by_store_category,
         grade_ros_averages=grade_ros_averages,
+        cluster_ros_averages=cluster_ros_averages,
         min_presentation_qty=min_presentation_qty,
         previous_season_id=previous_season_id,
+        style_dna_cache=style_dna_cache,
     )
     return signal.demand
 
@@ -336,9 +402,11 @@ async def calculate_store_demand_details(
     *,
     sales_by_store_category: Mapping[tuple[UUID, UUID], float] | None = None,
     grade_ros_averages: Mapping[tuple[str, UUID], float] | None = None,
+    cluster_ros_averages: Mapping[tuple[UUID, UUID], float] | None = None,
     min_presentation_qty: int | None = None,
     previous_season_id: UUID | None = None,
     preloaded_stockout_signals: Mapping[tuple[UUID, str], list[tuple[date, int, bool | None]]] | None = None,
+    style_dna_cache: MutableMapping[StyleDnaCacheKey, StyleDnaProxy | None] | None = None,
 ) -> DemandSignal:
     """
     Calculate demand for a store × SKU combination using four-tier fallback:
@@ -349,6 +417,7 @@ async def calculate_store_demand_details(
     5. Minimum presentation quantity
     """
     category = sku.category
+    normalized_category = _normalize_category(category)
     grade = _normalize_grade(fallback_grade)
     min_qty = min_presentation_qty if min_presentation_qty is not None else await get_min_presentation_qty(db, brand_id)
     weeks_remaining = max(int(season_weeks_remaining or DEFAULT_SEASON_WEEKS_REMAINING), 1)
@@ -374,21 +443,17 @@ async def calculate_store_demand_details(
             store_id=store.id,
             category=category,
             season_id=previous_season_id,
-            preloaded_rows=(preloaded_stockout_signals or {}).get((store.id, category)),
+            preloaded_rows=(preloaded_stockout_signals or {}).get((store.id, normalized_category)),
         )
         if corrected_ros is not None and corrected_ros > base_ros:
             base_ros = corrected_ros
             is_corrected = True
     else:
         # TIER 2: Try cluster average ROS for this specific SKU
-        # Use preloaded grade_ros_averages as a proxy; true cluster avg
-        # requires a DB call — use only if store has a cluster_id set.
         cluster_ros = None
-        if store.cluster_id is not None and grade_ros_averages is not None:
-            # For now, use grade avg as cluster proxy until a preloaded cluster map is available
-            # In future iterations, this should call _get_cluster_avg_ros()
-            cluster_ros = grade_ros_averages.get((grade, sku.id))
-        
+        if store.cluster_id is not None and cluster_ros_averages is not None:
+            cluster_ros = cluster_ros_averages.get((store.cluster_id, sku.id))
+
         if cluster_ros is not None and float(cluster_ros) > 0:
             source = "cluster_average"
             base_ros = float(cluster_ros)
@@ -404,13 +469,20 @@ async def calculate_store_demand_details(
                 base_ros = float(grade_ros)
             else:
                 # TIER 4: Style DNA matching
-                style_dna = await _load_style_dna_proxy(
-                    db=db,
-                    brand_id=brand_id,
-                    store_id=store.id,
-                    sku=sku,
-                    season_id=previous_season_id,
-                )
+                style_dna_cache_key = _build_style_dna_cache_key(store.id, sku, previous_season_id)
+                style_dna: StyleDnaProxy | None
+                if style_dna_cache is not None and style_dna_cache_key in style_dna_cache:
+                    style_dna = style_dna_cache[style_dna_cache_key]
+                else:
+                    style_dna = await _load_style_dna_proxy(
+                        db=db,
+                        brand_id=brand_id,
+                        store_id=store.id,
+                        sku=sku,
+                        season_id=previous_season_id,
+                    )
+                    if style_dna_cache is not None:
+                        style_dna_cache[style_dna_cache_key] = style_dna
                 if style_dna is not None:
                     dna_ros, matched_style_code, similarity_score, dna_sample_size = style_dna
                     source = "style_dna_analogue"
@@ -682,7 +754,7 @@ async def _load_style_dna_proxy(
     store_id: UUID,
     sku: SKU,
     season_id: UUID | None,
-) -> tuple[float, str, float, int] | None:
+) -> StyleDnaProxy | None:
     date_range = await _season_date_range(db, brand_id, season_id)
     if date_range is None:
         return None
@@ -709,7 +781,7 @@ async def _load_style_dna_proxy(
             SalesData.week_start_date >= start_date,
             SalesData.week_start_date <= end_date,
             SKU.category == sku.category,
-            SalesData.sku_id != sku.id,
+            SKU.style_code != sku.style_code,
         )
         .group_by(
             SKU.sku_code,
@@ -767,6 +839,28 @@ def _normalize_grade(grade: str | None) -> str:
     if cleaned in {"A+", "A", "B", "C"}:
         return cleaned
     return DEFAULT_GRADE
+
+
+def _normalize_category(category: str | None) -> str:
+    return " ".join(str(category or "").strip().lower().split())
+
+
+def _normalize_text(value: str | None) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _build_style_dna_cache_key(store_id: UUID, sku: SKU, season_id: UUID | None) -> StyleDnaCacheKey:
+    return (
+        store_id,
+        sku.style_code,
+        _normalize_category(sku.category),
+        _normalize_text(sku.price_band),
+        _normalize_text(sku.colour_family),
+        _normalize_text(sku.fabric),
+        _normalize_text(sku.resolved_risk_level),
+        _normalize_text(sku.sub_category),
+        season_id,
+    )
 
 
 def _grade_rank(grade: str | None) -> int:

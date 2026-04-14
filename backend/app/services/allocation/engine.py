@@ -44,6 +44,7 @@ from app.services.allocation.demand import (
     get_min_presentation_qty,
     get_previous_season_id,
     get_season_weeks_remaining,
+    load_cluster_ros_averages,
     load_grade_map,
     load_grade_ros_averages,
     load_sales_history,
@@ -73,6 +74,15 @@ DEFAULT_BRAND_SETTINGS: dict = {
     },
 }
 
+
+def _normalize_category_key(category: str | None) -> str:
+    return " ".join(str(category or "").strip().lower().split())
+
+
+def _normalize_price_band(price_band: str | None) -> str | None:
+    cleaned = " ".join(str(price_band or "").strip().upper().split())
+    return cleaned or None
+
 @dataclass
 class ScoreData:
     score: float
@@ -88,12 +98,16 @@ class AllocationEngine:
         self._store_cache: dict[UUID, Store] = {}
         self._store_list_cache: dict[UUID, StyleStoreList | None] = {}
         self._grade_cache: dict[tuple[UUID, str, str | None], str] | None = None
+        self._display_capacity_cache: dict[tuple[UUID, str], int] = {}
+        self._display_capacity_preloaded: bool = False
 
     async def generate(self, grn_id: UUID, brand_id: UUID, db: AsyncSession) -> AllocationSession:
         # Reset caches per generation run
         self._store_cache = {}
         self._store_list_cache = {}
         self._grade_cache = None
+        self._display_capacity_cache = {}
+        self._display_capacity_preloaded = False
 
         grn = await db.scalar(select(GRN).where(GRN.id == grn_id, GRN.brand_id == brand_id))
         if grn is None:
@@ -200,17 +214,20 @@ class AllocationEngine:
             load_grade_map(db, brand_id),
         )
 
-        sales_by_store_category, grade_ros_averages, preloaded_stockout_signals = await asyncio.gather(
+        sales_by_store_category, grade_ros_averages, cluster_ros_averages, preloaded_stockout_signals = await asyncio.gather(
             load_sales_history(db=db, brand_id=brand_id, season_id=previous_season_id),
             load_grade_ros_averages(db=db, brand_id=brand_id, season_id=previous_season_id),
+            load_cluster_ros_averages(db=db, brand_id=brand_id, season_id=previous_season_id),
             preload_stockout_signals(db=db, brand_id=brand_id, season_id=previous_season_id),
         )
-        brand_settings, store_profile_map, inventory, ros_by_attribute = await asyncio.gather(
+        brand_settings, store_profile_map, inventory, ros_by_attribute, _ = await asyncio.gather(
             self._load_brand_settings(brand_id, db),
             load_store_profile_map(brand_id, db),
             self._load_latest_inventory(brand_id, db),
             self._load_ros_by_attribute(brand_id, db),
+            self._preload_display_capacity(brand_id, db),
         )
+        style_dna_cache = {}
 
         total_units = 0
         processed = 0
@@ -221,6 +238,7 @@ class AllocationEngine:
             sku = sku_map.get(grn_line.sku_id)
             if sku is None:
                 continue
+            normalized_category = _normalize_category_key(sku.category)
 
             rule = sku.store_group_rule
             if grn_line.buy_plan_line_id is not None and grn_line.buy_plan_line_id in buy_plan_map:
@@ -237,7 +255,7 @@ class AllocationEngine:
             eligible_stores = self._filter_stores_for_group_rule(
                 stores=stores,
                 grade_map=grade_map,
-                product_category=sku.category,
+                product_category=normalized_category,
                 rule=rule,
             )
             if not eligible_stores:
@@ -268,7 +286,7 @@ class AllocationEngine:
             demand_tasks = []
             store_grade_map: dict[UUID, str] = {}
             for store in eligible_stores:
-                grade = grade_map.get((store.id, sku.category), DEFAULT_GRADE)
+                grade = grade_map.get((store.id, normalized_category), DEFAULT_GRADE)
                 store_grade_map[store.id] = grade
                 demand_tasks.append(
                     calculate_store_demand_details(
@@ -280,9 +298,11 @@ class AllocationEngine:
                         fallback_grade=grade,
                         sales_by_store_category=sales_by_store_category,
                         grade_ros_averages=grade_ros_averages,
+                        cluster_ros_averages=cluster_ros_averages,
                         min_presentation_qty=min_presentation_qty,
                         previous_season_id=previous_season_id,
                         preloaded_stockout_signals=preloaded_stockout_signals,
+                        style_dna_cache=style_dna_cache,
                     )
                 )
 
@@ -294,7 +314,10 @@ class AllocationEngine:
             for store, signal in zip(eligible_stores, demand_signals):
                 style_risk_group = (sku.style_risk_group or "PROVEN").upper()
                 grade = store_grade_map[store.id]
-                cover_target_weeks = self._cover_target_weeks(style_risk_group, grade)
+                cover_target_weeks = min(
+                    self._cover_target_weeks(style_risk_group, grade),
+                    max(int(season_weeks_remaining), 1),
+                )
                 if cover_target_weeks <= 0:
                     store_demands[store.id] = 0
                     demand_signal_map[store.id] = signal
@@ -342,8 +365,17 @@ class AllocationEngine:
                 min_presentation_qty=min_presentation_qty,
                 store_grades=store_grade_map,
             )
-            final_allocations = await self.apply_constraints(final_allocations, available_units, grn_line, db)
+            final_allocations = await self.apply_constraints(final_allocations, available_units, sku, db)
             final_allocations = await self.filter_stores_by_size_eligibility(final_allocations, sku, brand_id, db)
+            final_allocations = await self._top_up_allocations(
+                allocations=final_allocations,
+                target_demands=store_demands,
+                available_units=available_units,
+                sku=sku,
+                store_scores=eligible_scores,
+                brand_id=brand_id,
+                db=db,
+            )
 
             # Post-constraints reconciliation to guarantee this SKU never exceeds available units.
             total_allocated = sum(final_allocations.values())
@@ -386,7 +418,10 @@ class AllocationEngine:
                 final_qty = final_allocations.get(store_id, 0)
                 signal = demand_signal_map[store_id]
                 style_risk_group = (sku.style_risk_group or "PROVEN").upper()
-                cover_target_weeks = self._cover_target_weeks(style_risk_group, signal.grade)
+                cover_target_weeks = min(
+                    self._cover_target_weeks(style_risk_group, signal.grade),
+                    max(int(season_weeks_remaining), 1),
+                )
                 profile = store_profile_map.get(store_id)
 
                 size_split: dict[str, int] = {}
@@ -438,6 +473,7 @@ class AllocationEngine:
                     qty=final_qty,
                     store_scores=eligible_scores,
                     ros_data=ros_by_attribute,
+                    season_weeks_remaining=season_weeks_remaining,
                     db=db,
                 )
                 cluster_avg = float(method_reasoning.get("cluster_avg_ros_attribute") or 0.0)
@@ -548,7 +584,7 @@ class AllocationEngine:
                 stale_reasoning = build_allocation_reasoning(
                     store_id=str(stale_line.store_id),
                     sku_id=str(sku.id),
-                    grade=grade_map.get((stale_line.store_id, sku.category), DEFAULT_GRADE),
+                    grade=grade_map.get((stale_line.store_id, normalized_category), DEFAULT_GRADE),
                     demand_result=TrueDemandResult(
                         weekly_ros=0.0,
                         raw_weekly_ros=0.0,
@@ -628,6 +664,7 @@ class AllocationEngine:
         product_category: str,
         rule: str | None,
     ) -> list[Store]:
+        normalized_category = _normalize_category_key(product_category)
         normalized_rule = (rule or "All Stores").strip().upper()
         if normalized_rule in {"ALL STORES", "ALL"}:
             return stores
@@ -644,7 +681,7 @@ class AllocationEngine:
         return [
             store
             for store in stores
-            if grade_map.get((store.id, product_category), DEFAULT_GRADE) in allowed
+            if grade_map.get((store.id, normalized_category), DEFAULT_GRADE) in allowed
         ]
 
     def _confidence_from_ros_source(self, source: str) -> str:
@@ -726,7 +763,11 @@ class AllocationEngine:
             )
             cache: dict[tuple[UUID, str, str | None], str] = {}
             for store_id, product_category, price_band, grade in result.all():
-                cache[(store_id, product_category, price_band)] = grade
+                cache[(
+                    store_id,
+                    _normalize_category_key(product_category),
+                    _normalize_price_band(price_band),
+                )] = grade
             self._grade_cache = cache
         return self._grade_cache
 
@@ -739,14 +780,16 @@ class AllocationEngine:
         db: AsyncSession,
     ) -> str:
         grades = await self._load_all_grades(brand_id, db)
+        normalized_category = _normalize_category_key(product_category)
+        normalized_price_band = _normalize_price_band(price_band)
 
         # exact match: store + product + price_band
-        exact = grades.get((store_id, product_category, price_band))
+        exact = grades.get((store_id, normalized_category, normalized_price_band))
         if exact:
             return exact
 
         # fallback: store + product, no price_band
-        product_level = grades.get((store_id, product_category, None))
+        product_level = grades.get((store_id, normalized_category, None))
         if product_level:
             return product_level
 
@@ -857,12 +900,13 @@ class AllocationEngine:
 
         eligible: dict[UUID, ScoreData] = {}
         store_list = await self._load_style_store_list(sku.store_list_id, brand_id, db)
+        store_list_ids = set(store_list.store_ids) if store_list is not None else None
         required_min_grade = sku.resolved_min_grade
 
         for store_id, score_data in store_scores.items():
             store = self._store_cache[store_id]
 
-            if store_list is not None and store_id not in set(store_list.store_ids):
+            if store_list_ids is not None and store_id not in store_list_ids:
                 continue
 
             if required_min_grade:
@@ -888,16 +932,42 @@ class AllocationEngine:
                 return False
         return True
 
+    async def _preload_display_capacity(self, brand_id: UUID, db: AsyncSession) -> int:
+        rows = await db.execute(
+            select(
+                StoreDisplayCapacity.store_id,
+                StoreDisplayCapacity.category,
+                StoreDisplayCapacity.max_units,
+                StoreDisplayCapacity.max_styles,
+            ).where(StoreDisplayCapacity.brand_id == brand_id)
+        )
+        self._display_capacity_cache = {}
+        for store_id, category, max_units, max_styles in rows.all():
+            self._display_capacity_cache[(store_id, _normalize_category_key(category))] = int(
+                max_units if max_units is not None else (max_styles or 0) * 6
+            )
+        self._display_capacity_preloaded = True
+        return len(self._display_capacity_cache)
+
     async def _remaining_display_capacity(self, store_id: UUID, category: str, db: AsyncSession) -> int:
+        cache_key = (store_id, _normalize_category_key(category))
+        cached = self._display_capacity_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if self._display_capacity_preloaded:
+            return 999
+
         cap = await db.scalar(
             select(StoreDisplayCapacity).where(
                 StoreDisplayCapacity.store_id == store_id,
-                StoreDisplayCapacity.category == category,
+                func.lower(func.trim(StoreDisplayCapacity.category)) == _normalize_category_key(category),
             )
         )
         if cap is None:
             return 999
-        return cap.max_units or (cap.max_styles * 6)
+        resolved = int(cap.max_units if cap.max_units is not None else (cap.max_styles or 0) * 6)
+        self._display_capacity_cache[cache_key] = resolved
+        return resolved
 
     def distribute_units(
         self,
@@ -1074,19 +1144,22 @@ class AllocationEngine:
         self,
         allocation: dict[UUID, int],
         available_units: int,
-        grn_line: GRNLine,
+        sku: SKU,
         db: AsyncSession,
+        existing_allocations: dict[UUID, int] | None = None,
     ) -> dict[UUID, int]:
         constrained: dict[UUID, int] = {}
-        total_allocated = 0
-        sku = await db.scalar(select(SKU).where(SKU.id == grn_line.sku_id))
-        if sku is None:
+        already_allocated = existing_allocations or {}
+        total_allocated = sum(int(qty or 0) for qty in already_allocated.values())
+        if total_allocated >= available_units:
             return {}
 
         sorted_stores = sorted(allocation.items(), key=lambda item: item[1], reverse=True)
         for store_id, qty in sorted_stores:
             remaining_capacity = await self._remaining_display_capacity(store_id, sku.category, db)
-            qty = min(qty, max(remaining_capacity, 0))
+            current_store_allocation = int(already_allocated.get(store_id, 0))
+            capacity_room = max(remaining_capacity - current_store_allocation, 0)
+            qty = min(qty, capacity_room)
             remaining_available = available_units - total_allocated
             qty = min(qty, max(remaining_available, 0))
 
@@ -1098,6 +1171,59 @@ class AllocationEngine:
                 break
 
         return constrained
+
+    async def _top_up_allocations(
+        self,
+        allocations: dict[UUID, int],
+        target_demands: dict[UUID, int],
+        available_units: int,
+        sku: SKU,
+        store_scores: dict[UUID, ScoreData],
+        brand_id: UUID,
+        db: AsyncSession,
+    ) -> dict[UUID, int]:
+        current = {store_id: int(qty or 0) for store_id, qty in allocations.items() if int(qty or 0) > 0}
+        remaining = max(0, available_units - sum(current.values()))
+        if remaining <= 0:
+            return current
+
+        residual_demands = {
+            store_id: max(int(target_demands.get(store_id, 0)) - int(current.get(store_id, 0)), 0)
+            for store_id in target_demands.keys()
+        }
+        residual_demands = {store_id: qty for store_id, qty in residual_demands.items() if qty > 0}
+        if not residual_demands:
+            return current
+
+        incremental = apply_inventory_cap(
+            store_demands=residual_demands,
+            available_qty=remaining,
+            min_presentation_qty=0,
+            store_grades=None,
+        )
+        incremental = await self.apply_constraints(
+            allocation=incremental,
+            available_units=available_units,
+            sku=sku,
+            db=db,
+            existing_allocations=current,
+        )
+        incremental = await self.filter_stores_by_size_eligibility(incremental, sku, brand_id, db)
+        if not incremental:
+            return current
+
+        ranked_store_ids = sorted(
+            incremental.keys(),
+            key=lambda sid: store_scores[sid].score if sid in store_scores else 0.0,
+            reverse=True,
+        )
+        for store_id in ranked_store_ids:
+            qty = int(incremental.get(store_id, 0))
+            if qty <= 0:
+                continue
+            current[store_id] = int(current.get(store_id, 0)) + qty
+
+        return current
 
     def _affinity_multiplier(self, profile, sku: SKU) -> float:
         if profile is None:
@@ -1195,6 +1321,7 @@ class AllocationEngine:
         qty: int,
         store_scores: dict[UUID, ScoreData],
         ros_data: dict[tuple[UUID, str], dict[str, float]],
+        season_weeks_remaining: int,
         db: AsyncSession,
     ) -> dict:
         store = self._store_cache[store_id]
@@ -1213,7 +1340,6 @@ class AllocationEngine:
         store_ros = score.store_ros
         current_cover = score.current_cover
         capacity_available = await self._remaining_display_capacity(store_id, sku.category, db)
-        season_weeks_remaining = await self._season_weeks_remaining(sku, db)
         weeks_cover = qty / max(store_ros, 0.01) / 7
 
         return {

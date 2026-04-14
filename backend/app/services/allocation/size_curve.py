@@ -87,6 +87,10 @@ async def load_historical_size_ratios(
     3. Brand-level ratios
     4. Empty dict (caller should use guide weights only)
     """
+    season_filter = []
+    if historical_season_id is not None:
+        season_filter = [SKU.season_id == historical_season_id]
+
     store_rows = await db.execute(
         select(SKU.size, func.sum(SalesData.units_sold))
         .join(SKU, SKU.id == SalesData.sku_id)
@@ -94,6 +98,7 @@ async def load_historical_size_ratios(
             SalesData.brand_id == brand_id,
             SalesData.store_id == store_id,
             SKU.category == product_category,
+            *season_filter,
         )
         .group_by(SKU.size)
     )
@@ -116,6 +121,7 @@ async def load_historical_size_ratios(
                 SalesData.brand_id == brand_id,
                 Store.cluster_id == cluster_id,
                 SKU.category == product_category,
+                *season_filter,
             )
             .group_by(SKU.size)
         )
@@ -129,6 +135,7 @@ async def load_historical_size_ratios(
         .where(
             SalesData.brand_id == brand_id,
             SKU.category == product_category,
+            *season_filter,
         )
         .group_by(SKU.size)
     )

@@ -74,11 +74,36 @@ function withTimeoutSignal(
 
 async function parseApiError(response: Response): Promise<ApiError> {
   try {
-    const error = (await response.json()) as ApiErrorEnvelope;
+    const error = (await response.json()) as ApiErrorEnvelope & {
+      code?: string;
+      message?: string;
+      detail?: unknown;
+    };
+    const detailMessage =
+      typeof error?.detail === "string"
+        ? error.detail
+        : Array.isArray(error?.detail)
+        ? error.detail
+            .map((item) => {
+              if (typeof item === "string") return item;
+              if (item && typeof item === "object" && "msg" in item) {
+                const msg = String((item as { msg?: unknown }).msg ?? "");
+                const locRaw = (item as { loc?: unknown }).loc;
+                const loc = Array.isArray(locRaw) ? locRaw.map(String).join(".") : "";
+                return loc ? `${loc}: ${msg}` : msg;
+              }
+              return "";
+            })
+            .filter(Boolean)
+            .join("; ")
+        : undefined;
     return new ApiError(
-      error?.error?.code ?? `HTTP_${response.status}`,
-      error?.error?.message ?? `Request failed with status ${response.status}`,
-      error?.error?.details
+      error?.error?.code ?? error?.code ?? `HTTP_${response.status}`,
+      error?.error?.message ??
+        error?.message ??
+        detailMessage ??
+        `Request failed with status ${response.status}`,
+      error?.error?.details ?? error?.detail
     );
   } catch {
     return new ApiError(`HTTP_${response.status}`, `Request failed with status ${response.status}`);

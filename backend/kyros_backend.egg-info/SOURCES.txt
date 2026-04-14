@@ -103,7 +103,6 @@ kyros_backend.egg-info/dependency_links.txt
 kyros_backend.egg-info/requires.txt
 kyros_backend.egg-info/top_level.txt
 scripts/dispatch_upload.py
-scripts/seed_data.py
 tests/test_allocation_distribution.py
 tests/test_celery_failure.py
 tests/test_cover_framing.py

@@ -501,7 +501,6 @@ Identical logic. One is never called. Use the one in `snapshot.py` (or move to a
 ```bash
 make up
 make migrate
-make load-pilot
 make test
 make jobs
 ```

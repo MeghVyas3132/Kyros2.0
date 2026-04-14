@@ -262,3 +262,49 @@ export interface AllocationInsights {
   total_lines: number;
   total_units_allocated: number;
 }
+
+export interface AllocationBenchmarkCheck {
+  metric: string;
+  operator: "<=" | ">=";
+  target: number;
+  actual: number;
+  passed: boolean;
+}
+
+export interface AllocationBenchmarkBucket {
+  key: string;
+  lines: number;
+  allocated_units: number;
+  override_rate: number;
+  under_coverage_rate: number;
+  grade_compliance_rate: number;
+}
+
+export interface AllocationBenchmarkReport {
+  session_id: string;
+  session_status: string;
+  summary: {
+    total_lines: number;
+    allocated_units_total: number;
+    available_units_total: number;
+    override_rate: number;
+    under_coverage_rate: number;
+    grade_compliance_rate: number;
+    inventory_utilization_rate: number;
+    high_confidence_share: number;
+    quality_score: number;
+  };
+  acceptance: {
+    overall_pass: boolean;
+    checks: AllocationBenchmarkCheck[];
+  };
+  demand_source_mix: Array<{
+    source: string;
+    lines: number;
+    share: number;
+  }>;
+  scorecards: {
+    by_grade: AllocationBenchmarkBucket[];
+    by_style_risk_group: AllocationBenchmarkBucket[];
+  };
+}

@@ -1,4 +1,4 @@
-.PHONY: up down migrate load-pilot test jobs logs shell-backend shell-db
+.PHONY: up down migrate test jobs logs shell-backend shell-db
 
 up:
 	docker compose up -d --build
@@ -8,9 +8,6 @@ down:
 
 migrate:
 	docker compose exec backend alembic upgrade head
-
-load-pilot:
-	docker compose exec backend python scripts/seed_data.py
 
 test:
 	docker compose exec backend pytest -v --tb=short
