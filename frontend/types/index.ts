@@ -203,6 +203,9 @@ export interface AllocationSession {
   total_skus: number;
   total_units_recommended: number;
   total_units_approved: number;
+  health_score?: number | null;
+  health_report?: any | null;
+  decision?: any | null;
   failure_reason?: string | null;
   approved_by: string | null;
   approved_at: string | null;

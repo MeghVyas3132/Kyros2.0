@@ -19,11 +19,26 @@ async def _run_allocation(session_id: str, grn_id: str, brand_id: str) -> dict:
     from app.database import AsyncSessionLocal
     from app.models import AllocationSession, AllocationStatus
     from app.services.allocation.engine import AllocationEngine
+    from app.services.allocation.health import AllocationHealthAnalyzer, compute_decision
 
     engine = AllocationEngine()
 
     async with AsyncSessionLocal() as db:
         session = await engine.generate(UUID(grn_id), UUID(brand_id), db)
+        
+        # ── INTELLIGENCE LAYER ──
+        analyzer = AllocationHealthAnalyzer(session.id, session.brand_id, db)
+        report = await analyzer.analyze()
+        decision = compute_decision(
+            health_score=report.score,
+            risks=report.risks,
+            context=analyzer.get_context()
+        )
+        session.health_score = report.score
+        session.health_report = report.to_json()
+        session.decision = decision
+        # ────────────────────────
+        
         await db.commit()
         return {
             "session_id": str(session.id),
@@ -79,14 +94,24 @@ def run_allocation_task(self, session_id: str, grn_id: str, brand_id: str) -> di
         raise
     except Exception as exc:
         logger.exception("allocation_failed grn=%s duration=%.1fs", grn_id, perf_counter() - start)
+        retries = int(getattr(self.request, "retries", 0))
+        max_retries = int(getattr(self, "max_retries", 0) or 0)
+        if retries >= max_retries:
+            asyncio.run(
+                _mark_failed(
+                    session_id,
+                    f"Allocation failed after {max_retries + 1} attempts. Last error: {str(exc)[:500]}",
+                )
+            )
+            raise
         try:
-            countdown = 30 * (self.request.retries + 1)
+            countdown = 30 * (retries + 1)
             raise self.retry(exc=exc, countdown=countdown)
         except MaxRetriesExceededError:
             asyncio.run(
                 _mark_failed(
                     session_id,
-                    f"Allocation failed after 3 attempts. Last error: {str(exc)[:500]}",
+                    f"Allocation failed after {max_retries + 1} attempts. Last error: {str(exc)[:500]}",
                 )
             )
             raise

@@ -113,6 +113,7 @@ async function parseApiError(response: Response): Promise<ApiError> {
 type ApiRequestOptions = RequestInit & {
   timeoutMs?: number;
   retryCount?: number;
+  _authRetryAttempted?: boolean;
 };
 
 async function tryRefreshToken(): Promise<boolean> {
@@ -135,11 +136,16 @@ async function tryRefreshToken(): Promise<boolean> {
   return true;
 }
 
+function isAuthPath(path: string): boolean {
+  return path.startsWith("/api/v1/auth/");
+}
+
 export async function apiRequest<T>(path: string, options?: ApiRequestOptions): Promise<T> {
   const token = getToken();
   const isFormData = options?.body instanceof FormData;
   const timeoutMs = options?.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const retryCount = options?.retryCount ?? 0;
+  const authRetryAttempted = options?._authRetryAttempted ?? false;
 
   const { signal, cancel } = withTimeoutSignal(timeoutMs, options?.signal ?? undefined);
 
@@ -171,10 +177,18 @@ export async function apiRequest<T>(path: string, options?: ApiRequestOptions): 
   }
 
   if (response.status === 401) {
-    const refreshed = await tryRefreshToken();
-    if (refreshed) {
-      return apiRequest<T>(path, options);
+    if (isAuthPath(path)) {
+      throw await parseApiError(response);
     }
+
+    if (!authRetryAttempted) {
+      const refreshed = await tryRefreshToken();
+      if (refreshed) {
+        return apiRequest<T>(path, { ...options, _authRetryAttempted: true });
+      }
+    }
+
+    clearAuthTokens();
     if (typeof window !== "undefined") {
       window.location.href = "/login";
     }

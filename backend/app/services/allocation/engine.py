@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import date
@@ -30,6 +29,8 @@ from app.models import (
     StyleStoreList,
 )
 from app.services.allocation.cap import apply_inventory_cap
+from app.services.allocation.guardrails import apply_guardrails
+from app.services.allocation.intelligence import auto_detect_strategy, prioritize_stores, enforce_mva
 from app.services.allocation.constants import (
     DEFAULT_COVER_TARGETS,
     DEFAULT_GRADE,
@@ -51,7 +52,7 @@ from app.services.allocation.demand import (
     preload_stockout_signals,
 )
 from app.utils.date_utils import utcnow
-from app.services.allocation.size_curve import calculate_size_distribution
+from app.services.allocation.size_curve import calculate_size_distribution, preload_size_data
 from app.services.allocation.store_profile import load_store_profile_map
 
 logger = logging.getLogger(__name__)
@@ -113,11 +114,12 @@ class AllocationEngine:
         if grn is None:
             raise ValueError(f"GRN {grn_id} not found for brand {brand_id}")
 
+        # Fix 1.3: Lock the session row to prevent concurrent runs
         session = await db.scalar(
             select(AllocationSession).where(
                 AllocationSession.grn_id == grn_id,
                 AllocationSession.brand_id == brand_id,
-            )
+            ).with_for_update(skip_locked=False)
         )
         if session is not None and session.status == AllocationStatus.APPROVED:
             return session
@@ -207,26 +209,31 @@ class AllocationEngine:
         for line in existing_lines:
             existing_lines_by_sku.setdefault(line.sku_id, []).append(line)
 
-        previous_season_id, season_weeks_remaining, min_presentation_qty, grade_map = await asyncio.gather(
-            get_previous_season_id(db, brand_id, grn.season_id),
-            get_season_weeks_remaining(db, brand_id, grn.season_id),
-            get_min_presentation_qty(db, brand_id),
-            load_grade_map(db, brand_id),
-        )
+        previous_season_id = await get_previous_season_id(db, brand_id, grn.season_id)
+        season_weeks_remaining = await get_season_weeks_remaining(db, brand_id, grn.season_id)
+        min_presentation_qty = await get_min_presentation_qty(db, brand_id)
+        grade_map = await load_grade_map(db, brand_id)
 
-        sales_by_store_category, grade_ros_averages, cluster_ros_averages, preloaded_stockout_signals = await asyncio.gather(
-            load_sales_history(db=db, brand_id=brand_id, season_id=previous_season_id),
-            load_grade_ros_averages(db=db, brand_id=brand_id, season_id=previous_season_id),
-            load_cluster_ros_averages(db=db, brand_id=brand_id, season_id=previous_season_id),
-            preload_stockout_signals(db=db, brand_id=brand_id, season_id=previous_season_id),
+        sales_by_store_category = await load_sales_history(
+            db=db, brand_id=brand_id, season_id=previous_season_id
         )
-        brand_settings, store_profile_map, inventory, ros_by_attribute, _ = await asyncio.gather(
-            self._load_brand_settings(brand_id, db),
-            load_store_profile_map(brand_id, db),
-            self._load_latest_inventory(brand_id, db),
-            self._load_ros_by_attribute(brand_id, db),
-            self._preload_display_capacity(brand_id, db),
+        grade_ros_averages = await load_grade_ros_averages(
+            db=db, brand_id=brand_id, season_id=previous_season_id
         )
+        cluster_ros_averages = await load_cluster_ros_averages(
+            db=db, brand_id=brand_id, season_id=previous_season_id
+        )
+        preloaded_stockout_signals = await preload_stockout_signals(
+            db=db, brand_id=brand_id, season_id=previous_season_id
+        )
+        brand_settings = await self._load_brand_settings(brand_id, db)
+        store_profile_map = await load_store_profile_map(brand_id, db)
+        inventory = await self._load_latest_inventory(brand_id, db)
+        ros_by_attribute = await self._load_ros_by_attribute(brand_id, db)
+        await self._preload_display_capacity(brand_id, db)
+        preloaded_guides, preloaded_ratios = await preload_size_data(brand_id, db)
+        logger.info("Preloaded %d size-guide categories and %d store-level size ratio entries",
+                    len(preloaded_guides), len(preloaded_ratios.store_ratios))
         style_dna_cache = {}
 
         total_units = 0
@@ -234,24 +241,52 @@ class AllocationEngine:
         BATCH_SIZE = 500
         batch = []
 
+        # ──────────────────────────────────────────────────────────────
+        # STYLE-LEVEL ALLOCATION (Fix 1.1)
+        # Group GRN lines by style_code so that all 8 sizes of a style
+        # share a single demand/cap/distribution pass.
+        # ──────────────────────────────────────────────────────────────
+        from collections import defaultdict as _defaultdict
+
+        style_groups: dict[str, list] = _defaultdict(list)
         for grn_line in grn_lines:
             sku = sku_map.get(grn_line.sku_id)
             if sku is None:
                 continue
+            style_groups[sku.style_code].append(grn_line)
+
+        for style_code, style_grn_lines in style_groups.items():
+            # --- Sum available_units across all sizes for this style ---
+            style_available_units = 0
+            size_available_map: dict[UUID, int] = {}   # sku_id → available
+            representative_sku: SKU | None = None
+
+            for grn_line in style_grn_lines:
+                sku = sku_map.get(grn_line.sku_id)
+                if sku is None:
+                    continue
+                reserved = reservation_map.get(grn_line.id)
+                if reserved is None:
+                    reserved = int(grn_line.ecom_reserved_qty or 0) + int(grn_line.ars_reserved_qty or 0)
+                avail = max(0, int(grn_line.units_received or 0) - reserved)
+                size_available_map[sku.id] = avail
+                style_available_units += avail
+                if representative_sku is None:
+                    representative_sku = sku
+
+            if style_available_units <= 0 or representative_sku is None:
+                continue
+
+            sku = representative_sku
             normalized_category = _normalize_category_key(sku.category)
 
             rule = sku.store_group_rule
-            if grn_line.buy_plan_line_id is not None and grn_line.buy_plan_line_id in buy_plan_map:
-                rule = buy_plan_map[grn_line.buy_plan_line_id].store_group_rule or rule
+            for grn_line in style_grn_lines:
+                if grn_line.buy_plan_line_id is not None and grn_line.buy_plan_line_id in buy_plan_map:
+                    rule = buy_plan_map[grn_line.buy_plan_line_id].store_group_rule or rule
+                    break
 
-            reserved = reservation_map.get(grn_line.id)
-            if reserved is None:
-                reserved = int(grn_line.ecom_reserved_qty or 0) + int(grn_line.ars_reserved_qty or 0)
-            available_units = max(0, int(grn_line.units_received or 0) - reserved)
-            if available_units <= 0:
-                logger.warning("Skipping SKU %s because available qty is %d", sku.sku_code, available_units)
-                continue
-
+            # --- Filter & score stores (same as before, using representative SKU) ---
             eligible_stores = self._filter_stores_for_group_rule(
                 stores=stores,
                 grade_map=grade_map,
@@ -259,7 +294,7 @@ class AllocationEngine:
                 rule=rule,
             )
             if not eligible_stores:
-                logger.warning("No eligible stores found for SKU %s under rule %s", sku.sku_code, rule)
+                logger.warning("No eligible stores for style %s under rule %s", style_code, rule)
                 continue
 
             store_scores = await self.score_stores(
@@ -278,18 +313,40 @@ class AllocationEngine:
                 db=db,
                 brand_id=brand_id,
             )
+
+            # ──── NEW: PRIORITIZATION LAYER ────
+            min_depth_setting = brand_settings.get("min_depth", 3)
+            strategy = auto_detect_strategy(
+                available_units=style_available_units,
+                eligible_store_count=len(eligible_scores),
+                risk_level=sku.style_risk_group or "PROVEN",
+                min_depth=min_depth_setting,
+            )
+            prioritized = prioritize_stores(
+                eligible_scores=eligible_scores,
+                available_units=style_available_units,
+                min_depth=min_depth_setting,
+                strategy=strategy,
+            )
+            eligible_scores = prioritized
+            eligible_stores = [
+                store for store in eligible_stores if store.id in prioritized
+            ]
+            # ──── END PRIORITIZATION ────
+
             if not eligible_scores:
-                logger.warning("No stores passed eligibility constraints for SKU %s", sku.sku_code)
+                logger.warning("No stores passed eligibility for style %s", style_code)
                 continue
             eligible_stores = [self._store_cache[store_id] for store_id in eligible_scores.keys()]
 
-            demand_tasks = []
+            # --- Compute demand at STYLE level (not per-size) ---
+            demand_signals: list[DemandSignal] = []
             store_grade_map: dict[UUID, str] = {}
             for store in eligible_stores:
                 grade = grade_map.get((store.id, normalized_category), DEFAULT_GRADE)
                 store_grade_map[store.id] = grade
-                demand_tasks.append(
-                    calculate_store_demand_details(
+                demand_signals.append(
+                    await calculate_store_demand_details(
                         db=db,
                         brand_id=brand_id,
                         sku=sku,
@@ -306,7 +363,6 @@ class AllocationEngine:
                     )
                 )
 
-            demand_signals = await asyncio.gather(*demand_tasks)
             store_demands: dict[UUID, int] = {}
             demand_signal_map: dict[UUID, DemandSignal] = {}
             affinity_adjustment_map: dict[UUID, int] = {}
@@ -328,7 +384,6 @@ class AllocationEngine:
                 profile = store_profile_map.get(store.id)
                 affinity_multiplier = self._affinity_multiplier(profile, sku)
 
-                # Apply grade and affinity multipliers to weekly_ros for final demand calculation.
                 base_ros_with_grade = signal.weekly_ros * signal.grade_multiplier
                 adjusted_ros = base_ros_with_grade * affinity_multiplier
                 pre_affinity_target = round(base_ros_with_grade * cover_target_weeks)
@@ -339,7 +394,7 @@ class AllocationEngine:
                 affinity_multiplier_map[store.id] = affinity_multiplier
 
             total_raw_demand = sum(store_demands.values())
-            base_distribution = self.distribute_units(eligible_scores, available_units, sku, brand_settings)
+            base_distribution = self.distribute_units(eligible_scores, style_available_units, sku, brand_settings)
             if base_distribution:
                 allowed_store_ids = set(base_distribution.keys())
                 store_demands = {
@@ -350,8 +405,6 @@ class AllocationEngine:
             if total_raw_demand <= 0:
                 continue
 
-            # Apply cannibalization to demand BEFORE capping so reduced units
-            # are redistributed rather than wasted.
             store_demands, cannibalization_meta = self._apply_story_cannibalization(
                 sku=sku,
                 allocations=store_demands,
@@ -359,63 +412,87 @@ class AllocationEngine:
                 sku_map=sku_map,
             )
 
+            # --- Cap at STYLE level (not per-size) ---
             final_allocations = apply_inventory_cap(
                 store_demands=store_demands,
-                available_qty=available_units,
+                available_qty=style_available_units,
                 min_presentation_qty=min_presentation_qty,
                 store_grades=store_grade_map,
             )
-            final_allocations = await self.apply_constraints(final_allocations, available_units, sku, db)
+
+            # ──── NEW: MVA ENFORCEMENT ────
+            final_allocations = enforce_mva(
+                allocations=final_allocations,
+                store_grades=store_grade_map,
+                base_mva=min_presentation_qty,
+                eligible_scores=eligible_scores,
+            )
+            # ──── END MVA ────
+            
+            # --- Phase 2.1: Guardrails ---
+            guardrail_result = apply_guardrails(
+                allocations=final_allocations,
+                available_units=style_available_units,
+                store_grades=store_grade_map,
+                brand_config=brand_settings,
+            )
+            final_allocations = guardrail_result.adjustments
+
+            final_allocations = await self.apply_constraints(final_allocations, style_available_units, sku, db)
             final_allocations = await self.filter_stores_by_size_eligibility(final_allocations, sku, brand_id, db)
             final_allocations = await self._top_up_allocations(
                 allocations=final_allocations,
                 target_demands=store_demands,
-                available_units=available_units,
+                available_units=style_available_units,
                 sku=sku,
                 store_scores=eligible_scores,
                 brand_id=brand_id,
                 db=db,
             )
 
-            # Post-constraints reconciliation to guarantee this SKU never exceeds available units.
+            # Post-constraints reconciliation
             total_allocated = sum(final_allocations.values())
-            if total_allocated > available_units:
+            if total_allocated > style_available_units:
                 logger.warning(
-                    "SKU %s: allocated %d exceeds available %d after constraints. Scaling down.",
-                    sku.id,
-                    total_allocated,
-                    available_units,
+                    "Style %s: allocated %d exceeds available %d. Scaling down.",
+                    style_code, total_allocated, style_available_units,
                 )
                 if total_allocated > 0:
-                    scale = available_units / total_allocated
+                    scale = style_available_units / total_allocated
                     scaled_allocations = {
                         store_id: max(0, round(qty * scale))
                         for store_id, qty in final_allocations.items()
                     }
-
-                    rounding_overflow = sum(scaled_allocations.values()) - available_units
+                    rounding_overflow = sum(scaled_allocations.values()) - style_available_units
                     if rounding_overflow > 0:
                         for store_id, qty in sorted(
-                            scaled_allocations.items(),
-                            key=lambda item: item[1],
-                            reverse=True,
+                            scaled_allocations.items(), key=lambda item: item[1], reverse=True,
                         ):
                             if rounding_overflow <= 0:
                                 break
                             decrement = min(qty, rounding_overflow)
                             scaled_allocations[store_id] -= decrement
                             rounding_overflow -= decrement
-
                     final_allocations = {
                         store_id: qty for store_id, qty in scaled_allocations.items() if qty > 0
                     }
 
-            size_distribution_sources: dict[UUID, str] = {}
+            # ──────────────────────────────────────────────────────────
+            # SIZE DISTRIBUTION: Split each store's style-level qty
+            # into per-size quantities using the existing size curve.
+            # Then emit one AllocationLine per (store × size-SKU).
+            # ──────────────────────────────────────────────────────────
+            # Build a map from size → sku_id for this style
+            size_to_sku: dict[str, SKU] = {}
+            for grn_line in style_grn_lines:
+                _sku = sku_map.get(grn_line.sku_id)
+                if _sku is not None and _sku.size:
+                    size_to_sku[_sku.size] = _sku
 
             for store in eligible_stores:
                 store_id = store.id
+                style_qty = final_allocations.get(store_id, 0)
                 raw_demand = store_demands.get(store_id, 0)
-                final_qty = final_allocations.get(store_id, 0)
                 signal = demand_signal_map[store_id]
                 style_risk_group = (sku.style_risk_group or "PROVEN").upper()
                 cover_target_weeks = min(
@@ -424,24 +501,25 @@ class AllocationEngine:
                 )
                 profile = store_profile_map.get(store_id)
 
+                # Compute size split for this store's style-level allocation
                 size_split: dict[str, int] = {}
                 size_distribution_source = "size_guide"
-                if final_qty > 0:
+                if style_qty > 0:
                     try:
                         size_split = await calculate_size_distribution(
                             db=db,
                             brand_id=brand_id,
                             sku=sku,
                             store=store,
-                            total_qty=final_qty,
+                            total_qty=style_qty,
                             store_grade=store_grade_map.get(store_id, DEFAULT_GRADE),
                             historical_season_id=previous_season_id,
+                            preloaded_guides=preloaded_guides,
+                            preloaded_ratios=preloaded_ratios,
                         )
                     except Exception:  # noqa: BLE001
                         logger.warning(
-                            "Size curve failed for sku=%s store=%s",
-                            sku.sku_code,
-                            store.store_code,
+                            "Size curve failed for style=%s store=%s", style_code, store.store_code,
                             exc_info=True,
                         )
                         size_split = {}
@@ -451,7 +529,6 @@ class AllocationEngine:
                         if len(non_zero_sizes) > 1:
                             size_distribution_source = "historical"
 
-                size_distribution_sources[store_id] = size_distribution_source
                 confidence = self.calculate_confidence(
                     ScoreData(
                         score=0.0,
@@ -464,13 +541,13 @@ class AllocationEngine:
                     brand_settings,
                 )
 
-                local_scale_factor = (final_qty / raw_demand) if raw_demand > 0 else 1.0
-                weeks_cover = (final_qty / signal.weekly_ros) if signal.weekly_ros > 0 else 0.0
+                local_scale_factor = (style_qty / raw_demand) if raw_demand > 0 else 1.0
+                weeks_cover = (style_qty / signal.weekly_ros) if signal.weekly_ros > 0 else 0.0
 
                 method_reasoning = await self.generate_reasoning(
                     store_id=store_id,
                     sku=sku,
-                    qty=final_qty,
+                    qty=style_qty,
                     store_scores=eligible_scores,
                     ros_data=ros_by_attribute,
                     season_weeks_remaining=season_weeks_remaining,
@@ -478,7 +555,6 @@ class AllocationEngine:
                 )
                 cluster_avg = float(method_reasoning.get("cluster_avg_ros_attribute") or 0.0)
 
-                # Convert DemandSignal to TrueDemandResult for the unified builder
                 true_demand = TrueDemandResult(
                     weekly_ros=signal.weekly_ros,
                     raw_weekly_ros=signal.weekly_ros,
@@ -499,8 +575,8 @@ class AllocationEngine:
                     demand_result=true_demand,
                     cover_target_weeks=cover_target_weeks,
                     raw_demand_units=raw_demand,
-                    final_qty=final_qty,
-                    available_qty=int(available_units),
+                    final_qty=style_qty,
+                    available_qty=int(style_available_units),
                     size_result={
                         "size_split": size_split,
                         "source": "store_historical" if size_distribution_source == "historical" else "brand_size_guide",
@@ -546,100 +622,138 @@ class AllocationEngine:
                     "size_distribution_source": size_distribution_source,
                     "cap_scale_factor": round(local_scale_factor, 4),
                     "total_demand_before_cap": int(total_raw_demand),
-                    "available_qty": int(available_units),
+                    "available_qty": int(style_available_units),
                 }
 
-                existing_line = existing_line_map.get((store_id, sku.id))
-                if existing_line is None:
-                    existing_line = AllocationLine(
-                        session_id=session.id,
-                        brand_id=brand_id,
-                        store_id=store_id,
-                        sku_id=sku.id,
-                        ai_reasoning=reasoning,
-                    )
-                    batch.append(existing_line)
-                    existing_line_map[(store_id, sku.id)] = existing_line
-                else:
-                    existing_line.ai_reasoning = reasoning
+                # --- Emit one AllocationLine per size-SKU ---
+                if size_split:
+                    for size_label, size_qty in size_split.items():
+                        size_sku = size_to_sku.get(size_label)
+                        if size_sku is None or size_qty <= 0:
+                            continue
 
-                existing_line.ai_recommended_qty = raw_demand
-                existing_line.final_qty = final_qty
-                existing_line.ai_confidence = confidence
-                existing_line.ai_projections = projections
-                
-                # Batch commit when batch is full
+                        existing_line = existing_line_map.get((store_id, size_sku.id))
+                        if existing_line is None:
+                            existing_line = AllocationLine(
+                                session_id=session.id,
+                                brand_id=brand_id,
+                                store_id=store_id,
+                                sku_id=size_sku.id,
+                                ai_reasoning=reasoning,
+                            )
+                            batch.append(existing_line)
+                            existing_line_map[(store_id, size_sku.id)] = existing_line
+                        else:
+                            existing_line.ai_reasoning = reasoning
+
+                        existing_line.ai_recommended_qty = size_qty
+                        existing_line.final_qty = size_qty
+                        existing_line.ai_confidence = confidence
+                        existing_line.ai_projections = projections
+
+                elif style_qty > 0:
+                    # size_split failed — fall back to putting all on representative SKU
+                    existing_line = existing_line_map.get((store_id, sku.id))
+                    if existing_line is None:
+                        existing_line = AllocationLine(
+                            session_id=session.id,
+                            brand_id=brand_id,
+                            store_id=store_id,
+                            sku_id=sku.id,
+                            ai_reasoning=reasoning,
+                        )
+                        batch.append(existing_line)
+                        existing_line_map[(store_id, sku.id)] = existing_line
+                    else:
+                        existing_line.ai_reasoning = reasoning
+
+                    existing_line.ai_recommended_qty = style_qty
+                    existing_line.final_qty = style_qty
+                    existing_line.ai_confidence = confidence
+                    existing_line.ai_projections = projections
+
+                # Also emit zero-qty lines for sizes that got 0
+                for size_label, size_sku in size_to_sku.items():
+                    if size_split.get(size_label, 0) > 0:
+                        continue
+                    existing_line = existing_line_map.get((store_id, size_sku.id))
+                    if existing_line is None:
+                        existing_line = AllocationLine(
+                            session_id=session.id,
+                            brand_id=brand_id,
+                            store_id=store_id,
+                            sku_id=size_sku.id,
+                            ai_reasoning=reasoning,
+                        )
+                        batch.append(existing_line)
+                        existing_line_map[(store_id, size_sku.id)] = existing_line
+                    else:
+                        existing_line.ai_reasoning = reasoning
+                    existing_line.ai_recommended_qty = 0
+                    existing_line.final_qty = 0
+                    existing_line.ai_confidence = confidence
+                    existing_line.ai_projections = projections
+
+                # Batch flush
                 if len(batch) >= BATCH_SIZE:
                     db.add_all(batch)
-                    await db.commit()
+                    await db.flush()
                     batch.clear()
 
+            # Handle stale lines for all SKUs in this style
             touched_store_ids = {store.id for store in eligible_stores}
-            stale_lines = existing_lines_by_sku.get(sku.id, [])
-            for stale_line in stale_lines:
-                if stale_line.store_id in touched_store_ids:
+            for grn_line in style_grn_lines:
+                _sku = sku_map.get(grn_line.sku_id)
+                if _sku is None:
                     continue
-                
-                # Use unified reasoning builder for stale lines too
-                stale_reasoning = build_allocation_reasoning(
-                    store_id=str(stale_line.store_id),
-                    sku_id=str(sku.id),
-                    grade=grade_map.get((stale_line.store_id, normalized_category), DEFAULT_GRADE),
-                    demand_result=TrueDemandResult(
-                        weekly_ros=0.0,
-                        raw_weekly_ros=0.0,
-                        source="minimum_presentation",
-                        is_corrected=False,
-                        stockout_week=None,
-                        lost_sales_estimate=None,
-                        data_sample_size=0,
-                        cluster_store_count=0,
-                    ),
-                    cover_target_weeks=0,
-                    raw_demand_units=0,
-                    final_qty=0,
-                    available_qty=int(available_units),
-                    size_result={"size_split": {}, "source": "brand_size_guide", "season_code": None},
-                    season_weeks_remaining=season_weeks_remaining,
-                    grade_multiplier=1.0,
-                    store_ros_attribute="0.0 units/week (not eligible)",
-                    cluster_avg_ros_attribute="0.0 units/week (cluster proxy)",
-                    ros_vs_cluster_pct=0,
-                    current_stock_cover_days=0.0,
-                    data_sample_size=0,
-                )
-                # Override narratives for clarity
-                stale_reasoning["narrative_demand"] = "This line is not eligible under current store group or constraints."
-                stale_reasoning["narrative_adjustments"] = "No adjustments applied."
-                stale_reasoning["narrative_cap"] = "No scaling required."
-                stale_reasoning["confidence_basis"] = "No historical demand available for this store/style context."
-                
-                stale_line.ai_recommended_qty = 0
-                stale_line.final_qty = 0
-                stale_line.ai_confidence = "LOW"
-                stale_line.ai_reasoning = stale_reasoning
-                stale_line.ai_projections = {
-                    "size_split": {},
-                    "size_distribution_source": size_distribution_sources.get(stale_line.store_id, "size_guide"),
-                    "cap_scale_factor": 1.0,
-                    "total_demand_before_cap": 0,
-                    "available_qty": int(available_units),
-                }
+                stale_lines = existing_lines_by_sku.get(_sku.id, [])
+                for stale_line in stale_lines:
+                    if stale_line.store_id in touched_store_ids:
+                        continue
 
-            sku_total_allocated = sum(final_allocations.values())
-            if sku_total_allocated != available_units:
+                    stale_reasoning = build_allocation_reasoning(
+                        store_id=str(stale_line.store_id),
+                        sku_id=str(_sku.id),
+                        grade=grade_map.get((stale_line.store_id, normalized_category), DEFAULT_GRADE),
+                        demand_result=TrueDemandResult(
+                            weekly_ros=0.0, raw_weekly_ros=0.0, source="minimum_presentation",
+                            is_corrected=False, stockout_week=None, lost_sales_estimate=None,
+                            data_sample_size=0, cluster_store_count=0,
+                        ),
+                        cover_target_weeks=0, raw_demand_units=0, final_qty=0,
+                        available_qty=int(style_available_units),
+                        size_result={"size_split": {}, "source": "brand_size_guide", "season_code": None},
+                        season_weeks_remaining=season_weeks_remaining, grade_multiplier=1.0,
+                        store_ros_attribute="0.0 units/week (not eligible)",
+                        cluster_avg_ros_attribute="0.0 units/week (cluster proxy)",
+                        ros_vs_cluster_pct=0, current_stock_cover_days=0.0, data_sample_size=0,
+                    )
+                    stale_reasoning["narrative_demand"] = "This line is not eligible under current store group or constraints."
+                    stale_reasoning["narrative_adjustments"] = "No adjustments applied."
+                    stale_reasoning["narrative_cap"] = "No scaling required."
+                    stale_reasoning["confidence_basis"] = "No historical demand available for this store/style context."
+                    stale_line.ai_recommended_qty = 0
+                    stale_line.final_qty = 0
+                    stale_line.ai_confidence = "LOW"
+                    stale_line.ai_reasoning = stale_reasoning
+                    stale_line.ai_projections = {
+                        "size_split": {}, "size_distribution_source": "size_guide",
+                        "cap_scale_factor": 1.0, "total_demand_before_cap": 0,
+                        "available_qty": int(style_available_units),
+                    }
+
+            style_total_allocated = sum(final_allocations.values())
+            if style_total_allocated != style_available_units:
                 logger.warning(
-                    "SKU cap mismatch for sku=%s: allocated=%d available=%d",
-                    sku.sku_code,
-                    sku_total_allocated,
-                    available_units,
+                    "Style cap mismatch for style=%s: allocated=%d available=%d",
+                    style_code, style_total_allocated, style_available_units,
                 )
 
-            total_units += sku_total_allocated
+            total_units += style_total_allocated
 
             processed += 1
-            if processed % 100 == 0:
-                logger.info("Allocation progress: %d / %d GRN lines processed", processed, len(grn_lines))
+            if processed % 50 == 0:
+                logger.info("Allocation progress: %d / %d styles processed", processed, len(style_groups))
 
         if batch:
             db.add_all(batch)
@@ -651,7 +765,7 @@ class AllocationEngine:
             total_units,
             len(stores),
         )
-        session.total_skus = len(grn_lines)
+        session.total_skus = len(style_groups)
         session.total_units_recommended = total_units
         session.status = AllocationStatus.UNDER_REVIEW
         await db.flush()
@@ -819,6 +933,8 @@ class AllocationEngine:
             brand_settings.get("cold_start", {}).get("scoring_mode", "GRADE_ONLY")
         ).upper()
 
+        # Phase 1: Collect raw values for all stores
+        raw_data: dict[UUID, tuple[float, int, float, float, int, str]] = {}
         for store in stores:
             ros_entry = ros_by_attribute.get((store.id, attribute_key), {})
             sample_size = int(ros_entry.get("sample_size", 0))
@@ -837,12 +953,36 @@ class AllocationEngine:
             if sample_size == 0 and scoring_mode == "GRADE_ONLY":
                 ros_component = 0.0
 
+            raw_data[store.id] = (ros_component, grade_score, current_cover, store_ros, sample_size, store_grade)
+
+        if not raw_data:
+            return scores
+
+        # Phase 2: Min-max normalize each component to [0, 1]
+        store_ids = list(raw_data.keys())
+        ros_vals = [raw_data[sid][0] for sid in store_ids]
+        grade_vals = [float(raw_data[sid][1]) for sid in store_ids]
+        cover_inv_vals = [1.0 / max(raw_data[sid][2], 0.1) for sid in store_ids]
+
+        def _normalize(vals: list[float]) -> list[float]:
+            lo, hi = min(vals), max(vals)
+            if hi <= lo:
+                return [0.5] * len(vals)
+            return [(v - lo) / (hi - lo) for v in vals]
+
+        norm_ros = _normalize(ros_vals)
+        norm_grade = _normalize(grade_vals)
+        norm_cover = _normalize(cover_inv_vals)
+
+        # Phase 3: Apply weights to normalized components
+        for i, store_id in enumerate(store_ids):
+            ros_component, grade_score, current_cover, store_ros, sample_size, store_grade = raw_data[store_id]
             score = (
-                (ROS_WEIGHT * ros_component)
-                + (GRADE_WEIGHT * grade_score)
-                + (COVER_WEIGHT * (1 / max(current_cover, 0.1)))
+                (ROS_WEIGHT * norm_ros[i])
+                + (GRADE_WEIGHT * norm_grade[i])
+                + (COVER_WEIGHT * norm_cover[i])
             )
-            scores[store.id] = ScoreData(
+            scores[store_id] = ScoreData(
                 score=score,
                 store_ros=store_ros,
                 grade_score=grade_score,
@@ -1045,8 +1185,19 @@ class AllocationEngine:
 
         if below_min and final:
             redistributable = sum(raw_distribution[store_id] for store_id in below_min)
-            top_store = max(final.keys(), key=lambda sid: eligible_stores[sid].score)
-            final[top_store] += redistributable
+            # Distribute proportionally to ALL above-minimum stores, not just top
+            total_above = sum(final.values())
+            if total_above > 0:
+                added = 0
+                sorted_final = sorted(final.keys(), key=lambda sid: eligible_stores[sid].score, reverse=True)
+                for store_id in sorted_final:
+                    share = round(redistributable * final[store_id] / total_above)
+                    final[store_id] += share
+                    added += share
+                # Fix rounding remainder
+                remainder = redistributable - added
+                if remainder != 0 and sorted_final:
+                    final[sorted_final[0]] += remainder
         elif below_min and not final:
             top_store = max(eligible_stores.keys(), key=lambda sid: eligible_stores[sid].score)
             final[top_store] = available_units

@@ -867,6 +867,46 @@ def _grade_rank(grade: str | None) -> int:
     order = {"A+": 4, "A": 3, "B": 2, "C": 1}
     return order.get(_normalize_grade(grade), 1)
 
+def calculate_confidence_score(
+    ros_source: str,
+    data_sample_size: int,
+    cap_scale_factor: float,
+    is_synthetic: bool,
+    is_stockout_corrected: bool,
+) -> tuple[str, float]:
+    """Returns (tier, numeric_score) where tier is HIGH/MEDIUM/LOW and score is 0-1."""
+    
+    base_scores = {
+        "store_historical": 0.80,
+        "cluster_average": 0.55,
+        "grade_average": 0.40,
+        "style_dna": 0.30,
+        "minimum_presentation": 0.10,
+    }
+    score = base_scores.get(ros_source, 0.10)
+    
+    # Adjust for sample size
+    if data_sample_size >= 12:
+        score += 0.15
+    elif data_sample_size >= 6:
+        score += 0.05
+    elif data_sample_size < 4:
+        score -= 0.10
+    
+    # Penalize synthetic data
+    if is_synthetic:
+        score *= 0.6
+    
+    # Penalize heavy capping
+    if cap_scale_factor < 0.3:
+        score -= 0.10
+    
+    score = max(0.0, min(1.0, score))
+    tier = "HIGH" if score >= 0.65 else "MEDIUM" if score >= 0.35 else "LOW"
+    return tier, round(score, 3)
+
+
+
 
 def build_allocation_reasoning(
     store_id: str,
@@ -904,6 +944,9 @@ def build_allocation_reasoning(
     data_sample_size: int = 0,
     # Deprecated parameter kept for backward compatibility
     story_concentration_note: str | None = None,
+    # Phase 2 
+    is_synthetic_data: bool = False,
+    grade_was_defaulted: bool = False,
 ) -> dict:
     """Build complete reasoning payload for an allocation line."""
     from app.services.allocation.constants import GRADE_MULTIPLIERS
@@ -975,6 +1018,30 @@ def build_allocation_reasoning(
             if (data_sample_size or demand_result.data_sample_size) >= 6
             else f"Low confidence ({data_sample_size or demand_result.data_sample_size}w history)"
         ),
+        # PHASE 2 - Confidence and Risk
+        "confidence_tier": calculate_confidence_score(
+            ros_source=demand_result.source,
+            data_sample_size=data_sample_size or demand_result.data_sample_size,
+            cap_scale_factor=scale_factor,
+            is_synthetic=is_synthetic_data,
+            is_stockout_corrected=demand_result.is_corrected,
+        )[0],
+        "confidence_score": calculate_confidence_score(
+            ros_source=demand_result.source,
+            data_sample_size=data_sample_size or demand_result.data_sample_size,
+            cap_scale_factor=scale_factor,
+            is_synthetic=is_synthetic_data,
+            is_stockout_corrected=demand_result.is_corrected,
+        )[1],
+        "risk_flags": {
+            "stockout_risk": weeks_at_final < 2.0,
+            "over_allocation_risk": final_qty > 3 * weekly_ros * season_weeks_remaining if (weekly_ros * season_weeks_remaining) > 0 else False,
+            "low_confidence": (data_sample_size or demand_result.data_sample_size) < 4,
+            "no_history": demand_result.source == "minimum_presentation",
+            "heavy_cap_applied": scale_factor < 0.30,
+            "grade_defaulted": grade_was_defaulted,
+            "synthetic_demand": is_synthetic_data,
+        },
         # PHASE 2 PLACEHOLDERS
         "style_dna_match": style_dna_match,
         # BACKWARD COMPATIBLE FIELDS

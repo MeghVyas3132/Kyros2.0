@@ -1,0 +1,595 @@
+# Allocation Intelligence & Health Layer — System Design
+
+## 1. System Definition
+
+### What It Is
+A post-allocation validation engine that runs **automatically** after every `AllocationEngine.generate()` completes. It consumes the raw allocation output and produces a structured judgment: a **Health Score**, a set of **risk alerts**, and **actionable recommendations** — all without requiring human configuration.
+
+### Where It Sits
+
+```
+┌──────────────┐     ┌──────────────┐     ┌─────────────────────┐     ┌──────────────┐
+│  Ingestion   │────▶│  Allocation  │────▶│  INTELLIGENCE LAYER │────▶│  Frontend /  │
+│  Pipeline    │     │  Engine      │     │  (this system)      │     │  API Output  │
+└──────────────┘     └──────────────┘     └─────────────────────┘     └──────────────┘
+                           │                        │
+                      writes to               reads from
+                    allocation_lines        allocation_lines
+                                            + grn_lines
+                                            + sales_data
+                                            + store_product_grades
+```
+
+### Inputs (all already in DB after engine runs)
+
+| Input | Source | Purpose |
+|---|---|---|
+| `allocation_lines.final_qty` | Engine output | What was allocated |
+| `allocation_lines.ai_reasoning` | Engine output | Why it was allocated (ROS, grade, DNA match, cap factor, etc.) |
+| `allocation_lines.ai_projections` | Engine output | Size split, cap scale, raw demand |
+| `allocation_lines.ai_confidence` | Engine output | HIGH / MEDIUM / LOW |
+| `grn_lines.units_received` | Ingestion | Total available inventory |
+| `store_product_grades` | Grades upload | Store tier for each category |
+| `sales_data` | History upload | Actual sell-through for validation |
+| [stores](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#889-964) | Config | Store metadata (cluster, climate, capacity) |
+
+### Outputs
+
+| Output | Type | Consumer |
+|---|---|---|
+| **Session Health Score** (0-100) | Stored on `allocation_sessions` | Summary header in UI |
+| **Style Health Card** (per style) | JSON blob | Style-level detail panel |
+| **Risk Alerts** (per session) | Structured list | Alert bar + notification badge |
+| **Store-level Health** (per store) | Score + flags | Store Health page |
+| **Recommendations** (per style) | Action items | Decision panel |
+
+---
+
+## 2. Health Metrics
+
+### 2.1 Coverage Health
+
+**What it measures:** Will each store run out of stock before the season ends?
+
+```
+metric: weeks_of_cover
+formula: final_qty / weekly_ros    (per store × style)
+```
+
+| Classification | Range | Meaning |
+|---|---|---|
+| 🔴 STOCKOUT_RISK | < 2 weeks | Will likely sell out before replenishment |
+| 🟡 LEAN | 2–4 weeks | Running thin, one sales spike away from stockout |
+| 🟢 HEALTHY | 4–8 weeks | Optimal zone |
+| 🟠 OVERSTOCK | 8–12 weeks | More than needed; capital tied up |
+| 🔴 DEAD_RISK | > 12 weeks | Will likely generate markdowns |
+
+**Aggregation to session level:**
+
+```python
+coverage_score = (
+    pct_healthy * 1.0 +
+    pct_lean * 0.6 +
+    pct_overstock * 0.4 +
+    pct_stockout * 0.0 +
+    pct_dead * 0.0
+) * 100
+```
+
+> [!NOTE]
+> For cold-start (ros_source = `minimum_presentation`), weekly_ros is unreliable. These lines are excluded from the coverage calculation and flagged separately under Confidence.
+
+---
+
+### 2.2 Demand Alignment
+
+**What it measures:** Is the engine allocating proportional to actual demand signals?
+
+```
+metric: demand_alignment_ratio
+formula: final_qty / raw_demand_before_cap    (from ai_projections)
+```
+
+| Classification | Range | Meaning |
+|---|---|---|
+| 🔴 SEVERELY_UNDER | < 0.3 | Inventory shortage — heavy capping applied |
+| 🟡 UNDER | 0.3–0.7 | Constrained but functional |
+| 🟢 ALIGNED | 0.7–1.2 | Demand met within normal variance |
+| 🟠 OVER | > 1.2 | More than demand justified (min presentation fill) |
+
+**Aggregation:**
+
+```python
+alignment_score = pct_aligned * 100
+
+# Penalty for severe under-allocation
+alignment_score -= pct_severely_under * 30
+```
+
+---
+
+### 2.3 Distribution Balance
+
+**What it measures:** Is inventory spread fairly across stores, or concentrated in a few?
+
+```python
+# Per style: compute Gini coefficient across store allocations
+store_qtys = [line.final_qty for store in stores]  # per style
+gini = compute_gini(store_qtys)
+
+# Also: top-5 store concentration
+top5_pct = sum(sorted(store_qtys, reverse=True)[:5]) / sum(store_qtys)
+```
+
+| Classification | Gini | Top-5 Concentration | Meaning |
+|---|---|---|---|
+| 🟢 BALANCED | < 0.3 | < 40% | Even spread |
+| 🟡 MODERATE_SKEW | 0.3–0.5 | 40–60% | Acceptable for graded networks |
+| 🔴 HIGH_SKEW | > 0.5 | > 60% | Risk of starving lower-tier stores |
+
+**Aggregation:**
+
+```python
+balance_score = (1.0 - avg_gini_across_styles) * 100
+```
+
+> [!IMPORTANT]
+> Some skew is EXPECTED and CORRECT — A+ stores SHOULD get more. The threshold accounts for this by using 0.3 (not 0.0) as the "balanced" ceiling. Perfectly equal distribution across a graded network would actually be a bad sign.
+
+---
+
+### 2.4 Presentation Depth
+
+**What it measures:** Does each store have enough units per style to actually merchandise and sell?
+
+```
+metric: units_per_store_per_style
+formula: SUM(final_qty) GROUP BY store_id, style_code
+```
+
+| Classification | Units/Style | Meaning |
+|---|---|---|
+| 🔴 THIN | 1 unit | Cannot create a display; single-piece looks like leftover |
+| 🟡 MARGINAL | 2–3 units | Minimal viable presentation |
+| 🟢 ADEQUATE | 4–8 units | Proper size run visible on rack |
+| 🟢 STRONG | > 8 units | Full presentation with replenishment buffer |
+
+**Aggregation:**
+
+```python
+presentation_score = (
+    pct_adequate_or_strong * 1.0 +
+    pct_marginal * 0.5 +
+    pct_thin * 0.0
+) * 100
+```
+
+---
+
+### 2.5 Confidence Quality
+
+**What it measures:** How trustworthy is the data behind the allocation?
+
+Already computed by the engine per line as `ai_confidence` (HIGH/MEDIUM/LOW), but here we decompose WHY:
+
+| Factor | Weight | Scoring |
+|---|---|---|
+| Demand source tier | 40% | store_historical=1.0, cluster=0.8, grade=0.6, style_dna=0.4, min_pres=0.1 |
+| Data sample size | 30% | ≥20 weeks=1.0, 10-19=0.7, 5-9=0.4, <5=0.1 |
+| Cap factor severity | 15% | ≥0.7=1.0, 0.4-0.7=0.5, <0.4=0.1 |
+| Grade data available | 15% | explicit grade=1.0, defaulted to C=0.3 |
+
+**Aggregation:**
+
+```python
+confidence_score = weighted_avg(per_line_confidence) * 100
+```
+
+---
+
+## 3. Allocation Health Score (0–100)
+
+### Composite Formula
+
+```python
+WEIGHTS = {
+    "coverage":      0.30,   # Most critical — prevents stockouts and overstock
+    "demand_align":  0.25,   # Core accuracy — are we following the signal?
+    "confidence":    0.20,   # Trust factor — can the user believe this?
+    "presentation":  0.15,   # Retail reality — can stores actually sell this?
+    "balance":       0.10,   # Fairness — is the network being served equitably?
+}
+
+health_score = sum(
+    WEIGHTS[metric] * metric_score
+    for metric, metric_score in sub_scores.items()
+)
+```
+
+### Interpretation
+
+| Score | Label | Color | Meaning |
+|---|---|---|---|
+| 80–100 | **SAFE** | 🟢 Green | Approve with confidence |
+| 60–79 | **CAUTION** | 🟡 Amber | Review flagged items before approving |
+| 40–59 | **RISKY** | 🟠 Orange | Significant issues; manual review required |
+| 0–39 | **CRITICAL** | 🔴 Red | Do not approve without intervention |
+
+### Example for Current SS26 Run
+
+Based on the live data audit:
+
+| Metric | Sub-Score | Rationale |
+|---|---|---|
+| Coverage | ~45 | 45.7% utilization, many stores below target cover |
+| Demand Alignment | ~55 | Heavy capping (scale factor 0.20-0.40 common) |
+| Confidence | ~35 | 50% LOW confidence, 0% from Tier 1-3 |
+| Presentation | ~30 | Median 1 unit/line — very thin presentation |
+| Balance | ~75 | Healthy spread (stddev 218, Gini moderate) |
+
+**Composite: 0.30(45) + 0.25(55) + 0.20(35) + 0.15(30) + 0.10(75) = 45.8 → RISKY ⚠️**
+
+> [!TIP]
+> This is the CORRECT score for a cold-start season. It accurately reflects that the system is working but operating with limited data. As sales data accumulates, the score should climb toward 70-80.
+
+---
+
+## 4. Risk Engine
+
+Five risk detectors, each running independently and producing structured alerts.
+
+### 4.1 Stockout Risk
+
+```python
+def detect_stockout_risk(lines, season_weeks_remaining):
+    at_risk = []
+    for style, store_lines in group_by_style(lines):
+        for line in store_lines:
+            if line.final_qty == 0:
+                continue
+            ros = line.ai_reasoning["weekly_ros"]
+            if ros <= 0:
+                continue
+            weeks_cover = line.final_qty / ros
+            if weeks_cover < 2.0:
+                at_risk.append({
+                    "store_id": line.store_id,
+                    "sku_id": line.sku_id,
+                    "weeks_cover": weeks_cover,
+                    "severity": "CRITICAL" if weeks_cover < 1.0 else "WARNING",
+                    "explanation": f"Only {weeks_cover:.1f}w cover vs {season_weeks_remaining}w remaining",
+                    "recommendation": f"Increase by {ceil((2 - weeks_cover) * ros)} units"
+                })
+    return at_risk
+```
+
+### 4.2 Overstock Risk
+
+```python
+def detect_overstock_risk(lines, season_weeks_remaining):
+    flagged = []
+    for line in lines:
+        if line.final_qty == 0:
+            continue
+        ros = line.ai_reasoning["weekly_ros"]
+        if ros <= 0:
+            continue  # can't assess without demand signal
+        weeks_cover = line.final_qty / ros
+        if weeks_cover > season_weeks_remaining * 1.5:
+            flagged.append({
+                "severity": "WARNING",
+                "explanation": f"{weeks_cover:.0f}w cover but only {season_weeks_remaining}w left",
+                "recommendation": f"Reduce by {ceil((weeks_cover - season_weeks_remaining) * ros)} units"
+            })
+    return flagged
+```
+
+### 4.3 Skew Risk
+
+```python
+def detect_skew_risk(lines_by_style):
+    flagged = []
+    for style, store_allocations in lines_by_style.items():
+        qtys = [a.final_qty for a in store_allocations if a.final_qty > 0]
+        if len(qtys) < 3:
+            continue
+        top_store = max(qtys)
+        total = sum(qtys)
+        if top_store / total > 0.40:
+            flagged.append({
+                "style": style,
+                "severity": "WARNING",
+                "explanation": f"Top store has {top_store/total*100:.0f}% of this style's allocation",
+                "recommendation": "Consider redistributing to broader store set"
+            })
+    return flagged
+```
+
+### 4.4 Dead Stock Risk
+
+```python
+def detect_dead_stock(lines, season_weeks_remaining):
+    flagged = []
+    for line in lines:
+        if line.final_qty == 0:
+            continue
+        ros = line.ai_reasoning["weekly_ros"]
+        weeks_cover = line.final_qty / max(ros, 0.01)
+        ros_source = line.ai_reasoning["ros_source"]
+        # Dead stock = massive overcover AND unreliable demand signal
+        if weeks_cover > 20 and ros_source in ("minimum_presentation",):
+            flagged.append({
+                "severity": "CRITICAL",
+                "explanation": f"{weeks_cover:.0f}w cover based on minimum_presentation — no real demand signal",
+                "recommendation": "Hold stock in warehouse; do not push to this store"
+            })
+    return flagged
+```
+
+### 4.5 Low Confidence Allocation
+
+```python
+def detect_low_confidence_volume(lines, total_units):
+    low_conf_units = sum(l.final_qty for l in lines if l.ai_confidence == "LOW")
+    low_pct = low_conf_units / max(total_units, 1)
+    if low_pct > 0.40:
+        return {
+            "severity": "WARNING",
+            "metric": f"{low_pct*100:.0f}% of allocated units have LOW confidence",
+            "explanation": "Insufficient historical data; allocations based on fallback heuristics",
+            "recommendation": "Consider phased rollout — send 60% now, hold 40% for 2-week review"
+        }
+    return None
+```
+
+---
+
+## 5. Output Design
+
+### Session-Level Summary (shown at top of Allocations page)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  SS26-INITIAL-STOCK                                             │
+│  Health Score: 46 ⚠️ RISKY                                      │
+│                                                                  │
+│  Coverage  ███░░░░░░  45    Confidence  ██░░░░░░░░  35          │
+│  Demand    █████░░░░  55    Presentation ██░░░░░░░░  30         │
+│  Balance   ███████░░  75                                         │
+│                                                                  │
+│  🔴 3 Critical  🟡 12 Warnings                                  │
+│                                                                  │
+│  Top Issues:                                                     │
+│  • 36% of units have LOW confidence (cold-start)                │
+│  • 87% of store-SKU lines have ≤1 unit (thin presentation)     │
+│  • 184 stores constrained below target cover                    │
+│                                                                  │
+│  💡 Recommendation: This is a cold-start season. Consider       │
+│  approving with a 2-week re-evaluation trigger.                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Style-Level Health Card (shown in detail panel)
+
+```
+┌─────────────────────────────────────────────────────┐
+│  CWA5KU61424A · Muslin Kurta · Modal Chanderi       │
+│  Style Health: 72 🟡 CAUTION                        │
+│                                                      │
+│  Allocated: 1,200 units → 184 stores                │
+│  Demand Source: style_dna_analogue (CWS5KU61413B)   │
+│  Confidence: HIGH (21w history)                     │
+│                                                      │
+│  Issues:                                             │
+│  • 23 stores at stockout risk (<2w cover)           │
+│  • Top 5 stores hold 18% of allocation              │
+│                                                      │
+│  Recommendations:                                    │
+│  ✦ Increase allocation to 23 stockout-risk stores   │
+│  ✦ Shift 80 units from top-5 to mid-tier stores     │
+│                                                      │
+│  Size Curve: Store Historical ✅                     │
+│  Cannibalization: 3 competing colourways (0.65x)    │
+└─────────────────────────────────────────────────────┘
+```
+
+### Risk Alert Object (API payload)
+
+```json
+{
+  "session_id": "uuid",
+  "health_score": 46,
+  "health_label": "RISKY",
+  "sub_scores": {
+    "coverage": 45,
+    "demand_alignment": 55,
+    "confidence": 35,
+    "presentation": 30,
+    "balance": 75
+  },
+  "risks": [
+    {
+      "type": "LOW_CONFIDENCE_VOLUME",
+      "severity": "WARNING",
+      "affected_units": 35320,
+      "affected_pct": 36.6,
+      "explanation": "36% of allocated units based on fallback heuristics",
+      "recommendation": "Consider phased rollout — approve 60%, hold 40%"
+    },
+    {
+      "type": "THIN_PRESENTATION",
+      "severity": "WARNING",
+      "affected_stores": 184,
+      "explanation": "87% of store-SKU lines have 1 unit or less",
+      "recommendation": "Expected for 3500+ style catalog across 184 stores"
+    }
+  ],
+  "top_recommendations": [
+    "Approve with 2-week re-evaluation trigger",
+    "Monitor sell-through of style_dna matched styles",
+    "Re-run allocation after 2 weeks of SS26 sales data"
+  ]
+}
+```
+
+---
+
+## 6. Integration with Existing Engine
+
+### Execution Flow
+
+```python
+# In app/tasks/allocation.py — after engine.generate() completes:
+
+async def _run_allocation(session_id, grn_id, brand_id):
+    # Phase 1: Generate allocation (existing)
+    engine = AllocationEngine()
+    await engine.generate(session_id, grn_id, brand_id, db)
+
+    # Phase 2: Run intelligence layer (NEW)
+    health = AllocationHealthAnalyzer(session_id, brand_id, db)
+    report = await health.analyze()
+
+    # Phase 3: Persist results
+    session.health_score = report.score
+    session.health_label = report.label
+    session.health_report = report.to_json()
+    await db.commit()
+```
+
+### Feedback Loop (Future Learning)
+
+```
+┌──────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│  Allocation  │────▶│  Health Layer     │────▶│  Decision Log    │
+│  Engine      │     │  scores + risks   │     │  (persisted)     │
+│              │     │                   │     │                  │
+│              │     │                   │     │  score: 46       │
+│              │     │                   │     │  risks: [...]    │
+│              │     │                   │     │  user_action:    │
+│              │     │                   │     │    approved_at   │
+│              │     │                   │     │    overrides: 12 │
+└──────────────┘     └──────────────────┘     └──────────────────┘
+                                                      │
+                                                      ▼
+                                               ┌──────────────┐
+                                               │  Outcomes     │
+                                               │  Tracker      │
+                                               │  (Celery Beat)│
+                                               │               │
+                                               │  actual_sold  │
+                                               │  vs predicted │
+                                               └──────────────┘
+```
+
+### Interaction with Reasoning Layer
+
+The health layer **reads** the existing `ai_reasoning` JSON on each allocation line. It does NOT modify it. It produces a separate `health_report` JSON stored at the session level. This means:
+
+- Zero changes to the allocation engine code
+- Health layer is purely additive
+- Can be disabled without affecting core allocation
+
+---
+
+## 7. ML-Ready Data Logging
+
+### What to Log (Decision Context Table)
+
+```sql
+CREATE TABLE allocation_decision_logs (
+    id              UUID PRIMARY KEY,
+    session_id      UUID NOT NULL,
+    style_code      TEXT NOT NULL,
+    brand_id        UUID NOT NULL,
+
+    -- Input features (snapshot at decision time)
+    total_available  INT,
+    stores_eligible  INT,
+    demand_source    TEXT,         -- 'style_dna_analogue', etc.
+    avg_store_ros    FLOAT,
+    confidence_tier  TEXT,
+    season_week      INT,         -- which week of the season
+
+    -- Health layer output
+    health_score     INT,
+    coverage_score   INT,
+    alignment_score  INT,
+    risks_detected   JSONB,
+
+    -- User action (filled later)
+    user_approved    BOOLEAN,
+    user_overrides   INT DEFAULT 0,
+    override_delta   INT DEFAULT 0,  -- net units added/removed by user
+
+    -- Outcome (filled by Celery Beat after 4 weeks)
+    actual_sold_4w   INT,
+    actual_stockouts INT,
+    actual_markdowns INT,
+
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### How It Gets Smarter
+
+1. **Week 1-4:** Log every allocation decision with health scores
+2. **Week 5-8:** Celery Beat fills in `actual_sold_4w`, `actual_stockouts`
+3. **Week 9+:** Enough data to compute: "When health score was X and user approved, what actually happened?"
+4. **Future:** Train a simple regression: `predicted_sellthrough = f(health_score, demand_source, grade, ros)` → use this to auto-suggest the confidence thresholds instead of hardcoding them
+
+---
+
+## 8. Implementation Plan
+
+### Phase 1 — Core Validation (3-4 days)
+
+| Item | Details |
+|---|---|
+| `AllocationHealthAnalyzer` class | New file: `app/services/allocation/health.py` |
+| Coverage metric | Compute weeks_of_cover per store×style from allocation_lines + ai_reasoning |
+| Demand alignment metric | Compare final_qty vs raw_demand from ai_projections |
+| Session-level storage | Add `health_score`, `health_label`, `health_report` columns to `allocation_sessions` |
+| API endpoint | `GET /api/v1/allocations/{session_id}/health` |
+
+### Phase 2 — Risk Detection (2-3 days)
+
+| Item | Details |
+|---|---|
+| Stockout detector | Flag lines with < 2w cover |
+| Overstock detector | Flag lines with > 1.5x season weeks cover |
+| Skew detector | Per-style Gini coefficient + top-store concentration |
+| Dead stock detector | Cross-reference overstock + low confidence |
+| Risk aggregation | Roll up to session-level alert list |
+
+### Phase 3 — Scoring System (2 days)
+
+| Item | Details |
+|---|---|
+| Presentation depth metric | Per-store style unit counts |
+| Confidence quality decomposition | Weighted score from demand tier + sample size + cap factor |
+| Composite Health Score | Weighted average of 5 sub-scores |
+| Style-level health cards | Per-style breakdown with sub-scores |
+
+### Phase 4 — UX Layer (3 days)
+
+| Item | Details |
+|---|---|
+| Session health banner | Score bar + sub-score breakdown at top of Allocations page |
+| Risk alert bar | Severity-sorted list with expand/collapse |
+| Style health detail panel | Replaces current basic reasoning panel |
+| Store health page | Per-store health score + cross-style risk summary |
+| Recommendation engine | Rule-based suggestions derived from detected risks |
+
+---
+
+## 9. Design Principles
+
+| Principle | Rationale |
+|---|---|
+| **No dashboards** | Every output is a decision aid, not a chart to interpret |
+| **Interpretable** | Every score can be traced to a specific line-level metric |
+| **Additive** | Zero changes to existing engine — purely reads allocation output |
+| **Cold-start aware** | Correctly classifies low scores as "expected for new season" vs "something is wrong" |
+| **Retail-native language** | "stockout risk", "weeks of cover", "thin presentation" — not technical jargon |
+| **30-second rule** | A VP sees the health score, the top 3 issues, and the recommendation — decides in 30 seconds |

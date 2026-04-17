@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 
 import { StatusBadge } from "@/components/shared/StatusBadge";
 import { AllocationLine } from "@/types";
@@ -13,6 +13,7 @@ interface Props {
   simulations: Record<string, SimulationResult>;
   onSelect: (line: AllocationLine) => void;
   onChangeQty: (line: AllocationLine, qty: number) => void;
+  onCommitQty?: (line: AllocationLine, qty: number) => void;
   onOverrideReason: (line: AllocationLine, reason: string) => void;
 }
 
@@ -31,8 +32,14 @@ export function AllocationTable({
   simulations,
   onSelect,
   onChangeQty,
+  onCommitQty,
   onOverrideReason,
 }: Props) {
+  const [page, setPage] = useState(0);
+  const pageSize = 100;
+  const totalPages = Math.ceil(lines.length / pageSize);
+  const visibleLines = lines.slice(page * pageSize, (page + 1) * pageSize);
+
   const handleChange = useCallback(
     (line: AllocationLine, value: string) => {
       const num = Number(value);
@@ -42,19 +49,20 @@ export function AllocationTable({
   );
 
   return (
-    <div className="overflow-auto rounded-xl border border-slate-300 bg-white/95 shadow-sm">
+    <div className="overflow-auto rounded-xl border border-slate-300 bg-white/95 shadow-sm flex flex-col h-[700px]">
+      <div className="flex-1 overflow-auto">
       <table className="min-w-full text-sm">
-        <thead className="sticky top-0 bg-slate-100 text-left text-xs uppercase tracking-wide text-slate-600">
+        <thead className="sticky top-0 bg-slate-100 text-left text-xs uppercase tracking-wide text-slate-600 shadow-sm z-10">
           <tr>
             <th className="px-3 py-2">Store</th>
             <th className="px-3 py-2">SKU</th>
             <th className="px-3 py-2">Rec</th>
-            <th className="px-3 py-2">Final</th>
+            <th className="px-3 py-2 w-32">Final</th>
             <th className="px-3 py-2">Confidence</th>
           </tr>
         </thead>
         <tbody>
-          {lines.map((line) => {
+          {visibleLines.map((line) => {
             const current = quantities[line.id] ?? line.final_qty ?? line.ai_recommended_qty;
             const overridden = current !== line.ai_recommended_qty;
             const simulation = simulations[line.id];
@@ -108,6 +116,10 @@ export function AllocationTable({
                     value={current}
                     onClick={(event) => event.stopPropagation()}
                     onChange={(event) => handleChange(line, event.target.value)}
+                    onBlur={(event) => {
+                      const num = Number(event.target.value);
+                      if (!Number.isNaN(num)) onCommitQty?.(line, num);
+                    }}
                   />
                   {simulation ? (
                     <div className="mt-1 text-xs text-slate-600">
@@ -139,6 +151,31 @@ export function AllocationTable({
           })}
         </tbody>
       </table>
+      </div>
+      
+      {totalPages > 1 && (
+        <div className="flex items-center justify-between border-t border-slate-200 bg-slate-50 px-4 py-3 shrink-0">
+          <p className="text-xs text-slate-600">
+            Showing {page * pageSize + 1} to {Math.min((page + 1) * pageSize, lines.length)} of {lines.length} items
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage((p: number) => Math.max(0, p - 1))}
+              disabled={page === 0}
+              className="rounded-md border border-slate-300 bg-white px-3 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Previous
+            </button>
+            <button
+              onClick={() => setPage((p: number) => Math.min(totalPages - 1, p + 1))}
+              disabled={page === totalPages - 1}
+              className="rounded-md border border-slate-300 bg-white px-3 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

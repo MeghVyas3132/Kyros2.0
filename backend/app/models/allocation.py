@@ -34,6 +34,11 @@ class AllocationSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     total_skus: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_units_recommended: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_units_approved: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    
+    health_score: Mapped[int | None] = mapped_column(Integer)
+    health_report: Mapped[dict | None] = mapped_column(JSON)
+    decision: Mapped[dict | None] = mapped_column(JSON)
+    
     failure_reason: Mapped[str | None] = mapped_column(Text)
     approved_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"))
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

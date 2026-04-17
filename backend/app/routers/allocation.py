@@ -422,7 +422,11 @@ async def update_line(
     line.final_qty = payload.final_qty
     line.override_reason = payload.override_reason
     line.override_notes = payload.override_notes
-    line.was_overridden = payload.final_qty != line.ai_recommended_qty
+    # Compare against the engine's post-cap final_qty, not raw ai_recommended_qty.
+    # ai_recommended_qty is the raw demand before capping; final_qty is what the
+    # engine actually set after inventory cap / constraints.
+    original_engine_qty = line.final_qty if line.final_qty is not None else line.ai_recommended_qty
+    line.was_overridden = int(payload.final_qty) != int(original_engine_qty)
 
     await db.commit()
     await db.refresh(line)
@@ -485,6 +489,55 @@ async def approve_session(
     return envelope(session)
 
 
+from fastapi.responses import StreamingResponse
+import csv
+import io
+
+async def _csv_row_generator(session_id: UUID, brand_id: UUID, db: AsyncSession, include_zero: bool):
+    yield "GRN Code,SKU Code,Style Name,Size,Store Code,Store Name,City,Quantity\n"
+    
+    offset = 0
+    batch_size = 5000
+    grn_code = ""
+    session = await db.get(AllocationSession, session_id)
+    if session and session.grn_id:
+        grn = await db.get(GRN, session.grn_id)
+        if grn:
+            grn_code = grn.grn_code or ""
+
+    while True:
+        lines = await _load_session_lines(session_id, brand_id, db, line_limit=batch_size, line_offset=offset)
+        if not lines:
+            break
+            
+        for line in lines:
+            qty = (
+                line.get("final_qty")
+                if line.get("final_qty") is not None
+                else line.get("ai_recommended_qty", 0)
+            )
+            if not include_zero and int(qty or 0) <= 0:
+                continue
+                
+            # Using basic CSV formatting, escape strings with commas
+            row = [
+                grn_code,
+                line.get("sku_code", ""),
+                str(line.get("style_name", "")),
+                line.get("sku_size", ""),
+                line.get("store_code", ""),
+                str(line.get("store_name", "")),
+                str(line.get("store_city", "")),
+                str(qty)
+            ]
+            
+            output = io.StringIO()
+            writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+            writer.writerow(row)
+            yield output.getvalue()
+            
+        offset += batch_size
+
 @router.get("/sessions/{session_id}/export")
 async def export_session(
     session_id: UUID,
@@ -496,36 +549,8 @@ async def export_session(
     if session is None or session.brand_id != current_user.brand_id:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Session not found"})
 
-    lines = await _load_session_lines(session_id, current_user.brand_id, db)
-
-    records = []
-    grn = await db.get(GRN, session.grn_id)
-    for line in lines:
-        qty = (
-            line.get("final_qty")
-            if line.get("final_qty") is not None
-            else line.get("ai_recommended_qty", 0)
-        )
-        if not include_zero and int(qty or 0) <= 0:
-            continue
-
-        records.append(
-            {
-                "GRN Code": grn.grn_code if grn else "",
-                "SKU Code": line.get("sku_code", ""),
-                "Style Name": line.get("style_name", ""),
-                "Size": line.get("sku_size", ""),
-                "Store Code": line.get("store_code", ""),
-                "Store Name": line.get("store_name", ""),
-                "City": line.get("store_city", ""),
-                "Quantity": qty,
-            }
-        )
-
-    df = pd.DataFrame(records)
-    csv_data = df.to_csv(index=False)
-    return Response(
-        content=csv_data,
+    return StreamingResponse(
+        _csv_row_generator(session_id, current_user.brand_id, db, include_zero),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=allocation-{session_id}.csv"},
     )
@@ -587,7 +612,24 @@ async def get_allocation_insights(
             return "moderate"
         return "low"
     
+    demand_breakdown = {
+        "store_historical": sum(1 for l in lines if isinstance(l.ai_reasoning, dict) and l.ai_reasoning.get("ros_source") == "store_historical"),
+        "cluster_average": sum(1 for l in lines if isinstance(l.ai_reasoning, dict) and l.ai_reasoning.get("ros_source") == "cluster_average"),
+        "grade_average": sum(1 for l in lines if isinstance(l.ai_reasoning, dict) and l.ai_reasoning.get("ros_source") == "grade_average"),
+        "style_dna": sum(1 for l in lines if isinstance(l.ai_reasoning, dict) and l.ai_reasoning.get("ros_source") == "style_dna"),
+        "minimum_presentation": sum(1 for l in lines if isinstance(l.ai_reasoning, dict) and l.ai_reasoning.get("ros_source") == "minimum_presentation"),
+    }
+    total_allocated = sum(l.final_qty for l in lines if l.final_qty)
+    utilization_pct = round(total_allocated / max(session.total_units_recommended, 1) * 100, 1)
+
     return envelope({
+        "session_health": {
+            "utilization_pct": utilization_pct,
+            "stores_receiving_allocation": len(set(l.store_id for l in lines if l.final_qty and l.final_qty > 0)),
+            "stores_at_minimum": sum(1 for l in lines if isinstance(l.ai_reasoning, dict) and l.ai_reasoning.get("risk_flags", {}).get("heavy_cap_applied")),
+            "stores_defaulted_to_grade_c": sum(1 for l in lines if isinstance(l.ai_reasoning, dict) and l.ai_reasoning.get("risk_flags", {}).get("grade_defaulted")),
+            "demand_source_breakdown": demand_breakdown,
+        },
         "lost_sales_correction": {
             "stores_corrected": len(set(l.store_id for l in corrected_lines)),
             "estimated_recovered_units": round(sum(
@@ -610,7 +652,7 @@ async def get_allocation_insights(
             "low": sum(1 for l in lines if confidence_tier(l) == "low"),
         },
         "total_lines": len(lines),
-        "total_units_allocated": sum(l.final_qty for l in lines if l.final_qty),
+        "total_units_allocated": total_allocated,
     })
 
 

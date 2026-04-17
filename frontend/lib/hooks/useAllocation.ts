@@ -20,7 +20,7 @@ interface UseAllocationSessionOptions {
 }
 
 export function useAllocationSession(sessionId: string | null, options?: UseAllocationSessionOptions) {
-  const lineLimit = options?.lineLimit ?? 2000;
+  const lineLimit = options?.lineLimit ?? 500;
   const lineOffset = options?.lineOffset ?? 0;
   const key = sessionId
     ? `/api/v1/allocation/sessions/${sessionId}?line_limit=${lineLimit}&line_offset=${lineOffset}`

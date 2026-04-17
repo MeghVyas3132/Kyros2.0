@@ -53,10 +53,7 @@ from app.services.ingestion.bulk import execute_with_batching
 from app.services.ingestion.lookup import build_lookup_maps, normalize_key
 from app.services.ingestion.normalizer import normalize
 from app.services.ingestion.validator import RowError, UploadValidator
-from app.services.settings import get_brand_config
-from app.services.inventory.snapshot import build_snapshot_for_brand, seed_warehouse_inventory
-from app.services.performance.calculator import build_performance_snapshots
-from app.services.alerts.generator import generate_alerts
+from app.services.inventory.snapshot import seed_warehouse_inventory
 from app.utils.csv_parser import dataframe_from_bytes
 from app.utils.date_utils import utcnow
 from app.utils.s3 import read_upload_file
@@ -216,64 +213,6 @@ def _sales_size(row: pd.Series) -> str | None:
     return _clean_str(row.get("size")) or _clean_str(row.get("SIZE_FINAL"))
 
 
-def _derive_season_name(upload: Upload, df: pd.DataFrame) -> str:
-    if "buy_plan_name" in df.columns and not df.empty:
-        raw_name = df["buy_plan_name"].iloc[0]
-        if raw_name is not None and not pd.isna(raw_name):
-            candidate = str(raw_name).strip()
-            if candidate:
-                return candidate[:100]
-    stem = Path(upload.filename).stem
-    if "__" in stem:
-        stem = stem.split("__")[0]
-    stem = stem.strip()
-    return stem[:100] if stem else "Season 1"
-
-
-async def _ensure_simple_mode_season(
-    db: AsyncSession, brand_id: UUID, upload: Upload, df: pd.DataFrame
-) -> Season | None:
-    config = await get_brand_config(db, brand_id)
-    if not config.get("simple_mode", True):
-        return None
-
-    active = await db.scalar(
-        select(Season)
-        .where(Season.brand_id == brand_id, Season.status == SeasonStatus.ACTIVE)
-        .order_by(Season.start_date.desc())
-    )
-    if active is not None:
-        return active
-
-    latest = await db.scalar(
-        select(Season).where(Season.brand_id == brand_id).order_by(Season.start_date.desc())
-    )
-    if latest is not None:
-        latest.status = SeasonStatus.ACTIVE
-        await db.flush()
-        return latest
-
-    today = date.today()
-    season = Season(
-        brand_id=brand_id,
-        name=_derive_season_name(upload, df) or "Season 1",
-        start_date=today - timedelta(days=30),
-        end_date=today + timedelta(days=180),
-        categories=[],
-        status=SeasonStatus.ACTIVE,
-    )
-    db.add(season)
-    await db.flush()
-    return season
-
-
-async def _run_simple_mode_jobs(db: AsyncSession, brand_id: UUID) -> None:
-    today = date.today()
-    await build_snapshot_for_brand(brand_id, today, db)
-    await build_performance_snapshots(brand_id, today, db)
-    await generate_alerts(brand_id, today, db)
-
-
 async def _resolve_maps(
     db: AsyncSession, brand_id: UUID, df: pd.DataFrame
 ) -> tuple[dict[str, UUID], dict[str, UUID]]:
@@ -418,13 +357,10 @@ async def _upsert_sales(
 ) -> tuple[int, dict[str, int]]:
     _require_columns(df, ["store_code", "sku_code", "units_sold"], "SS25 SALES HISTORY")
 
-    # Sales uploads are treated as full refreshes for a brand.
-    # Delete prior rows first so removed SKUs/stores/weeks don't persist silently.
-    await db.execute(
-        delete(SalesData).where(
-            SalesData.brand_id == brand_id,
-        )
-    )
+    # Fix 1.4: Removed the destructive `DELETE FROM sales_data WHERE brand_id = ...`
+    # that wiped all historical data before re-upload. The upsert (on_conflict_do_update)
+    # below at _statement_factory already handles updates correctly via the
+    # uq_sales_brand_store_sku_week unique constraint.
 
     store_map, store_name_map, sku_map = await build_lookup_maps(db, brand_id)
     aggregated_rows: dict[tuple[UUID, UUID, date], dict] = {}
@@ -1545,7 +1481,6 @@ async def process_upload(db: AsyncSession, upload: Upload, task_id: str | None =
         upload.status = UploadStatus.FAILED
 
     if upload.status in {UploadStatus.COMPLETED, UploadStatus.PARTIAL} and successes > 0:
-        await _ensure_simple_mode_season(db, upload.brand_id, upload, valid_df)
         if upload.upload_type.value == "SALES":
             try:
                 season = await _resolve_ingestion_season(db, upload.brand_id)

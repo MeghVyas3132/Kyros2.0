@@ -1,0 +1,613 @@
+# Allocation Intelligence Layer v2 — Depth-First System Design
+
+> **Core insight from live data:** 71% of store-style allocations = exactly 2 units. 8% = 1 unit. A store cannot sell what it cannot display. This system fixes that.
+
+---
+
+## The Thin Allocation Problem (Root Cause)
+
+```
+Style BC-EWS6KS11238A has 309 units across 8 sizes.
+Engine spreads to 184 eligible stores.
+309 ÷ 184 = 1.68 units per store.
+After size splitting: most stores get 0-1 per size.
+
+Result: Every store has scraps. No store has a sellable assortment.
+```
+
+**Current system optimizes for fairness. Retail requires effectiveness.**
+
+---
+
+## Updated Architecture
+
+```
+┌──────────────────┐     ┌───────────────────┐     ┌──────────────────┐
+│  Allocation      │────▶│  PRIORITIZATION   │────▶│  Allocation      │
+│  Engine          │     │  LAYER (NEW)       │     │  Engine          │
+│  (score stores)  │     │                   │     │  (distribute)    │
+│                  │     │  • tier stores    │     │                  │
+│  eligible_stores │     │  • compute MVA    │     │  final_allocs    │
+│  store_scores    │     │  • filter by      │     │                  │
+│                  │     │    depth strategy  │     │                  │
+└──────────────────┘     └───────────────────┘     └──────────────────┘
+                                                           │
+                                                           ▼
+                                                   ┌──────────────────┐
+                                                   │  HEALTH LAYER    │
+                                                   │  (post-alloc)    │
+                                                   │                  │
+                                                   │  • score         │
+                                                   │  • risks         │
+                                                   │  • decision      │
+                                                   │  • recommendations│
+                                                   └──────────────────┘
+```
+
+> [!IMPORTANT]
+> The Prioritization Layer sits **inside** the allocation engine's per-style loop, BETWEEN [filter_eligible](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#1000-1035) and [distribute_units](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#1081-1104). It narrows the eligible store list so that [distribute_units](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#1081-1104) works with fewer stores → deeper allocations. Zero new tables. Zero new API calls.
+
+---
+
+## 1. Store Prioritization Layer
+
+### Tiering Logic
+
+For each style, after the engine scores and filters eligible stores, the prioritization layer assigns tiers:
+
+```python
+def prioritize_stores(
+    eligible_scores: dict[UUID, ScoreData],
+    available_units: int,
+    min_depth: int,        # MVA threshold (default: 4)
+    strategy: str,         # "depth_first" | "balanced" | "spread_first"
+) -> dict[UUID, ScoreData]:
+    """
+    Narrow the eligible store list to ensure minimum depth.
+    """
+    ranked = sorted(
+        eligible_scores.items(),
+        key=lambda item: item[1].score,
+        reverse=True,
+    )
+
+    # How many stores can we serve at minimum depth?
+    max_stores = available_units // min_depth
+
+    if strategy == "depth_first":
+        # Aggressive: serve fewer stores with strong depth
+        target_stores = min(max_stores, int(len(ranked) * 0.35))
+    elif strategy == "balanced":
+        # Default: serve as many as possible at min depth
+        target_stores = min(max_stores, int(len(ranked) * 0.65))
+    else:  # spread_first
+        target_stores = min(max_stores, len(ranked))
+
+    target_stores = max(target_stores, 3)  # always serve at least 3
+    selected = dict(ranked[:target_stores])
+    return selected
+```
+
+### What This Changes (Example)
+
+Style with 309 units, 184 eligible stores:
+
+| Strategy | Stores Served | Avg Depth/Store | Avg Depth/Size |
+|---|---|---|---|
+| **Current** | 184 | 1.7 | 0.2 |
+| **depth_first** | 64 | 4.8 | 0.7 |
+| **balanced** | 77 | 4.0 | 0.6 |
+| **spread_first** | 77 | 4.0 | 0.6 |
+
+### Store Tier Labels (for UI/Reasoning)
+
+| Tier | Stores | Rule | Allocation |
+|---|---|---|---|
+| **Tier 1: Priority** | Top 20% by score | A+/A grade + high ROS | Full depth allocation |
+| **Tier 2: Standard** | Next 30% | B grade or moderate ROS | Standard allocation |
+| **Tier 3: Reach** | Next 15% (balanced only) | C grade or low ROS | Minimum viable |
+| **Not Served** | Remainder | Below cutoff | 0 — inventory insufficient |
+
+---
+
+## 2. Minimum Viable Allocation (MVA)
+
+### The Rule
+
+> If a store would receive **fewer than MVA units** for a style, it receives **zero**.
+
+Those units are redistributed upward to stores that can use them.
+
+### MVA Thresholds
+
+```python
+MVA_BY_CATEGORY = {
+    "kurta_set": 4,    # needs S/M/L visible
+    "tunic": 3,        # fewer sizes needed
+    "dress": 4,        # full size run
+    "default": 3,      # fallback
+}
+
+MVA_BY_GRADE = {
+    "A+": 6,   # premium stores need full presentation
+    "A":  4,
+    "B":  3,
+    "C":  2,   # basic coverage
+}
+
+# Effective MVA = max(category_mva, grade_mva)
+```
+
+### Post-Distribution MVA Enforcement
+
+```python
+def enforce_mva(
+    allocations: dict[UUID, int],
+    store_grades: dict[UUID, str],
+    category: str,
+    eligible_scores: dict[UUID, ScoreData],
+) -> dict[UUID, int]:
+    """
+    After distribute_units, remove sub-MVA stores and redistribute.
+    """
+    cat_mva = MVA_BY_CATEGORY.get(category, 3)
+
+    survivors = {}
+    freed_units = 0
+
+    for store_id, qty in allocations.items():
+        grade = store_grades.get(store_id, "C")
+        grade_mva = MVA_BY_GRADE.get(grade, 2)
+        effective_mva = max(cat_mva, grade_mva)
+
+        if qty >= effective_mva:
+            survivors[store_id] = qty
+        else:
+            freed_units += qty  # return to pool
+
+    # Redistribute freed units to top survivors proportionally
+    if freed_units > 0 and survivors:
+        total_score = sum(
+            eligible_scores[sid].score
+            for sid in survivors
+        )
+        for sid in sorted(survivors, key=lambda s: eligible_scores[s].score, reverse=True):
+            share = round(freed_units * eligible_scores[sid].score / total_score)
+            survivors[sid] += share
+            freed_units -= share
+            if freed_units <= 0:
+                break
+
+    return survivors
+```
+
+### Impact Projection
+
+| Metric | Before MVA | After MVA (threshold=3) |
+|---|---|---|
+| Stores receiving stock | 184 | ~80-100 |
+| Avg depth per store-style | 1.7 | 4.0+ |
+| Units wasted on sub-threshold | ~15K | 0 |
+| Stores with sellable presentation | ~30% | ~90% |
+
+---
+
+## 3. Depth vs Spread Strategy Control
+
+### Brand-Level Configuration
+
+Stored in `brand_settings.config` JSON:
+
+```json
+{
+  "allocation_strategy": {
+    "mode": "balanced",
+    "min_depth_override": null,
+    "prioritize_new_styles": true,
+    "max_stores_pct": 0.65
+  }
+}
+```
+
+### Strategy Behaviors
+
+| Strategy | When to Use | Store Coverage | Depth |
+|---|---|---|---|
+| **depth_first** | New launch, limited stock, experimental styles | 25-40% of stores | Maximum depth |
+| **balanced** | Standard replenishment, proven styles | 50-65% of stores | Good depth |
+| **spread_first** | Basics, high-volume commodity styles | 80-100% of stores | Minimum depth |
+
+### Auto-Detection (Smart Default)
+
+```python
+def auto_detect_strategy(
+    available_units: int,
+    eligible_store_count: int,
+    risk_level: str,
+    min_depth: int,
+) -> str:
+    depth_ratio = available_units / (eligible_store_count * min_depth)
+
+    if risk_level == "EXPERIMENTAL" or depth_ratio < 0.5:
+        return "depth_first"
+    elif depth_ratio >= 1.5:
+        return "spread_first"
+    else:
+        return "balanced"
+```
+
+---
+
+## 4. Decision Layer
+
+### Decision Verdict
+
+The system produces a single, actionable verdict for each allocation session:
+
+```python
+def compute_decision(health_score: int, risks: list, context: dict) -> dict:
+
+    if health_score >= 75:
+        verdict = "APPROVE"
+        action = "Safe to release. All metrics within acceptable range."
+    elif health_score >= 55:
+        verdict = "APPROVE_WITH_CAUTION"
+        action = build_caution_action(risks, context)
+    elif health_score >= 35:
+        verdict = "REVIEW_REQUIRED"
+        action = build_review_action(risks, context)
+    else:
+        verdict = "REJECT"
+        action = "Do not release. Critical issues detected."
+
+    return {
+        "verdict": verdict,
+        "health_score": health_score,
+        "why": extract_top_reasons(risks, limit=3),
+        "action": action,
+        "hold_recommendation": compute_hold_pct(health_score, context),
+    }
+```
+
+### Decision Output (Example for SS26)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  DECISION: ⚠️ APPROVE WITH CAUTION                             │
+│                                                                  │
+│  Health Score: 58 / 100                                         │
+│                                                                  │
+│  WHY:                                                            │
+│  1. Cold-start season — 80% of demand from style DNA (Tier 4)  │
+│  2. Thin allocation in 45% of store-style combinations          │
+│  3. No historical stockout or skew risk detected                │
+│                                                                  │
+│  ACTION:                                                         │
+│  ✦ Release 100% of Tier 1 store allocations (top 40 stores)    │
+│  ✦ Release 70% of Tier 2 allocations (next 60 stores)          │
+│  ✦ Hold remaining 30% centrally for Week 2 re-evaluation       │
+│  ✦ Set auto-trigger: re-run allocation when SS26 sales data    │
+│    reaches 500+ transactions                                    │
+│                                                                  │
+│  PROJECTION:                                                     │
+│  Week 2: Score → ~62 (sales data activates Tier 2-3 demand)    │
+│  Week 4: Score → ~72 (store-historical ROS available)           │
+│  Week 6: Score → ~80 (full confidence)                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. Health Score v2 — With Hard Penalties
+
+### Base Score (unchanged)
+
+```python
+WEIGHTS = {
+    "coverage":      0.30,
+    "demand_align":  0.25,
+    "confidence":    0.20,
+    "presentation":  0.15,
+    "balance":       0.10,
+}
+base_score = sum(WEIGHTS[m] * scores[m] for m in WEIGHTS)
+```
+
+### Hard Penalty Rules
+
+```python
+def apply_hard_penalties(base_score: int, metrics: dict) -> int:
+    score = base_score
+    penalties = []
+
+    # P1: Stockout risk in top-tier stores
+    if metrics["pct_tier1_stockout_risk"] > 0.15:
+        penalty = min(20, int(metrics["pct_tier1_stockout_risk"] * 50))
+        score -= penalty
+        penalties.append(f"-{penalty} pts: {metrics['pct_tier1_stockout_risk']*100:.0f}% of priority stores at stockout risk")
+
+    # P2: Thin allocation (< MVA)
+    if metrics["pct_below_mva"] > 0.40:
+        penalty = min(15, int((metrics["pct_below_mva"] - 0.40) * 50))
+        score -= penalty
+        penalties.append(f"-{penalty} pts: {metrics['pct_below_mva']*100:.0f}% of allocations below minimum viable depth")
+
+    # P3: Zero allocation to A+ stores
+    if metrics["a_plus_stores_with_zero"] > 0:
+        penalty = min(10, metrics["a_plus_stores_with_zero"] * 2)
+        score -= penalty
+        penalties.append(f"-{penalty} pts: {metrics['a_plus_stores_with_zero']} A+ stores received zero allocation")
+
+    # P4: Extreme concentration
+    if metrics["top3_store_pct"] > 0.50:
+        penalty = 10
+        score -= penalty
+        penalties.append(f"-{penalty} pts: Top 3 stores hold >50% of all units")
+
+    return max(0, score), penalties
+```
+
+### Penalty Impact (Current SS26)
+
+| Penalty | Triggered? | Impact |
+|---|---|---|
+| Tier-1 stockout | ❌ No | 0 |
+| Thin allocation | ✅ Yes (71% below MVA) | -15 pts |
+| A+ zeroed | ❌ No | 0 |
+| Extreme concentration | ❌ No | 0 |
+
+**Base 46 → Final 31 (CRITICAL)** — This correctly reflects that thin allocation makes the current output un-sellable at store level.
+
+> [!WARNING]
+> With the Prioritization Layer + MVA enforcement active, thin allocation drops from 71% → ~10%, removing this penalty entirely. Score jumps to ~58 (CAUTION), which is the correct cold-start baseline.
+
+---
+
+## 6. Context-Aware Scoring
+
+### Season Maturity Modifier
+
+```python
+def season_context_modifier(
+    season_week: int,      # which week of the season are we in
+    total_season_weeks: int,
+    data_tier_distribution: dict,  # {"store_historical": 0.0, "style_dna": 0.80, ...}
+) -> dict:
+    """
+    Adjust scoring severity based on how much data the system has.
+    """
+    maturity = season_week / total_season_weeks  # 0.0 = brand new, 1.0 = end
+
+    # Early season: reduce confidence penalty (expected to be low)
+    confidence_weight_adj = 0.10 if maturity < 0.2 else 0.20
+
+    # Late season: increase overstock penalty (can't sell excess)
+    overstock_severity_mult = 1.0 + max(0, maturity - 0.5) * 2.0
+
+    # Early season: flag cold-start as informational, not critical
+    cold_start_flag = "INFORMATIONAL" if maturity < 0.3 else "WARNING"
+
+    return {
+        "confidence_weight": confidence_weight_adj,
+        "overstock_multiplier": overstock_severity_mult,
+        "cold_start_severity": cold_start_flag,
+        "maturity_label": (
+            "EARLY" if maturity < 0.25 else
+            "MID" if maturity < 0.60 else
+            "LATE"
+        ),
+    }
+```
+
+### Effect on SS26 (Week 1 of ~16 weeks)
+
+| Metric | Standard Weight | Early-Season Weight |
+|---|---|---|
+| Confidence | 0.20 | **0.10** (reduced) |
+| Coverage | 0.30 | 0.30 (unchanged) |
+| Presentation | 0.15 | **0.20** (increased — depth matters more early) |
+
+**Recalculated score with context: ~62 (CAUTION)** — correctly classifies as "proceed carefully" rather than "critical failure"
+
+---
+
+## 7. Prioritized Recommendations
+
+### Recommendation Engine
+
+```python
+def generate_recommendations(risks: list, metrics: dict, context: dict) -> list:
+    recs = []
+
+    for risk in risks:
+        impact = estimate_impact(risk, metrics)
+        recs.append({
+            "priority": impact["rank"],
+            "action": impact["action"],
+            "impact": impact["description"],
+            "effort": impact["effort"],
+            "units_affected": impact["units"],
+        })
+
+    # Sort by impact (descending)
+    recs.sort(key=lambda r: r["priority"])
+    return recs[:5]  # top 5 only — decision-ready, not overwhelming
+```
+
+### Example Output (Current SS26)
+
+```
+PRIORITY ACTIONS (sorted by business impact):
+
+1. 🔴 HIGH IMPACT — Enable depth-first strategy
+   Action:  Activate MVA enforcement (min 3 units/store/style)
+   Impact:  Eliminates 71% thin allocations → stores can actually display stock
+   Effort:  Config change (brand_settings)
+   Units:   Affects 96,394 units across 184 stores
+
+2. 🟡 MEDIUM IMPACT — Hold 30% for Week 2 re-run
+   Action:  Release to Tier 1-2 stores. Hold remainder centrally.
+   Impact:  Reduces waste from low-confidence allocations by ~20K units
+   Effort:  Split shipment coordination
+   Units:   ~29K units held
+
+3. 🟡 MEDIUM IMPACT — Monitor style DNA matched styles
+   Action:  Track sell-through of top 20 DNA-matched styles in Week 1-2
+   Impact:  Validates or invalidates the analogue matching for 80% of demand
+   Effort:  Automated report (Celery Beat)
+   Units:   77K units depend on DNA accuracy
+
+4. 🟢 LOW IMPACT — Skew tolerance acceptable
+   Action:  No action needed
+   Impact:  Distribution Gini within normal range for graded network
+   Effort:  None
+
+5. 🟢 LOW IMPACT — Size curve accuracy
+   Action:  Monitor after 2 weeks of sales
+   Impact:  Size splits currently from brand guide — will improve with data
+   Effort:  Automatic (engine upgrades itself)
+```
+
+---
+
+## 8. Evolution Projection
+
+### How the Score Improves Over Time
+
+```python
+def project_score_evolution(
+    current_score: int,
+    current_week: int,
+    data_tier_distribution: dict,
+) -> list[dict]:
+    """
+    Project health score improvement as data accumulates.
+    """
+    projections = []
+    tier4_pct = data_tier_distribution.get("style_dna_analogue", 0)
+    tier5_pct = data_tier_distribution.get("minimum_presentation", 0)
+
+    for week_offset in [2, 4, 6, 8]:
+        future_week = current_week + week_offset
+
+        # Model: each week of sales data converts ~15% of Tier4/5 → Tier1-3
+        conversion_rate = min(0.15 * week_offset, 0.90)
+        new_tier1_pct = tier4_pct * conversion_rate * 0.4   # some become store-level
+        new_tier2_pct = tier4_pct * conversion_rate * 0.35  # some become cluster
+        new_tier3_pct = tier4_pct * conversion_rate * 0.25  # some stay grade-level
+
+        # Score improvement: each tier upgrade improves confidence by ~5 pts
+        confidence_boost = (new_tier1_pct * 15 + new_tier2_pct * 10 + new_tier3_pct * 5)
+        projected = min(95, current_score + int(confidence_boost))
+
+        projections.append({
+            "week": future_week,
+            "projected_score": projected,
+            "label": (
+                "SAFE" if projected >= 75 else
+                "CAUTION" if projected >= 55 else
+                "RISKY"
+            ),
+            "driver": f"~{conversion_rate*100:.0f}% of styles now have store-level sales data",
+        })
+
+    return projections
+```
+
+### Projection for SS26
+
+| Week | Projected Score | Label | Driver |
+|---|---|---|---|
+| Current (W1) | 58 | CAUTION | Cold-start, 80% style DNA |
+| Week 3 | 65 | CAUTION | 30% of styles have 2+ weeks of sales |
+| Week 5 | 73 | CAUTION | Store-historical ROS starts activating |
+| Week 7 | 80 | SAFE | Majority of demand from Tier 1-2 |
+| Week 9 | 85 | SAFE | Full confidence, refined size curves |
+
+---
+
+## 9. Integration Plan
+
+### Where Each Layer Hooks In
+
+```python
+# In engine.py :: generate() — MODIFIED per-style loop:
+
+for style_code, style_grn_lines in style_groups.items():
+    # ... (existing: load SKUs, score stores, filter eligible)
+
+    # ──── NEW: PRIORITIZATION LAYER ────
+    strategy = auto_detect_strategy(
+        available_units=style_available_units,
+        eligible_store_count=len(eligible_scores),
+        risk_level=sku.style_risk_group or "PROVEN",
+        min_depth=brand_settings.get("min_depth", 3),
+    )
+    prioritized = prioritize_stores(
+        eligible_scores=eligible_scores,
+        available_units=style_available_units,
+        min_depth=brand_settings.get("min_depth", 3),
+        strategy=strategy,
+    )
+    # Replace eligible_scores with prioritized subset
+    eligible_scores = prioritized
+    eligible_stores = [
+        self._store_cache[sid] for sid in prioritized
+    ]
+    # ──── END PRIORITIZATION ────
+
+    # ... (existing: compute demand, distribute, cap, guardrails)
+
+    # ──── NEW: MVA ENFORCEMENT ────
+    final_allocations = enforce_mva(
+        allocations=final_allocations,
+        store_grades=store_grade_map,
+        category=sku.category,
+        eligible_scores=eligible_scores,
+    )
+    # ──── END MVA ────
+
+    # ... (existing: emit AllocationLines)
+
+
+# In tasks/allocation.py — AFTER engine.generate():
+
+# ──── NEW: HEALTH + DECISION LAYER ────
+analyzer = AllocationHealthAnalyzer(session_id, brand_id, db)
+report = await analyzer.analyze()
+decision = compute_decision(
+    health_score=report.score,
+    risks=report.risks,
+    context=analyzer.get_context(),
+)
+session.health_score = report.score
+session.health_report = report.to_json()
+session.decision = decision
+await db.commit()
+# ──── END HEALTH ────
+```
+
+### Implementation Phases
+
+| Phase | Scope | Time | Impact |
+|---|---|---|---|
+| **P1: MVA + Prioritization** | `prioritize_stores()`, `enforce_mva()` in engine.py | 2 days | Fixes thin allocation immediately |
+| **P2: Health Analyzer** | `AllocationHealthAnalyzer` class in `health.py` | 2 days | 5 sub-scores + hard penalties |
+| **P3: Decision + Recommendations** | `compute_decision()`, recommendation engine | 1 day | APPROVE/CAUTION/REJECT verdicts |
+| **P4: Context + Projections** | Season maturity modifier, evolution projection | 1 day | Cold-start awareness + score trajectory |
+| **P5: API + Frontend** | Health endpoint, decision banner, style cards | 2 days | User sees everything |
+
+**Total: ~8 days (within 1-week target with 1 day buffer)**
+
+---
+
+## Summary: What Makes This 10x
+
+| Existing Systems (Increff/Toolio) | KYROS v2 |
+|---|---|
+| Allocate by formula, show results | **Judge its own decisions before showing results** |
+| Same depth for all stores | **Depth-first: concentrate where it matters** |
+| No confidence measure | **Decomposed confidence with evolution projection** |
+| Manual review required | **System says APPROVE/CAUTION/REJECT with reasons** |
+| Static allocation | **Self-improving: cold-start → data-rich automatically** |
+| Dashboards for interpretation | **Decisions for action** |

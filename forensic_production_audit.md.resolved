@@ -1,0 +1,783 @@
+# Kyros 2.0 — Forensic Production Audit
+
+> **Purpose**: Pre-deployment audit for live retail pilot  
+> **Verdict**: System has strong architectural DNA but contains **5 critical blockers** that will produce incorrect allocations in production  
+> **Date**: April 2026
+
+---
+
+## 1. 🔍 ROOT CAUSE DEBUGGING — Exact Failure Points
+
+### FAILURE #1: Synthetic Time-Series Corrupts Demand Estimation
+
+**File**: [processor.py:409-414](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#L409-L414)
+
+```python
+parsed_week = _try_parse_week_start_date(row.get("week_start_date"))
+if parsed_week is None:
+    if synthetic_week_starts is None:
+        synthetic_week_starts = _generate_synthetic_week_starts(SYNTHETIC_SALES_WEEKS)
+    targets = _spread_units_across_weeks(units_sold, synthetic_week_starts)
+```
+
+**What happens**: When [week_start_date](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#846-862) is missing (the pilot case), the system generates 8 synthetic weeks ending at `today` and spreads units evenly.
+
+**Why it's wrong**:
+1. **Destroyed temporality**: A store that sold 100 units in week 1 and 0 in weeks 2-8 now shows 12.5 units/week consistently. This eliminates stockout detection, trend analysis, and launch-curve identification.
+2. **ROS is inflated for seasonal items**: If a product sold only in summer weeks 1-4, synthetic spreading applies those same units across autumn weeks too, inflating the ROS denominator.
+3. **Stockout correction is a no-op**: The stockout detection algorithm in [demand.py:62-72](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#L62-L72) looks for 3 consecutive zero-sale weeks — synthetic spreading **guarantees** no zeros exist (all weeks get ≥1 unit).
+
+**Step-by-step trace**:
+```
+Input: store_code=MUMBAI_01, sku_code=ABC123, units_sold=80, week_start_date=NULL
+
+1. processor.py:410 → parsed_week = None
+2. _generate_synthetic_week_starts(8) → [today-49d, today-42d, ..., today]
+3. _spread_units_across_weeks(80, 8_weeks) → {wk1:10, wk2:10, ..., wk8:10}
+4. Upserted as 8 separate SalesData rows, each with 10 units
+
+Later during allocation:
+5. load_sales_history() → store_ros = 80/8 = 10.0 units/week
+6. _calculate_stockout_correction() → no zero-weeks found → correction=None
+7. Demand = 10.0 × grade_mult × cover_weeks (WRONG: actual demand pattern is unknown)
+```
+
+**Impact**: Every allocation in the pilot is based on artifically flattened demand curves. For ~281K sales rows with no [week_start_date](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#846-862), **100% of Tier 1 demand signals are tainted**.
+
+---
+
+### FAILURE #2: Sales ≠ Demand (Fundamental Logical Flaw)
+
+**File**: [demand.py:148-182](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#L148-L182) (load_sales_history)
+
+```python
+weekly_ros = float(total_sold or 0) / float(weeks_with_data)
+```
+
+**The problem**: `units_sold` is **constrained sales** (what actually sold), not **true demand**. The distinction is critical:
+
+| Metric | Meaning | When they diverge |
+|--------|---------|-------------------|
+| Units sold | Actual transactions | Always ≤ demand |
+| True demand | What would have sold with unlimited stock | Stockouts, late GRNs, display issues |
+
+**Where correction fails**:
+- Stockout correction ([demand.py:75-145](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#L75-L145)) only fires when consecutive zero-sale weeks are detected. But with synthetic weeks, zeros never appear.
+- Even with real [week_start_date](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#846-862), the correction only handles **binary stockout** (in-stock vs. not). It doesn't correct for partial stockouts (5 units available but 10 demanded).
+
+**Consequence**: The system systematically **underestimates demand** for high-performing stores that frequently stock out. This creates a vicious cycle: stock out → lower observed ROS → lower allocation → more stockouts.
+
+---
+
+### FAILURE #3: Dual Demand Codepaths — One Is Dead Code
+
+**Files**: 
+- [demand.py:395-531](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#L395-L531) ([calculate_store_demand_details](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#395-532) — **USED by engine**)
+- [demand.py:1078-1164](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#L1078-L1164) ([calculate_demand_with_fallback](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#1078-1164) — **NEVER CALLED by engine**)
+
+The [calculate_demand_with_fallback](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#1078-1164) function is documented as "Phase 2" and has the comment `Currently, the engine uses calculate_store_demand_details()`. But these two functions have **different fallback semantics**:
+
+| Tier | [calculate_store_demand_details](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#395-532) | [calculate_demand_with_fallback](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#1078-1164) |
+|------|----------------------------------|----------------------------------|
+| 1 | Store×SKU ROS from preloaded map | Store×category ROS from DB query |
+| 2 | Cluster avg from preloaded map | Cluster×SKU from live DB query |
+| 3 | Grade avg from preloaded map | Grade×SKU from raw SQL text() |
+| 4 | Style DNA proxy | *(missing)* |
+| 5 | Min presentation | Min presentation |
+
+**Risk**: A developer might see [calculate_demand_with_fallback](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#1078-1164) and think it's the active codepath. The raw SQL in tier 3 ([demand.py:1049-1067](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#L1049-L1067)) uses [text()](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#848-850) with no parametrized types — a SQL injection risk in the dead codepath.
+
+---
+
+### FAILURE #4: Full Sales DELETE on Re-upload
+
+**File**: [processor.py:362-366](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#L362-L366)
+
+```python
+await db.execute(
+    delete(SalesData).where(SalesData.brand_id == brand_id)
+)
+```
+
+**What happens**: Every sales upload **deletes ALL historical sales data** for the entire brand, then re-inserts. This means:
+1. If the new file is smaller or has errors, previous valid data is permanently lost
+2. No audit trail of what changed
+3. If upload fails mid-way (after DELETE but before all INSERTs), the brand has **zero sales data**
+4. Any in-progress allocation reading from `sales_data` gets inconsistent results
+
+**Step-by-step failure**:
+```
+1. User uploads updated sales CSV (200K rows)
+2. DELETE FROM sales_data WHERE brand_id = X → 281K rows deleted
+3. Batch insert begins... processes 150K rows
+4. Network error / timeout / Celery crash
+5. Brand now has only 150K of 200K rows. 131K rows permanently lost.
+6. Next allocation uses truncated history → incorrect ROS for missing stores/SKUs
+```
+
+---
+
+### FAILURE #5: Mid-Loop Transaction Commits
+
+**File**: [engine.py:571-574](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#L571-L574)
+
+```python
+if len(batch) >= BATCH_SIZE:
+    db.add_all(batch)
+    await db.commit()
+    batch.clear()
+```
+
+**What happens**: The allocation engine commits every 500 AllocationLine records. If it processes 2,000 of 3,500 SKUs and then crashes:
+- 2,000 SKUs have committed allocation lines (persisted)
+- 1,500 SKUs have no allocation lines
+- Session status is still `GENERATING` (never reached `UNDER_REVIEW`)
+- The `existing_line_map` on restart will find those 2,000 lines, creating an inconsistent merge
+
+**Combined with**: The stale-line cleanup logic ([engine.py:576-626](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#L576-L626)) zeros out lines for stores no longer eligible — but only for SKUs it processes. The 1,500 unprocessed SKUs retain their previous (potentially wrong) allocations.
+
+---
+
+### FAILURE #6: `was_overridden` Comparison Is Logically Wrong
+
+**File**: [allocation.py router:425](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/routers/allocation.py#L425)
+
+```python
+line.was_overridden = payload.final_qty != line.ai_recommended_qty
+```
+
+But `ai_recommended_qty` is the **raw pre-cap demand**, not the `final_qty` that the engine originally set. So if the engine recommended 15 (raw) but set `final_qty=10` (after cap), and the user sets `final_qty=10`, `was_overridden` will be [True](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#49-60) even though the user didn't change anything.
+
+---
+
+## 2. ⚙️ ALLOCATION LOGIC VALIDATION
+
+### Is It Mathematically Correct?
+
+**Scoring formula** ([engine.py:839-843](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#L839-L843)):
+```python
+score = (0.50 × store_ros) + (0.25 × grade_score) + (0.25 × 1/cover)
+```
+
+**Problem**: These three terms are on **different scales** and are **not normalized**.
+- `store_ros` could be 0.1 to 50+ units/week
+- `grade_score` is 2-5 (integer)
+- `1/cover` is 0.07 to 10+
+
+A store with ROS=30 will have score ≈ 15 + 1.25 + 0.18 ≈ 16.43  
+A store with ROS=0.5 will have score ≈ 0.25 + 1.25 + 0.18 ≈ 1.68
+
+**The ROS term completely dominates.** Grade and cover are effectively noise. The 50/25/25 weights are misleading — real effective weights are more like 95/3/2.
+
+**Fix**: Normalize each component to [0, 1] before weighting, or use percentile ranks.
+
+### Distribution Logic Bias
+
+**File**: [engine.py:1029-1059](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#L1029-L1059) ([_distribute_standard](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#995-1060))
+
+When any store receives less than `min_units_per_store` (default 6), it gets **zero** and its units go to the top-scoring store:
+```python
+if below_min and final:
+    redistributable = sum(raw_distribution[store_id] for store_id in below_min)
+    top_store = max(final.keys(), key=lambda sid: eligible_stores[sid].score)
+    final[top_store] += redistributable
+```
+
+**Bias**: This creates a **winner-take-all** dynamic. For scarce SKUs (e.g., 30 units across 20 stores ≈ 1.5 each), every store falls below minimum → all 30 units go to a single store. This is directionally wrong for fashion retail where broad distribution drives brand visibility.
+
+### Demand Double-Application of Grade Multiplier
+
+**Engine applies grade multiplier** at [engine.py:331](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#L331):
+```python
+base_ros_with_grade = signal.weekly_ros * signal.grade_multiplier
+```
+
+**But [calculate_store_demand_details](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#395-532)** at [demand.py:516-517](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#L516-L517) also stores the multiplier (but doesn't apply it — the comment says so). However, the `DemandSignal.demand` field at [demand.py:517-518](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#L517-L518) is:
+```python
+raw_demand = round(base_ros * weeks_remaining)
+raw_demand = int(max(raw_demand, min_qty))
+```
+
+This is WITHOUT grade multiplier. Then engine applies multiplier. So the signal's `.demand` field is **not used** for the actual allocation — only `.weekly_ros` and `.grade_multiplier` are. This is confusing but functionally correct. The `.demand` field is wasted computation.
+
+### Cannibalization Factor Is Arbitrary
+
+**File**: [engine.py:1303](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#L1303)
+```python
+factor = 0.65 if competing_count > 0 else 1.0
+```
+
+This applies a **flat 35% reduction** regardless of whether there are 1 or 10 competing colorways. One shirt in the same story shouldn't reduce allocation by the same amount as 10 shirts. The relationship should be non-linear (e.g., `1.0 / (1 + 0.15 * competing_count)`).
+
+---
+
+## 3. 🧱 DATA PIPELINE & CONTRACT AUDIT
+
+### Current Implicit Schema Assumptions
+
+| Field | Assumed Present | Actual Pilot | Risk |
+|-------|----------------|-------------|------|
+| [store_code](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#195-202) | ✅ Required | Present | OK |
+| `sku_code` | ✅ Required | Present | OK |
+| `units_sold` | ✅ Required, int≥0 | Present | OK |
+| [week_start_date](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#846-862) | ⚠️ Optional with fallback | **MISSING** | 🔴 Critical (synthetic) |
+| `was_in_stock` | ⚠️ Optional, defaults True | **MISSING** | 🔴 Stockout detection broken |
+| `revenue` | ⚠️ Optional | Present | OK |
+| [category](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#204-210) | ⚠️ Falls back to "Uncategorized" | From DEPARTMENT | 🟡 Noisy |
+| `fabric` | ⚠️ Optional | From MATERIAL | OK |
+| [price_band](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#81-84) | ⚠️ Optional | From PRICEBAND | OK |
+| [grade](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#866-869) | ✅ Required in grade file | Present | Must be A+/A/B/C only |
+
+### Hidden Dependencies
+
+1. **SKU auto-creation from sales data** ([processor.py:293-316](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#L293-L316)): When a `sku_code` in the sales CSV doesn't exist, it's auto-created with `style_code = sku_code` and `style_name = sku_code`. This means:
+   - New SKUs from sales have no [season_id](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#562-594), `style_risk_group`, or `store_group_rule`
+   - They default to `FASHION` type and null for every meaningful field
+   - Allocation engine defaults them to `PROVEN` risk level and `All Stores` rule
+
+2. **Store auto-creation from store names** ([processor.py:237-275](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#L237-L275)): Auto-generates [store_code](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#195-202) from hashed store name. Multiple uploads with slightly different name formats (e.g., "Mumbai Store 1" vs "Mumbai Store-1") create duplicate stores.
+
+### Proposed Data Contract
+
+```yaml
+# SALES DATA CONTRACT
+sales_upload:
+  required_fields:
+    store_code: { type: string, max_length: 50, must_match: stores.store_code }
+    sku_code: { type: string, max_length: 100, must_match: skus.sku_code }
+    units_sold: { type: integer, min: 0 }
+  
+  strongly_recommended:
+    week_start_date: { type: date, format: "YYYY-MM-DD", must_be_monday: true }
+    was_in_stock: { type: boolean }
+  
+  optional:
+    revenue: { type: float, min: 0 }
+    was_on_promotion: { type: boolean }
+  
+  validation_rules:
+    - reject_if: "week_start_date is missing AND no brand-level synthetic_weeks override"
+    - warn_if: "< 4 distinct weeks after parsing"
+    - reject_if: "store_code not found in stores table AND no auto_create flag"
+    - reject_if: "sku_code not found in skus table AND no auto_create flag"
+    - warn_if: "> 30% of rows have units_sold = 0"
+  
+  failure_handling:
+    unknown_store: SKIP_ROW_WITH_WARNING  # not silent drop
+    unknown_sku: SKIP_ROW_WITH_WARNING
+    missing_week: REJECT_UPLOAD  # force user to provide dates
+    zero_units: SKIP_ROW  # current behavior, OK
+```
+
+---
+
+## 4. 🧨 EDGE CASE & FAILURE SIMULATION
+
+### Case 1: Zero Sales SKU (New to All Stores)
+
+**Input**: SKU "NEW_SHIRT_001" appears in GRN but has zero rows in `sales_data`.
+
+**Current behavior**:
+1. [load_sales_history](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#148-183) returns nothing for this SKU → Tier 1 fails
+2. [cluster_ros_averages](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#307-361) returns nothing → Tier 2 fails
+3. [grade_ros_averages](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#244-305) returns nothing → Tier 3 fails
+4. Style DNA query ([demand.py:763-801](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#L763-L801)): searches for similar SKUs in same category. If similar SKUs exist → Tier 4 succeeds with weighted ROS
+5. If no similar SKUs → Tier 5: `demand = min_presentation_qty (2 units)`
+6. **Result**: 2 units × N stores → widely spread, low-confidence
+
+**Why it's wrong**: For a brand-new experimental style, you want concentrated distribution to test stores, not wide spread at minimum quantities. The allocation should treat truly new SKUs differently.
+
+**Expected**: If `style_risk_group = EXPERIMENTAL`, the engine does concentrate to 5 stores. But new SKUs from sales bootstrap have **null** `style_risk_group` ([processor.py:303-316](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#L303-L316)), which defaults to `PROVEN`. So new SKUs get wide distribution at 2 units each — the opposite of what's needed.
+
+### Case 2: Stockout Period (Real Dates)
+
+**Input**: Store X sold 50 units/week for weeks 1-3, then 0 units weeks 4-8 (out of stock).
+
+**Current behavior with real dates**: 
+1. [_infer_stockout_week](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#62-73) → detects stockout at week 3 (3 consecutive zeros)
+2. `corrected_ros = 50 × 8 / 8 = 50` (extrapolates full-season at pre-stockout rate)
+3. ✅ Correction works
+
+**Current behavior with synthetic dates** (pilot):
+1. 150 total units spread across 8 synthetic weeks → 19 units/week each
+2. No consecutive zeros → stockout not detected
+3. `corrected_ros = None`
+4. Demand is 19 units/week (should be 50) → **62% under-allocation**
+
+### Case 3: High Inventory + Low Demand
+
+**Input**: 500 units available, total demand across all stores = 50 units.
+
+**Current behavior**:
+1. [apply_inventory_cap](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/cap.py#11-47): `total_demand(50) ≤ available(500)` → returns raw demands
+2. [_top_up_allocations](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#1174-1226) ([engine.py:1174-1225](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#L1174-L1225)): remaining = 500 - 50 = 450 units
+3. Residual demands are computed but they're 0 (demand already met)
+4. **Result**: Only 50 of 500 units allocated. 450 units unallocated.
+
+**Why**: [top_up](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#1174-1226) only redistributes based on `target_demands` gap. If target demands are fully met, no more is added. The system intentionally under-allocates to match demand, but the brand VP will see "90% of inventory sitting in warehouse" and lose trust.
+
+**Expected**: Flag this as an anomaly, suggest demand re-evaluation, or offer a "push remaining to top stores" option.
+
+### Case 4: Missing/Corrupted Grade Data
+
+**Input**: A new store was added but no grade CSV uploaded for it.
+
+**Current behavior**: 
+1. `grade_map.get((store_id, category))` → None → defaults to `DEFAULT_GRADE = "C"`
+2. Grade C multiplier = 0.50 → demand halved
+3. Cover target = PROVEN/C = 3 weeks (lowest)
+4. **Result**: New store systematically under-allocated
+
+**Expected**: Surface a warning that N stores are defaulting to grade C. Let user acknowledge or upload grades.
+
+### Case 5: Conflicting Grade vs. ROS
+
+**Input**: Store graded "C" but has highest ROS (10 units/week) because it's in a high-traffic mall.
+
+**Current behavior**:
+1. Scoring: `0.50×10 + 0.25×2 + 0.25×(1/14) ≈ 5.52` — still high score (ROS dominates)
+2. But demand calculation: `10 × 0.50 (C mult) × 3 weeks (C cover) = 15 units`
+3. An A+ store with ROS=5: `5 × 1.25 × 7 = 43.75 units` 
+
+**The paradox**: The scoring says "this C store is important" but the demand formula says "give it 15 units". The A+ store with half the ROS gets 3× the allocation. **The grade multiplier is overriding observed reality.**
+
+---
+
+## 5. 📈 PERFORMANCE & SCALABILITY
+
+### Complexity Analysis
+
+```
+Main loop:   O(G × S)  where G = GRN lines, S = eligible stores per SKU
+Scoring:     O(S) per SKU (one-time preloaded)
+Demand:      O(S) per SKU (preloaded maps → O(1) lookups)
+Cap:         O(S × log(S)) for sorting
+Size curve:  O(S × Q) per SKU where Q = sizes per category (DB queries per store!)
+Top-up:      O(S × log(S)) per SKU
+```
+
+**Critical path**: For 3,536 SKUs × 162 stores = ~573K store×SKU pairs, each needing demand calculation, scoring, capping, size distribution, and reasoning generation.
+
+### Measured Bottlenecks
+
+| Operation | Per SKU | For 3,536 SKUs |
+|-----------|---------|----------------|
+| Score stores | ~0.5ms (preloaded) | ~2s |
+| Demand per store | ~0.2ms (preloaded) | ~115s |
+| Style DNA (cold cache) | **50-200ms per DB call** | **Up to 10+ min** |
+| Size distribution | **5-20ms per store** (DB call per store!) | **Up to 30 min** |
+| Reasoning build | ~0.5ms | ~5s |
+
+**Worst-case scenario** (all Tier 4 Style DNA + all size distribution DB calls):
+```
+573K × 100ms (Style DNA) + 573K × 10ms (size curve) = 57.3K sec + 5.7K sec ≈ **17.5 hours**
+```
+
+This is why the Celery task has a 30-minute timeout — but even the happy path with typical cache hit rates runs **5-15 minutes** for the pilot dataset.
+
+### Size Curve Is the Hidden Killer
+
+**File**: [size_curve.py:76-152](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/size_curve.py#L76-L152) ([load_historical_size_ratios](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/size_curve.py#76-153))
+
+For EACH store×SKU, this function makes **up to 3 DB queries** (store → cluster → brand fallback):
+```python
+store_rows = await db.execute(...)     # Query 1
+cluster_rows = await db.execute(...)   # Query 2 (if store fails)
+brand_rows = await db.execute(...)     # Query 3 (if cluster fails)
+```
+
+For 162 stores × 3,536 SKUs = **up to 1.7M DB queries**. Even at 1ms each = 28 minutes.
+
+**Fix**: Pre-compute size ratios per (category, grade) at session start, not per store×SKU.
+
+### Scaling Assessment
+
+| Scale | Est. Time | Viable? |
+|-------|-----------|---------|
+| 162 stores × 3.5K SKUs | 5-15 min | ⚠️ Marginal |
+| 500 stores × 5K SKUs | 30-90 min | ❌ Timeout |
+| 1000 stores × 10K SKUs | 3-12 hours | ❌ Impossible |
+
+---
+
+## 6. 🧠 ML-READINESS
+
+### Where ML Should Plug In
+
+| Module | Current | ML Replacement | Data Needed Now |
+|--------|---------|----------------|-----------------|
+| **Demand estimation** | ROS with 5-tier fallback | Gradient boosted model (XGBoost/LightGBM) | Feature vectors per store×SKU |
+| **Store scoring weights** | Fixed 50/25/25 | Learned weights via reinforcement learning | Decision logs with outcomes |
+| **Grade multipliers** | Hardcoded {A+:1.25, C:0.50} | Learned from actual sell-through | Sell-through at 4/8/12 weeks |
+| **Cover targets** | Static matrix | Dynamic based on style lifecycle | Launch week + weekly velocity |
+| **Cannibalization** | Fixed 0.65 | Substitution model | Co-purchase / co-view data |
+
+### Feature Logging Schema (Start NOW)
+
+```python
+# Log per allocation decision for future ML training
+@dataclass
+class AllocationDecisionLog:
+    # Context
+    session_id: UUID
+    grn_id: UUID
+    brand_id: UUID
+    timestamp: datetime
+    
+    # Store features
+    store_id: UUID
+    store_grade: str
+    store_cluster_id: UUID | None
+    store_climate_zone: str | None
+    store_opening_days: int  # days since opening
+    
+    # SKU features
+    sku_id: UUID
+    sku_category: str
+    sku_fabric: str | None
+    sku_price_band: str | None
+    sku_risk_level: str
+    sku_story: str | None
+    is_new_sku: bool  # True if no prior sales history
+    
+    # Demand signals
+    ros_source: str  # which tier was used
+    weekly_ros: float
+    raw_weekly_ros: float  # before any correction
+    is_stockout_corrected: bool
+    grade_multiplier: float
+    affinity_multiplier: float
+    cluster_avg_ros: float | None
+    grade_avg_ros: float | None
+    style_dna_match_score: float | None
+    data_sample_size: int  # weeks of history
+    
+    # Allocation decision
+    cover_target_weeks: int
+    season_weeks_remaining: int
+    raw_demand: int  # before cap
+    final_qty: int   # after cap and constraints
+    available_qty: int  # warehouse available
+    cap_scale_factor: float
+    cannibalization_factor: float | None
+    
+    # Store competition context
+    competing_colorways_at_store: int
+    total_skus_allocated_to_store: int  # in this session
+    
+    # Confidence
+    ai_confidence: str  # HIGH/MEDIUM/LOW
+    score: float  # composite store score
+    
+    # --- OUTCOME (populated post-season) ---
+    actual_sold_4w: int | None
+    actual_sold_8w: int | None
+    actual_sold_eow: int | None
+    was_overridden: bool
+    override_qty: int | None  # user's override if any
+    override_sold_better: bool | None  # did override outperform AI?
+```
+
+### Training Dataset Structure
+
+```
+Features (X):
+  - store_grade_numeric (A+=4, A=3, B=2, C=1)
+  - store_ros_last_season
+  - store_cluster_avg_ros
+  - sku_risk_numeric (PROVEN=1, CONFIDENT=2, EXPERIMENTAL=3)
+  - sku_price_band_encoded
+  - season_weeks_remaining
+  - available_qty_log
+  - competing_colorways
+  - is_new_sku (binary)
+  - store_category_affinity_score
+  
+Target (y): 
+  - actual_sell_through_rate_4w = actual_sold_4w / final_qty
+  
+Model: LightGBM regressor predicting sell-through rate
+Allocation: final_qty = predicted_demand × cover_target / predicted_sell_through_rate
+```
+
+---
+
+## 7. 🔄 IN-SEASON INTELLIGENCE DESIGN
+
+### Architecture Extension (Minimal Changes)
+
+```
+Current:
+  GRN Upload → Allocation Engine → AllocationSession → Review → Approve → Export
+
+Extended:
+  GRN Upload → Allocation Engine → AllocationSession → Review → Approve → Export
+                                         ↑
+  Weekly Inventory Snapshot ──────────→ Replenishment Engine────→ TransferSession
+                                         ↑
+  Weekly Sales Ingestion ─────────────→ Performance Tracker ────→ Alert Engine
+```
+
+**New tables needed**:
+```sql
+CREATE TABLE transfer_recommendations (
+    id UUID PRIMARY KEY,
+    session_id UUID REFERENCES allocation_sessions(id),
+    from_store_id UUID REFERENCES stores(id),
+    to_store_id UUID REFERENCES stores(id),
+    sku_id UUID REFERENCES skus(id),
+    qty INT NOT NULL,
+    reason JSONB,
+    status VARCHAR(20) DEFAULT 'PENDING'
+);
+
+CREATE TABLE replenishment_triggers (
+    id UUID PRIMARY KEY,
+    store_id UUID REFERENCES stores(id),
+    sku_id UUID REFERENCES skus(id),
+    current_stock INT,
+    weekly_ros FLOAT,
+    days_of_cover FLOAT,
+    trigger_type VARCHAR(30),  -- 'STOCKOUT_IMMINENT', 'BELOW_SAFETY_STOCK', 'REORDER_POINT'
+    suggested_qty INT,
+    created_at TIMESTAMPTZ
+);
+```
+
+**Reusable components**:
+- [load_sales_history()](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#148-183) → reuse with updated date range
+- [calculate_store_demand_details()](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#395-532) → reuse for in-season demand
+- [apply_inventory_cap()](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/cap.py#11-47) → reuse for transfer qty capping
+- [build_allocation_reasoning()](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#871-989) → extend for transfer reasoning
+
+**New Celery beat schedule**:
+```python
+# Every Monday: refresh inventory + check replenishment triggers
+celery_app.conf.beat_schedule = {
+    'weekly-replenishment-check': {
+        'task': 'app.tasks.replenishment.check_triggers',
+        'schedule': crontab(day_of_week='monday', hour=6),
+    },
+}
+```
+
+---
+
+## 8. 🛡️ DECISION SAFETY & GUARDRAILS
+
+### Current Guardrails (What exists)
+
+| Guardrail | Location | Status |
+|-----------|----------|--------|
+| Available qty ≥ 0 check | engine.py:252 | ✅ Exists |
+| Post-cap overflow guard | engine.py:380-410 | ✅ Exists |
+| Display capacity check | engine.py:918-919 | ✅ Exists |
+| Override inventory check | allocation.py router:410 | ✅ Exists |
+| UNDER_REVIEW re-generation block | allocation.py router:193 | ✅ Exists |
+
+### Missing Guardrails (Must Add Before Pilot)
+
+#### 1. Max Store Allocation Cap
+```python
+# engine.py — after final_allocations computed
+MAX_STORE_PCT = 0.25  # No single store should get > 25% of available
+for store_id, qty in final_allocations.items():
+    if qty > available_units * MAX_STORE_PCT:
+        logger.warning("Store %s getting %.0f%% of inventory", store_id, qty/available_units*100)
+        final_allocations[store_id] = int(available_units * MAX_STORE_PCT)
+```
+
+#### 2. Skew Detection
+```python
+# After allocation: check Gini coefficient of distribution
+def gini_coefficient(allocations: dict[UUID, int]) -> float:
+    values = sorted(allocations.values())
+    n = len(values)
+    if n == 0: return 0
+    cumsum = sum((i+1) * v for i, v in enumerate(values))
+    return (2 * cumsum) / (n * sum(values)) - (n + 1) / n
+
+gini = gini_coefficient(final_allocations)
+if gini > 0.6:  # highly skewed
+    session.warnings.append(f"SKU {sku.sku_code}: allocation is highly skewed (Gini={gini:.2f})")
+```
+
+#### 3. Anomaly Flags per Allocation Line
+```python
+# Add to ai_reasoning JSONB
+"risk_flags": {
+    "stockout_risk": weeks_cover < 2,
+    "over_allocation_risk": final_qty > 3 * weekly_ros * season_weeks_remaining,
+    "low_confidence": ai_confidence == "LOW",
+    "no_history": ros_source == "minimum_presentation",
+    "heavy_cap_applied": cap_scale_factor < 0.3,
+}
+```
+
+---
+
+## 9. 🏗️ PRODUCTION READINESS
+
+### 🔴 Critical Blockers (MUST FIX Before Pilot)
+
+| # | Issue | Impact | Fix Effort |
+|---|-------|--------|------------|
+| 1 | **Synthetic week spreading** masks real demand patterns | All allocations are based on artificial ROS | 2 days: Require [week_start_date](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#846-862) OR accept flat ROS with explicit warning |
+| 2 | **Full DELETE on sales re-upload** | Data loss on partial failure | 1 day: Use idempotent upsert, not delete+insert |
+| 3 | **Mid-loop `db.commit()`** | Inconsistent state on crash | 0.5 day: Single transaction with flush (not commit) |
+| 4 | **No concurrent run protection** | Race condition on duplicate requests | 0.5 day: `SELECT FOR UPDATE` on session |
+| 5 | **Un-normalized scoring** | ROS dominates, grades/cover meaningless | 1 day: Normalize to [0,1] before weighting |
+
+### 🟡 Will Destroy User Trust (Fix in Week 1)
+
+| # | Issue | Impact |
+|---|-------|--------|
+| 6 | No warning when most stores default to grade C | User sees low allocations, doesn't understand why |
+| 7 | No utilization summary ("450 of 500 units unallocated") | VP asks "where's my inventory?" |
+| 8 | `was_overridden` flag is wrong (compares to raw, not final) | Review analytics are meaningless |
+| 9 | CSV export loads all lines into memory | 500K+ lines → OOM for production-sized datasets |
+| 10 | No summary email/notification when allocation completes | User has to keep polling the UI |
+
+### 🟢 Acceptable Imperfections (Can Ship With)
+
+| Issue | Why It's OK For Pilot |
+|-------|----------------------|
+| Style DNA matching is premature | Tier 1-3 cover pilot adequately |
+| Cannibalization factor is fixed | Manual override covers edge cases |
+| No inter-store transfers | Pre-season only in pilot |
+| Single Celery worker | Pilot has 1 brand, 1 concurrent run |
+| boto3 unused | No impact, just unnecessary dep |
+
+---
+
+## 10. 🛠️ PHASED FIX PLAN
+
+### Phase 1 — Critical Blockers (Days 1-5)
+
+1. **[Day 1]** Remove mid-loop `db.commit()` in [engine.py:573](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#L573). Use `await db.flush()` instead. Single `db.commit()` after the entire loop.
+2. **[Day 1]** Add `SELECT ... FOR UPDATE` on [AllocationSession](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/models/allocation.py#21-40) at [engine.py:115-120](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#L115-L120).
+3. **[Day 2]** Replace `DELETE + INSERT` in [processor.py:362-366](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#L362-L366) with `ON CONFLICT DO UPDATE` only. No preamble delete.
+4. **[Day 2-3]** Normalize scoring components in [engine.py:835-843](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/engine.py#L835-L843): percentile-rank each component across all stores before weighting.
+5. **[Day 3]** Add data quality validation: reject sales uploads entirely if [week_start_date](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/ingestion/processor.py#846-862) is missing for >50% of rows when brand is in "production mode". Keep synthetic fallback for onboarding/demo only.
+6. **[Day 4]** Pre-compute size ratios once per (category, grade) at session start instead of per store×SKU. Cache in `self._size_ratio_cache`.
+7. **[Day 5]** Fix `was_overridden` comparison in [allocation.py:425](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/routers/allocation.py#L425) — compare against `line.final_qty` (engine's final), not `line.ai_recommended_qty`.
+
+### Phase 2 — Stability & Trust (Days 6-12)
+
+8. Add allocation summary to session: total allocated, total available, utilization %, stores at default grade, demand source mix.
+9. Add max-store-cap guardrail (25% cap).
+10. Add skew detection and warning flags.
+11. Streaming CSV export using chunked DB reads.
+12. Add "allocation health" warnings to frontend: "78 stores have no grade data — defaulting to C."
+13. Delete the dead [calculate_demand_with_fallback](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#1078-1164) codepath and the raw SQL [text()](file:///Users/meghvyas/Desktop/Kyros2.0/backend/app/services/allocation/demand.py#848-850) query.
+
+### Phase 3 — ML-Ready Foundation (Days 13-20)
+
+14. Create `allocation_decision_logs` table and persist `AllocationDecisionLog` for every line.
+15. Add Celery beat task to populate `actual_sellthrough_4w/8w` from sales data at +4/+8 weeks.
+16. Add `ai_was_better` computation: compare AI's `final_qty` sell-through vs. user override sell-through.
+17. Modularize `engine.py:generate()` — extract scoring, demand, distribution, capping into separate orchestrator steps.
+
+### Phase 4 — In-Season System (Days 21-30)
+
+18. Add weekly inventory snapshot ingestion.
+19. Add replenishment trigger Celery beat task.
+20. Add transfer recommendation engine (reuses demand + cap logic).
+21. Add in-season performance dashboard cards.
+
+---
+
+## 11. 📦 CODE-LEVEL IMPROVEMENTS
+
+### Refactor 1: Split `engine.py:generate()` Into Orchestrator
+
+```python
+# Pseudocode for refactored engine
+class AllocationEngine:
+    async def generate(self, grn_id, brand_id, db) -> AllocationSession:
+        context = await self._build_context(grn_id, brand_id, db)     # Load all data
+        session = await self._init_session(context, db)                # Create/reset session
+        
+        for grn_line in context.grn_lines:
+            result = await self._allocate_sku(grn_line, context, db)   # Per-SKU logic
+            if result:
+                self._batch.extend(result.lines)
+                self._flush_if_needed(db)                              # flush, NOT commit
+        
+        await self._finalize(session, db)                              # Single commit
+        return session
+    
+    async def _allocate_sku(self, grn_line, ctx, db) -> SkuAllocationResult:
+        available = self._compute_available(grn_line, ctx)
+        eligible = self._filter_eligible(ctx.stores, grn_line.sku, ctx)
+        scores = self._score_stores(eligible, grn_line.sku, ctx)
+        demands = self._compute_demands(eligible, grn_line.sku, ctx)
+        distribution = self._distribute(scores, demands, available, grn_line.sku, ctx)
+        final = self._apply_constraints(distribution, available, grn_line.sku, ctx)
+        return self._build_lines(final, demands, scores, grn_line.sku, ctx)
+```
+
+### Refactor 2: Normalize Scoring
+
+```python
+def score_stores(self, sku, stores, ...) -> dict[UUID, ScoreData]:
+    # Compute raw values
+    raw_ros = {s.id: ros_by_attribute.get((s.id, key), {}).get("ros", 0) for s in stores}
+    raw_grades = {s.id: GRADE_SCORES.get(grade, 2) for s in stores}
+    raw_cover_inv = {s.id: 1/max(self._attribute_cover(s.id, inventory), 0.1) for s in stores}
+    
+    # Normalize to [0, 1] using min-max scaling
+    def normalize(values: dict) -> dict:
+        vals = list(values.values())
+        lo, hi = min(vals), max(vals)
+        if hi == lo: return {k: 0.5 for k in values}
+        return {k: (v - lo) / (hi - lo) for k, v in values.items()}
+    
+    norm_ros = normalize(raw_ros)
+    norm_grade = normalize(raw_grades)
+    norm_cover = normalize(raw_cover_inv)
+    
+    return {
+        s.id: ScoreData(
+            score=ROS_WEIGHT * norm_ros[s.id] + GRADE_WEIGHT * norm_grade[s.id] + COVER_WEIGHT * norm_cover[s.id],
+            ...
+        ) for s in stores
+    }
+```
+
+### Refactor 3: Cache Size Ratios
+
+```python
+# In AllocationEngine.__init__
+self._size_ratio_cache: dict[tuple[str, str], dict[str, float]] = {}
+
+# In generate(), before main loop:
+await self._preload_size_ratios(brand_id, previous_season_id, db)
+
+async def _preload_size_ratios(self, brand_id, season_id, db):
+    """Pre-compute size ratios at brand level (shared across stores)."""
+    categories = set(sku.category for sku in sku_map.values())
+    for category in categories:
+        ratios = await load_historical_size_ratios(
+            brand_id=brand_id,
+            product_category=category,
+            store_id=None,  # brand-level
+            db=db,
+            historical_season_id=season_id,
+        )
+        self._size_ratio_cache[category] = ratios
+```
+
+### Refactor 4: Non-Linear Cannibalization
+
+```python
+def _apply_story_cannibalization(self, sku, allocations, existing_line_map, sku_map):
+    # ... existing competing_count logic ...
+    
+    # Non-linear decay instead of fixed 0.65
+    if competing_count > 0:
+        factor = 1.0 / (1.0 + 0.15 * competing_count)  
+        # 1 competitor: 0.87, 2: 0.77, 5: 0.57, 10: 0.40
+    else:
+        factor = 1.0
+```

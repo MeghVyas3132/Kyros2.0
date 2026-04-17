@@ -40,7 +40,8 @@ export default function GRNDetailPage() {
   const { data: grn } = useGRN(grnId);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionStatus, setSessionStatus] = useState<string | null>(null);
-  const [lineLimit, setLineLimit] = useState(2000);
+  const [activeTab, setActiveTab] = useState<"overview" | "lines">("overview");
+  const [lineLimit, setLineLimit] = useState(500);
   const {
     data: allocation,
     error: allocationError,
@@ -62,7 +63,7 @@ export default function GRNDetailPage() {
   const status = allocation?.session?.status ?? sessionStatus ?? (grn?.status === "RECEIVED" ? "DRAFT" : "UNDER_REVIEW");
 
   useEffect(() => {
-    setLineLimit(2000);
+    setLineLimit(500);
   }, [sessionId]);
 
   // Poll for session status while GENERATING
@@ -88,7 +89,7 @@ export default function GRNDetailPage() {
         .catch((error) => {
           setStatusRefreshError(errorMessage(error, "Could not refresh allocation status. Retrying..."));
         });
-    }, 3000);
+    }, 5000);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
@@ -107,7 +108,9 @@ export default function GRNDetailPage() {
       })
       .catch((error) => {
         const message = errorMessage(error, "Could not check allocation session status.");
-        const isMissingSession = error instanceof ApiError && error.code === "HTTP_404";
+        const isMissingSession =
+          error instanceof ApiError &&
+          (error.code === "HTTP_404" || error.code === "NOT_FOUND");
         if (isMissingSession) {
           // No session exists yet - this is normal for newly received stock
           setSessionId(null);
@@ -215,7 +218,12 @@ export default function GRNDetailPage() {
       simTimerRef.current = window.setTimeout(() => {
         void runSimulation(line, qty);
       }, 300);
+    },
+    [runSimulation]
+  );
 
+  const handleCommitQty = useCallback(
+    (line: AllocationLine, qty: number) => {
       void apiRequest(`/api/v1/allocation/lines/${line.id}`, {
         method: "PUT",
         body: JSON.stringify({
@@ -232,7 +240,7 @@ export default function GRNDetailPage() {
           setActionError(errorMessage(error, "Could not save quantity override."));
         });
     },
-    [mutate, runSimulation]
+    [mutate]
   );
 
   const handleOverrideReason = useCallback(
@@ -415,156 +423,247 @@ export default function GRNDetailPage() {
           </p>
         </div>
       ) : (
-        <div className="space-y-4">
-          {allocationError ? (
-            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
-              <p className="text-sm font-medium text-amber-900">Could not load allocation lines yet.</p>
-              <p className="mt-1 text-xs text-amber-700">
-                {allocationError instanceof Error
-                  ? allocationError.message
-                  : "The response is taking too long. Try loading a smaller page of lines."}
-              </p>
-            </div>
-          ) : null}
+        <div className="space-y-6">
+          {/* Tabs Navigation */}
+          <div className="border-b border-slate-200">
+            <nav className="-mb-px flex space-x-6" aria-label="Tabs">
+              <button
+                onClick={() => setActiveTab("overview")}
+                className={`whitespace-nowrap border-b-2 py-3 px-1 text-sm font-medium ${
+                  activeTab === "overview"
+                    ? "border-slate-900 text-slate-900"
+                    : "border-transparent text-slate-500 hover:border-slate-300 hover:text-slate-700"
+                }`}
+              >
+                Intelligence Dashboard
+              </button>
+              <button
+                onClick={() => setActiveTab("lines")}
+                className={`whitespace-nowrap border-b-2 py-3 px-1 text-sm font-medium ${
+                  activeTab === "lines"
+                    ? "border-slate-900 text-slate-900"
+                    : "border-transparent text-slate-500 hover:border-slate-300 hover:text-slate-700"
+                }`}
+              >
+                Allocation Lines {(allocation?.lines_total ?? 0).toLocaleString()}
+              </button>
+            </nav>
+          </div>
 
-          {allocation?.lines_total != null && allocation.lines_total > (allocation.lines?.length ?? 0) ? (
-            <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
-              <p className="text-xs text-slate-700">
-                Showing {allocation.lines.length.toLocaleString()} of {allocation.lines_total.toLocaleString()} lines.
-              </p>
-              {allocation.lines_has_more ? (
-                <button
-                  onClick={() => setLineLimit((prev) => prev + 2000)}
-                  className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
-                >
-                  Load 2,000 More
-                </button>
+          {activeTab === "overview" && (
+            <div className="space-y-6">
+              {allocation?.session?.health_score !== undefined && allocation?.session?.health_score !== null && (
+                <div className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+                  <div className={`p-4 border-b ${
+                    allocation.session.decision?.verdict === "APPROVE" ? "bg-emerald-50 border-emerald-100" :
+                    allocation.session.decision?.verdict === "APPROVE_WITH_CAUTION" ? "bg-amber-50 border-amber-100" :
+                    "bg-red-50 border-red-100"
+                  }`}>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-1">AI Verdict</p>
+                        <h2 className="text-xl font-bold text-slate-900">{allocation.session.decision?.verdict?.replace(/_/g, ' ') || "REVIEW REQUIRED"}</h2>
+                        <p className="text-sm mt-1 text-slate-700">{allocation.session.decision?.action}</p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-1">Health Score</p>
+                        <p className={`text-4xl font-bold ${
+                           allocation.session.health_score >= 75 ? "text-emerald-600" :
+                           allocation.session.health_score >= 55 ? "text-amber-600" : "text-red-600"
+                        }`}>
+                          {allocation.session.health_score} <span className="text-xl text-slate-400">/ 100</span>
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-4 bg-white">
+                    <div>
+                      <h3 className="text-sm font-semibold text-slate-900 mb-3">Core Metrics</h3>
+                      <div className="space-y-3">
+                        {allocation.session.health_report?.sub_scores && Object.entries(allocation.session.health_report.sub_scores).map(([key, val]: any) => (
+                           <div key={key} className="flex items-center justify-between">
+                             <span className="text-xs uppercase text-slate-600 font-medium">{key}</span>
+                             <div className="flex items-center gap-2">
+                               <div className="w-32 bg-slate-100 rounded-full h-1.5">
+                                 <div className={`h-1.5 rounded-full ${val >= 80 ? 'bg-emerald-500' : val >= 60 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${Math.min(100, Math.max(0, val))}%` }}></div>
+                               </div>
+                               <span className="text-xs font-bold text-slate-700 w-8 text-right">{Math.round(val)}</span>
+                             </div>
+                           </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                       <h3 className="text-sm font-semibold text-slate-900 mb-3">Top Recommendations</h3>
+                       <ul className="space-y-2">
+                         {allocation.session.health_report?.top_recommendations?.map((rec: string, i: number) => (
+                           <li key={i} className="flex gap-2 text-sm text-slate-700 items-start">
+                              <svg className="h-4 w-4 text-blue-500 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg>
+                              <span>{rec}</span>
+                           </li>
+                         ))}
+                       </ul>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Insights cards */}
+              {insights && (
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-amber-800 mb-1">
+                      Stockout correction
+                    </p>
+                    <p className="text-2xl font-bold text-amber-900">
+                      +{insights.lost_sales_correction.estimated_recovered_units} units
+                    </p>
+                    <p className="text-xs text-amber-700 mt-1">
+                      {insights.lost_sales_correction.headline}
+                    </p>
+                    <p className="text-xs text-amber-600 mt-0.5">
+                      {insights.lost_sales_correction.subtext}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-white p-4">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                      Constrained stores
+                    </p>
+                    <p className="text-2xl font-bold text-slate-900">
+                      {insights.under_covered_stores.count}
+                    </p>
+                    <p className="text-xs text-slate-500 mt-1">
+                      {insights.under_covered_stores.headline}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-white p-4">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                      Signal confidence
+                    </p>
+                    <div className="flex items-center gap-4 mt-2">
+                      <span className="text-sm">
+                        <span className="text-xl font-bold text-emerald-700">
+                          {insights.confidence_breakdown.high}
+                        </span>
+                        <span className="text-xs text-slate-500 ml-1">high</span>
+                      </span>
+                      <span className="text-sm">
+                        <span className="text-xl font-bold text-amber-600">
+                          {insights.confidence_breakdown.moderate}
+                        </span>
+                        <span className="text-xs text-slate-500 ml-1">moderate</span>
+                      </span>
+                      <span className="text-sm">
+                        <span className="text-xl font-bold text-red-500">
+                          {insights.confidence_breakdown.low}
+                        </span>
+                        <span className="text-xs text-slate-500 ml-1">low</span>
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {benchmark ? (
+                <div className="rounded-lg border border-slate-200 bg-white p-4">
+                  <div className="grid grid-cols-4 gap-3">
+                    <div className={`rounded-md border px-3 py-2 ${benchmark.acceptance.overall_pass ? "border-emerald-200 bg-emerald-50" : "border-amber-200 bg-amber-50"}`}>
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">MVP Gate</p>
+                      <p className={`mt-1 text-sm font-semibold ${benchmark.acceptance.overall_pass ? "text-emerald-700" : "text-amber-700"}`}>
+                        {benchmark.acceptance.overall_pass ? "Pass" : "Needs tuning"}
+                      </p>
+                    </div>
+                    <div className="rounded-md border border-slate-200 px-3 py-2">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Quality score</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">
+                        {benchmark.summary.quality_score.toFixed(1)} / 100
+                      </p>
+                    </div>
+                    <div className="rounded-md border border-slate-200 px-3 py-2">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Override rate</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">
+                        {(benchmark.summary.override_rate * 100).toFixed(1)}%
+                      </p>
+                    </div>
+                    <div className="rounded-md border border-slate-200 px-3 py-2">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Inventory utilization</p>
+                      <p className="mt-1 text-sm font-semibold text-slate-900">
+                        {(benchmark.summary.inventory_utilization_rate * 100).toFixed(1)}%
+                      </p>
+                    </div>
+                  </div>
+                  {benchmark.demand_source_mix.length > 0 ? (
+                    <p className="mt-3 text-xs text-slate-500">
+                      Demand signal mix:{" "}
+                      {benchmark.demand_source_mix
+                        .slice(0, 3)
+                        .map((item) => `${item.source} ${(item.share * 100).toFixed(0)}%`)
+                        .join(" · ")}
+                    </p>
+                  ) : null}
+                </div>
               ) : null}
             </div>
-          ) : null}
+          )}
 
-          {/* Insights cards */}
-          {insights && (
-            <div className="grid grid-cols-3 gap-3">
-              <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
-                <p className="text-xs font-semibold uppercase tracking-wide text-amber-800 mb-1">
-                  Stockout correction
-                </p>
-                <p className="text-2xl font-bold text-amber-900">
-                  +{insights.lost_sales_correction.estimated_recovered_units} units
-                </p>
-                <p className="text-xs text-amber-700 mt-1">
-                  {insights.lost_sales_correction.headline}
-                </p>
-                <p className="text-xs text-amber-600 mt-0.5">
-                  {insights.lost_sales_correction.subtext}
-                </p>
-              </div>
-              <div className="rounded-lg border border-slate-200 bg-white p-4">
-                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-1">
-                  Constrained stores
-                </p>
-                <p className="text-2xl font-bold text-slate-900">
-                  {insights.under_covered_stores.count}
-                </p>
-                <p className="text-xs text-slate-500 mt-1">
-                  {insights.under_covered_stores.headline}
-                </p>
-              </div>
-              <div className="rounded-lg border border-slate-200 bg-white p-4">
-                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-1">
-                  Signal confidence
-                </p>
-                <div className="flex items-center gap-4 mt-2">
-                  <span className="text-sm">
-                    <span className="text-xl font-bold text-emerald-700">
-                      {insights.confidence_breakdown.high}
-                    </span>
-                    <span className="text-xs text-slate-500 ml-1">high</span>
-                  </span>
-                  <span className="text-sm">
-                    <span className="text-xl font-bold text-amber-600">
-                      {insights.confidence_breakdown.moderate}
-                    </span>
-                    <span className="text-xs text-slate-500 ml-1">moderate</span>
-                  </span>
-                  <span className="text-sm">
-                    <span className="text-xl font-bold text-red-500">
-                      {insights.confidence_breakdown.low}
-                    </span>
-                    <span className="text-xs text-slate-500 ml-1">low</span>
-                  </span>
+          {activeTab === "lines" && (
+            <div className="space-y-4">
+              {allocationError ? (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+                  <p className="text-sm font-medium text-amber-900">Could not load allocation lines yet.</p>
+                  <p className="mt-1 text-xs text-amber-700">
+                    {allocationError instanceof Error
+                      ? allocationError.message
+                      : "The response is taking too long. Try loading a smaller page of lines."}
+                  </p>
+                </div>
+              ) : null}
+
+              {allocation?.lines_total != null && allocation.lines_total > (allocation.lines?.length ?? 0) ? (
+                <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
+                  <p className="text-xs text-slate-700">
+                    Showing {allocation.lines.length.toLocaleString()} of {allocation.lines_total.toLocaleString()} lines.
+                  </p>
+                  {allocation.lines_has_more ? (
+                    <button
+                      onClick={() => setLineLimit((prev) => prev + 500)}
+                      className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                    >
+                      Load 500 More
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+
+              <div className="grid grid-cols-12 gap-4">
+                <div className="col-span-8">
+                  <AllocationTable
+                    lines={allocation?.lines ?? []}
+                    selectedLineId={selectedLine?.id ?? null}
+                    quantities={quantities}
+                    onSelect={(line) => setSelectedLine(line)}
+                    onChangeQty={handleChangeQty}
+                    onCommitQty={handleCommitQty}
+                    onOverrideReason={handleOverrideReason}
+                    simulations={simulations}
+                  />
+                </div>
+                <div className="col-span-4">
+                  <ExplainabilityPanel
+                    line={selectedLine}
+                    skuName={selectedLine?.style_name ?? undefined}
+                    styleRiskGroup={selectedLine?.sku_style_risk_group ?? undefined}
+                  />
+                  {selectedLine ? (
+                    <>
+                      <hr className="my-3 border-slate-200" />
+                      <ScenarioSimulator line={selectedLine} />
+                    </>
+                  ) : null}
                 </div>
               </div>
             </div>
           )}
-
-          {benchmark ? (
-            <div className="rounded-lg border border-slate-200 bg-white p-4">
-              <div className="grid grid-cols-4 gap-3">
-                <div className={`rounded-md border px-3 py-2 ${benchmark.acceptance.overall_pass ? "border-emerald-200 bg-emerald-50" : "border-amber-200 bg-amber-50"}`}>
-                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">MVP Gate</p>
-                  <p className={`mt-1 text-sm font-semibold ${benchmark.acceptance.overall_pass ? "text-emerald-700" : "text-amber-700"}`}>
-                    {benchmark.acceptance.overall_pass ? "Pass" : "Needs tuning"}
-                  </p>
-                </div>
-                <div className="rounded-md border border-slate-200 px-3 py-2">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Quality score</p>
-                  <p className="mt-1 text-sm font-semibold text-slate-900">
-                    {benchmark.summary.quality_score.toFixed(1)} / 100
-                  </p>
-                </div>
-                <div className="rounded-md border border-slate-200 px-3 py-2">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Override rate</p>
-                  <p className="mt-1 text-sm font-semibold text-slate-900">
-                    {(benchmark.summary.override_rate * 100).toFixed(1)}%
-                  </p>
-                </div>
-                <div className="rounded-md border border-slate-200 px-3 py-2">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Inventory utilization</p>
-                  <p className="mt-1 text-sm font-semibold text-slate-900">
-                    {(benchmark.summary.inventory_utilization_rate * 100).toFixed(1)}%
-                  </p>
-                </div>
-              </div>
-              {benchmark.demand_source_mix.length > 0 ? (
-                <p className="mt-3 text-xs text-slate-500">
-                  Demand signal mix:{" "}
-                  {benchmark.demand_source_mix
-                    .slice(0, 3)
-                    .map((item) => `${item.source} ${(item.share * 100).toFixed(0)}%`)
-                    .join(" · ")}
-                </p>
-              ) : null}
-            </div>
-          ) : null}
-
-          <div className="grid grid-cols-12 gap-4">
-          <div className="col-span-8">
-            <AllocationTable
-              lines={allocation?.lines ?? []}
-              selectedLineId={selectedLine?.id ?? null}
-              quantities={quantities}
-              onSelect={(line) => setSelectedLine(line)}
-              onChangeQty={handleChangeQty}
-              onOverrideReason={handleOverrideReason}
-              simulations={simulations}
-            />
-          </div>
-          <div className="col-span-4">
-            <ExplainabilityPanel
-              line={selectedLine}
-              skuName={selectedLine?.style_name ?? undefined}
-              styleRiskGroup={selectedLine?.sku_style_risk_group ?? undefined}
-            />
-            {selectedLine ? (
-              <>
-                <hr className="my-3 border-slate-200" />
-                <ScenarioSimulator line={selectedLine} />
-              </>
-            ) : null}
-          </div>
-        </div>
         </div>
       )}
     </div>

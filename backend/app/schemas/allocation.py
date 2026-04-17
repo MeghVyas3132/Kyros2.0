@@ -25,6 +25,9 @@ class AllocationSessionOut(BaseModel):
     total_skus: int
     total_units_recommended: int
     total_units_approved: int
+    health_score: int | None = None
+    health_report: dict | None = None
+    decision: dict | None = None
     failure_reason: str | None
     approved_by: UUID | None
     approved_at: datetime | None
