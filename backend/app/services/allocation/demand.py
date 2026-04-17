@@ -437,13 +437,17 @@ async def calculate_store_demand_details(
         source = "store_historical"
         base_ros = float(store_ros)
         # Note: Stockout correction is category-level, kept for consistency
+        pre_rows = None
+        if preloaded_stockout_signals is not None:
+            pre_rows = preloaded_stockout_signals.get((store.id, normalized_category), [])
+
         corrected_ros, stockout_week, lost_sales_estimate, sample_size = await _calculate_stockout_correction(
             db=db,
             brand_id=brand_id,
             store_id=store.id,
             category=category,
             season_id=previous_season_id,
-            preloaded_rows=(preloaded_stockout_signals or {}).get((store.id, normalized_category)),
+            preloaded_rows=pre_rows,
         )
         if corrected_ros is not None and corrected_ros > base_ros:
             base_ros = corrected_ros
