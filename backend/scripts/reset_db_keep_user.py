@@ -20,7 +20,6 @@ async def reset_db():
             "skus",
             "stores",
             "clusters",
-            "seasons",
             "buy_plan_files",
             "size_guides",
             "sales_data",

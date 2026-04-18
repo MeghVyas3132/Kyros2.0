@@ -232,6 +232,7 @@ class AllocationEngine:
         ros_by_attribute = await self._load_ros_by_attribute(brand_id, db)
         await self._preload_display_capacity(brand_id, db)
         preloaded_guides, preloaded_ratios = await preload_size_data(brand_id, db)
+        self._size_guide_cache_by_category = preloaded_guides
         logger.info("Preloaded %d size-guide categories and %d store-level size ratio entries",
                     len(preloaded_guides), len(preloaded_ratios.store_ratios))
         style_dna_cache = {}
@@ -1266,13 +1267,20 @@ class AllocationEngine:
         if not sku.size:
             return allocation
 
-        size_guide = await db.scalar(
-            select(SizeGuide).where(
-                SizeGuide.brand_id == brand_id,
-                SizeGuide.product_category == sku.category,
-                SizeGuide.size == sku.size,
+        cached_guides = getattr(self, "_size_guide_cache_by_category", None)
+        if cached_guides is not None:
+            norm_cat = " ".join(str(sku.category or "").strip().lower().split())
+            guides = cached_guides.get(norm_cat, [])
+            # Must handle case-insensitive size match if needed, but strict is fine for DB matching logic 
+            size_guide = next((g for g in guides if str(g.size).strip().upper() == str(sku.size).strip().upper()), None)
+        else:
+            size_guide = await db.scalar(
+                select(SizeGuide).where(
+                    SizeGuide.brand_id == brand_id,
+                    SizeGuide.product_category == sku.category,
+                    SizeGuide.size == sku.size,
+                )
             )
-        )
         if size_guide is None:
             return allocation
         if size_guide.min_max_ratio <= 0:
