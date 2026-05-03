@@ -93,6 +93,58 @@ def normalize_reasoning(raw: dict[str, Any] | None) -> dict[str, Any]:
 	return normalized
 
 
+def generate_human_reasoning(normalized: dict) -> str:
+    """
+    Generates a 2-3 sentence plain-English explanation of an allocation recommendation.
+    Takes the output of normalize_reasoning() as input.
+    """
+    store_ros = normalized.get("weekly_ros", 0)
+    ros_source = normalized.get("ros_source", "minimum_presentation")
+    store_grade = normalized.get("store_grade", "C")
+    cover_target = normalized.get("cover_target_weeks", 0)
+    weeks_cover = normalized.get("weeks_cover_at_recommended", 0)
+    is_stockout_corrected = normalized.get("is_stockout_corrected", False) or normalized.get("stockout_correction_applied", False)
+    scale_factor = normalized.get("scale_factor", 1.0)
+
+    # Demand source mapping
+    source_label_map = {
+        "store_historical": "store sales history",
+        "STORE_HIST": "store sales history",
+        "cluster_average": "cluster average",
+        "CLUSTER": "cluster average",
+        "grade_average": "grade average",
+        "GRADE": "grade average",
+        "style_dna_analogue": "a similar style",
+        "STYLE_DNA": "a similar style",
+        "minimum_presentation": "minimum display requirement",
+        "FLOOR": "minimum display requirement",
+    }
+    source_label = source_label_map.get(str(ros_source), "available history")
+
+    # Sentence 1: demand basis
+    if store_ros > 0:
+        sentence1 = f"Allocated based on {store_ros:.1f} units/week from {source_label} (grade {store_grade})."
+    else:
+        sentence1 = f"Allocated at minimum display quantity — no sales history available for this store."
+
+    # Sentence 2: stockout correction note
+    if is_stockout_corrected:
+        sentence2 = "Demand was adjusted upward because this style ran out of stock mid-season — recorded sales understated true demand."
+    elif scale_factor < 0.99:
+        sentence2 = f"Supply was limited; quantity scaled to {scale_factor*100:.0f}% of full demand to distribute available stock across stores."
+    else:
+        sentence2 = ""
+
+    # Sentence 3: cover outcome
+    if cover_target > 0:
+        sentence3 = f"This gives {weeks_cover:.1f} weeks of cover (target: {cover_target} weeks)."
+    else:
+        sentence3 = ""
+
+    parts = [s for s in [sentence1, sentence2, sentence3] if s]
+    return " ".join(parts)
+
+
 def normalize_projections(raw: dict[str, Any] | None) -> dict[str, Any]:
 	payload = raw if isinstance(raw, dict) else {}
 	return {

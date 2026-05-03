@@ -1,11 +1,13 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 import useSWR from "swr";
 
 import { SmartUploadCard } from "@/components/ingestion/SmartUploadCard";
 import { UploadDropzone } from "@/components/ingestion/UploadDropzone";
 import { apiRequest } from "@/lib/api";
+import { useSeasons } from "@/lib/hooks/useSeasons";
 
 const UPLOAD_CATEGORIES = [
   {
@@ -78,12 +80,32 @@ const STATUS_MAP: Record<string, { label: string; color: string }> = {
   PENDING: { label: "Queued", color: "text-slate-700 bg-slate-50" },
 };
 
+type DataQualityCheck = {
+  key: string;
+  status: "GREEN" | "AMBER" | "RED";
+  title: string;
+  detail: string;
+};
+type DataQualityResponse = {
+  readiness: "GREEN" | "AMBER" | "RED";
+  readiness_message: string;
+  checks: DataQualityCheck[];
+  facts: Record<string, unknown>;
+};
+
 export default function IngestionPage() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [activeType, setActiveType] = useState<UploadType | null>(null);
   const { data: uploads, mutate } = useSWR<Array<Record<string, unknown>>>(
     "/api/v1/ingestion/uploads",
     (path: string) => apiRequest<Array<Record<string, unknown>>>(path)
+  );
+  const { data: seasons, isLoading: seasonsLoading } = useSeasons();
+  const noSeasonYet = !seasonsLoading && Array.isArray(seasons) && seasons.length === 0;
+  const { data: dataQuality } = useSWR<DataQualityResponse>(
+    !noSeasonYet ? "/api/v1/ingestion/data-quality" : null,
+    (path: string) => apiRequest<DataQualityResponse>(path),
+    { refreshInterval: 8000 }
   );
 
   return (
@@ -95,6 +117,86 @@ export default function IngestionPage() {
           Upload your planning files. Kyros will automatically detect the content and process it.
         </p>
       </div>
+
+      {/* First-season gate: buy-file ingest needs a season to attach the
+          buy plan to. Block the upload UI until the planner has set one up. */}
+      {noSeasonYet ? (
+        <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">
+          <p className="font-semibold">Set up your season first</p>
+          <p className="mt-1 text-amber-800">
+            Buy plans, OTB, and allocations are scoped to a season. Create one
+            before uploading data — otherwise the buy file upload will fail.
+          </p>
+          <Link
+            href="/setup/seasons?first=1"
+            className="mt-3 inline-flex items-center gap-1 rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700"
+          >
+            Go to Setup → Seasons
+          </Link>
+        </div>
+      ) : null}
+
+      {/* Pre-flight readiness — surfaces input quality BEFORE allocation runs.
+          The point: catch garbage data while the planner is still on this
+          screen, not after the engine spent 3 minutes producing a bad plan. */}
+      {dataQuality && (
+        <div
+          className={`rounded-lg border p-4 text-sm ${
+            dataQuality.readiness === "RED"
+              ? "border-red-300 bg-red-50 text-red-900"
+              : dataQuality.readiness === "AMBER"
+              ? "border-amber-300 bg-amber-50 text-amber-900"
+              : "border-emerald-300 bg-emerald-50 text-emerald-900"
+          }`}
+        >
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <span
+                  className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs font-bold text-white ${
+                    dataQuality.readiness === "RED"
+                      ? "bg-red-500"
+                      : dataQuality.readiness === "AMBER"
+                      ? "bg-amber-500"
+                      : "bg-emerald-500"
+                  }`}
+                >
+                  {dataQuality.readiness === "RED" ? "!" : dataQuality.readiness === "AMBER" ? "•" : "✓"}
+                </span>
+                <p className="font-semibold">
+                  Data readiness: {dataQuality.readiness}
+                </p>
+              </div>
+              <p className="mt-1 text-sm">{dataQuality.readiness_message}</p>
+            </div>
+          </div>
+
+          <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {dataQuality.checks.map((check) => (
+              <div
+                key={check.key}
+                className="rounded-md border border-white/60 bg-white/70 p-3"
+              >
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`inline-block h-2 w-2 rounded-full ${
+                      check.status === "RED"
+                        ? "bg-red-500"
+                        : check.status === "AMBER"
+                        ? "bg-amber-500"
+                        : "bg-emerald-500"
+                    }`}
+                  />
+                  <p className="text-sm font-semibold text-slate-900">
+                    {check.title}
+                  </p>
+                </div>
+                <p className="mt-1 text-xs text-slate-700">{check.detail}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Smart Upload — Primary Action */}
       <SmartUploadCard onUploaded={() => void mutate()} />

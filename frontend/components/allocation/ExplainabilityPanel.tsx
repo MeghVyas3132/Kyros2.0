@@ -1,5 +1,8 @@
 "use client";
 
+import { useEffect, useRef, useState } from "react";
+
+import { apiRequest } from "@/lib/api";
 import { AllocationLine, AllocationReasoning } from "@/types";
 
 interface Props {
@@ -8,9 +11,54 @@ interface Props {
   styleRiskGroup?: string;
 }
 
+interface NarrationResponse {
+  line_id: string;
+  narration: string;
+  fallback: string;
+}
+
 const SIZE_ORDER = ["XS", "S", "M", "L", "XL", "XXL", "2XL", "3XL", "28", "30", "32", "34", "36", "38", "40", "42"];
 
 export function ExplainabilityPanel({ line, skuName, styleRiskGroup }: Props) {
+  const [llmNarration, setLlmNarration] = useState<string | null>(null);
+  const [llmLoading, setLlmLoading] = useState(false);
+  const requestedFor = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!line?.id) {
+      setLlmNarration(null);
+      return;
+    }
+    if (requestedFor.current === line.id) return;
+    requestedFor.current = line.id;
+    setLlmLoading(true);
+    setLlmNarration(null);
+
+    let cancelled = false;
+    void apiRequest<NarrationResponse>(
+      `/api/v1/allocation/lines/${line.id}/narration`
+    )
+      .then((data) => {
+        if (cancelled) return;
+        // Only swap in the LLM version if it differs meaningfully from the
+        // deterministic fallback — otherwise the existing line.ai_reasoning_human
+        // already says the same thing.
+        if (data.narration && data.narration !== data.fallback) {
+          setLlmNarration(data.narration);
+        }
+      })
+      .catch(() => {
+        // Silent — the deterministic template is already shown.
+      })
+      .finally(() => {
+        if (!cancelled) setLlmLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [line?.id]);
+
   if (!line) {
     return (
       <div className="p-4 text-sm text-slate-500">
@@ -23,6 +71,8 @@ export function ExplainabilityPanel({ line, skuName, styleRiskGroup }: Props) {
   if (!r) {
     return <div className="p-4 text-sm text-slate-500">No reasoning data available for this line.</div>;
   }
+
+  const narrationText = llmNarration ?? line.ai_reasoning_human ?? null;
 
   const reasoning = r;
   const ros = reasoning?.weekly_ros ?? reasoning?.raw_weekly_ros ?? 0;
@@ -49,6 +99,34 @@ export function ExplainabilityPanel({ line, skuName, styleRiskGroup }: Props) {
 
   return (
     <div className="space-y-5 p-4 text-sm">
+      {narrationText && (
+        <div className="mb-4 rounded-lg bg-slate-50 border border-slate-200 px-4 py-3">
+          <p className="text-sm text-slate-700 leading-relaxed">{narrationText}</p>
+          <div className="mt-1.5 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-slate-400">
+            {llmNarration ? (
+              <>
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                AI-narrated
+              </>
+            ) : llmLoading ? (
+              <>
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-slate-300 animate-pulse" />
+                Refining…
+              </>
+            ) : (
+              <>
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-slate-300" />
+                Template
+              </>
+            )}
+          </div>
+        </div>
+      )}
+      <details className="mt-0" open>
+        <summary className="cursor-pointer text-xs text-slate-500 hover:text-slate-700 select-none mb-3">
+          Show full reasoning details
+        </summary>
+        <div className="space-y-5">
       <div className="grid grid-cols-2 gap-3 rounded-lg border bg-slate-50/70 p-4">
         <div>
           <p className="mb-1 text-xs uppercase tracking-wide text-slate-500">Target Cover</p>
@@ -156,6 +234,61 @@ export function ExplainabilityPanel({ line, skuName, styleRiskGroup }: Props) {
         </div>
       )}
 
+      {/* Style-analogue match — surfaced when Tier 1.5 fired. Shows the
+          actual prior styles whose sales drove the inferred demand, so the
+          planner can audit the call line by line. */}
+      {r.style_analogue_match && Array.isArray(r.style_analogue_match.matched_style_codes) && (
+        <div className="border-t pt-4 space-y-2">
+          <div className="flex items-center gap-2">
+            <p className="text-xs uppercase tracking-wide text-slate-500">
+              Style analogue
+            </p>
+            {r.style_analogue_match.confidence_tier ? (
+              <span
+                className={`rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase ${
+                  r.style_analogue_match.confidence_tier === "HIGH"
+                    ? "bg-emerald-100 text-emerald-800"
+                    : "bg-amber-100 text-amber-800"
+                }`}
+              >
+                {String(r.style_analogue_match.confidence_tier).toLowerCase()}
+              </span>
+            ) : null}
+            {r.style_analogue_match.best_score != null ? (
+              <span className="text-[11px] text-slate-500">
+                best match {Math.round(Number(r.style_analogue_match.best_score) * 100)}%
+              </span>
+            ) : null}
+          </div>
+          <p className="text-sm text-slate-700">
+            {r.style_analogue_match.explanation}
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {r.style_analogue_match.matched_style_codes
+              .slice(0, 5)
+              .map((code: string, idx: number) => {
+                const score = Array.isArray(r.style_analogue_match!.scores)
+                  ? r.style_analogue_match!.scores[idx]
+                  : undefined;
+                return (
+                  <span
+                    key={code}
+                    className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-mono text-slate-800"
+                    title={score != null ? `score ${Number(score).toFixed(2)}` : undefined}
+                  >
+                    {code}
+                    {score != null ? (
+                      <span className="text-slate-400">
+                        {Math.round(Number(score) * 100)}%
+                      </span>
+                    ) : null}
+                  </span>
+                );
+              })}
+          </div>
+        </div>
+      )}
+
       {/* Style DNA match — show when populated */}
       {r.style_dna_match && (
         <div className="border-t pt-4 space-y-1">
@@ -193,6 +326,7 @@ export function ExplainabilityPanel({ line, skuName, styleRiskGroup }: Props) {
       {r.category_affinity == null &&
        r.fabric_affinity == null &&
        !r.style_dna_match &&
+       !r.style_analogue_match &&
        r.cannibalization_factor == null && (
         <div className="border-t pt-4 opacity-40">
           <p className="text-xs text-slate-500">
@@ -200,6 +334,8 @@ export function ExplainabilityPanel({ line, skuName, styleRiskGroup }: Props) {
           </p>
         </div>
       )}
+        </div>
+      </details>
     </div>
   );
 }

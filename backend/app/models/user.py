@@ -9,6 +9,7 @@ from app.database import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
 class UserRole(str, enum.Enum):
+    SUPER_ADMIN = "SUPER_ADMIN"
     ADMIN = "ADMIN"
     PLANNER = "PLANNER"
     VIEWER = "VIEWER"

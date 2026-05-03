@@ -2,10 +2,12 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 import { apiRequest } from "@/lib/api";
 import { useAlertCount, useAlerts } from "@/lib/hooks/useAlerts";
 import { useGRNs } from "@/lib/hooks/useGrns";
+import { useActiveSeasonId, useSeasons, useWorkflowState } from "@/lib/hooks/useSeasons";
 
 interface AllocationSessionLite {
   id: string;
@@ -33,10 +35,24 @@ interface AllocationInsights {
 }
 
 export default function DashboardPage() {
+  const router = useRouter();
   const { data: alerts } = useAlertCount();
   const { data: alertItems } = useAlerts();
   const { data: grns } = useGRNs();
+  const { data: seasons, isLoading: seasonsLoading } = useSeasons();
+  const activeSeasonId = useActiveSeasonId();
+  const { data: workflow } = useWorkflowState(activeSeasonId);
   const [insights, setInsights] = useState<AllocationInsights | null>(null);
+
+  // First-season gate: if a fresh tenant has zero seasons, the planning
+  // workflow can't start (buy-file ingest, allocation, OTB all require a
+  // season). Bounce them to /setup/seasons with a banner so the very first
+  // thing they do after login is define their season.
+  useEffect(() => {
+    if (!seasonsLoading && Array.isArray(seasons) && seasons.length === 0) {
+      router.replace("/setup/seasons?first=1");
+    }
+  }, [seasons, seasonsLoading, router]);
 
   useEffect(() => {
     let cancelled = false;
@@ -79,6 +95,40 @@ export default function DashboardPage() {
           Here&apos;s your daily planning overview.
         </p>
       </div>
+
+      {/* What to do next */}
+      {workflow && (
+        <div className="rounded-xl border border-slate-200 bg-white px-5 py-4">
+          <p className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
+            {workflow.season_name} · Next step
+          </p>
+          {workflow.next_step ? (
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">
+                  Step {workflow.next_step.step}: {workflow.next_step.label}
+                </p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {workflow.steps.find((s) => s.step === workflow.next_step!.step)?.description}
+                </p>
+              </div>
+              <Link
+                href={workflow.next_step.action_url}
+                className="shrink-0 rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700 transition-colors"
+              >
+                {workflow.next_step.action_label}
+              </Link>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 text-emerald-700">
+              <svg className="h-5 w-5" fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+              </svg>
+              <span className="text-sm font-medium">Season complete — ready for in-season tracking</span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Getting Started Guide (shown when no data) */}
       {!hasData ? (

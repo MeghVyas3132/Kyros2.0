@@ -20,15 +20,28 @@ router = APIRouter(prefix="/api/v1/skus", tags=["skus"])
 async def list_skus(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
-    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
+    search: str | None = Query(default=None, max_length=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> dict:
     offset = (page - 1) * page_size
-    total = await db.scalar(select(func.count(SKU.id)).where(SKU.brand_id == current_user.brand_id))
+    base = select(SKU).where(SKU.brand_id == current_user.brand_id)
+    count_base = select(func.count(SKU.id)).where(SKU.brand_id == current_user.brand_id)
+
+    if search:
+        pattern = f"%{search.strip()}%"
+        cond = (
+            SKU.sku_code.ilike(pattern)
+            | SKU.style_code.ilike(pattern)
+            | SKU.style_name.ilike(pattern)
+        )
+        base = base.where(cond)
+        count_base = count_base.where(cond)
+
+    total = await db.scalar(count_base)
     rows = (
         await db.execute(
-            select(SKU)
-            .where(SKU.brand_id == current_user.brand_id)
-            .order_by(SKU.style_name.asc(), SKU.sku_code.asc())
+            base.order_by(SKU.style_name.asc(), SKU.sku_code.asc())
             .limit(page_size)
             .offset(offset)
         )

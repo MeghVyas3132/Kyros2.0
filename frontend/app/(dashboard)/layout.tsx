@@ -6,10 +6,12 @@ import { useEffect, useState } from "react";
 
 import { useAlertCount } from "@/lib/hooks/useAlerts";
 import { clearAuthTokens, getToken } from "@/lib/api";
+import { WorkflowShell } from "@/components/shared/WorkflowShell";
 
 const NAV_ITEMS = [
   { href: "/dashboard", label: "Home", icon: "dashboard" },
   { href: "/ingestion", label: "Upload Data", icon: "upload" },
+  { href: "/buy-plan", label: "Buy Plans", icon: "buyplan" },
   { href: "/grn", label: "Stock Received", icon: "package" },
   { href: "/allocation", label: "Allocations", icon: "allocation" },
   { href: "/performance/styles", label: "Style Health", icon: "chart" },
@@ -17,6 +19,11 @@ const NAV_ITEMS = [
 ];
 
 const ICON_SVG: Record<string, React.ReactNode> = {
+  buyplan: (
+    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+    </svg>
+  ),
   dashboard: (
     <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
@@ -54,6 +61,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   const pathname = usePathname();
   const { data: alertCount } = useAlertCount();
   const [userName, setUserName] = useState<string>("");
+  const [userRole, setUserRole] = useState<string>("");
 
   useEffect(() => {
     const token = getToken();
@@ -64,10 +72,17 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     try {
       const user = JSON.parse(localStorage.getItem("kyros_user") || "{}");
       setUserName(user.full_name || "Planner");
+      setUserRole(user.role || "");
+      // SUPER_ADMIN should not be on tenant pages. Bounce them to the
+      // signup console unless they're already there.
+      if (user.role === "SUPER_ADMIN" && !pathname.startsWith("/super-admin")) {
+        router.replace("/super-admin");
+      }
     } catch {
       setUserName("Planner");
+      setUserRole("");
     }
-  }, [router]);
+  }, [router, pathname]);
 
   const handleLogout = () => {
     clearAuthTokens();
@@ -86,7 +101,16 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
           </div>
 
           <nav className="flex items-center gap-1">
-            {NAV_ITEMS.map((item) => {
+            {(userRole === "SUPER_ADMIN"
+              ? [
+                  // SUPER_ADMIN is platform-only — tenant nav items are
+                  // hidden because the underlying APIs reject them with
+                  // SUPER_ADMIN_TENANT_BLOCKED. They get one entry: the
+                  // signup-review console.
+                  { href: "/super-admin", label: "Super Admin", icon: "dashboard" },
+                ]
+              : NAV_ITEMS
+            ).map((item) => {
               const isActive =
                 pathname === item.href ||
                 (item.href !== "/dashboard" && pathname.startsWith(item.href));
@@ -131,6 +155,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
         </div>
       </header>
 
+      <WorkflowShell />
       <main className="mx-auto max-w-[1440px] px-6 py-6">{children}</main>
     </div>
   );

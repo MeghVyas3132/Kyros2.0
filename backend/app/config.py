@@ -35,6 +35,16 @@ class Settings(BaseSettings):
     celery_broker_url: str = Field(default="redis://localhost:6379/1", alias="CELERY_BROKER_URL")
     celery_result_backend: str = Field(default="redis://localhost:6379/2", alias="CELERY_RESULT_BACKEND")
 
+    # ─── LLM (Groq) ───────────────────────────────────────────────────────────
+    # Comma-separated list of Groq API keys. Rotated round-robin per request to
+    # spread rate-limit pressure. Empty string disables LLM narration entirely.
+    groq_api_keys: str = Field(default="", alias="GROQ_API_KEYS")
+    groq_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_MODEL")
+    groq_base_url: str = Field(default="https://api.groq.com/openai/v1", alias="GROQ_BASE_URL")
+    groq_timeout_seconds: float = Field(default=8.0, alias="GROQ_TIMEOUT_SECONDS")
+    groq_max_tokens: int = Field(default=200, alias="GROQ_MAX_TOKENS")
+    llm_enabled: bool = Field(default=True, alias="LLM_ENABLED")
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

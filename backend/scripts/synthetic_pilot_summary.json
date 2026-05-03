@@ -1,0 +1,74 @@
+{
+  "started_at": "2026-04-27 18:51:05",
+  "stages": {
+    "grades": {
+      "grade_rows_upserted": 4788,
+      "stores": 162,
+      "grade_records": 4788
+    },
+    "size_guide": {
+      "size_rows_upserted": 80,
+      "size_guide_records": 80
+    },
+    "buy": {
+      "buy_lines_upserted": 3536,
+      "sku_count": 3536,
+      "buy_plan_lines": 3536
+    },
+    "sales": {
+      "sales_rows_upserted": 75896,
+      "distinct_weeks": 8,
+      "total_units": 108865,
+      "sales_records": 75896,
+      "skipped_store_rows": 0,
+      "skipped_sku_rows": 0,
+      "zero_qty_rows": 16168,
+      "failed_batches_rows": 0,
+      "synthetic_weeking_rows": 63471,
+      "skipped_missing_date": 0
+    },
+    "capacity": {
+      "rows": 1258
+    },
+    "snapshot": {
+      "rows": 41762
+    },
+    "store_profiles": {
+      "profiles": 184
+    },
+    "grn": {
+      "styles": 25,
+      "skus": 200,
+      "units": 24486
+    },
+    "allocation": {
+      "session_id": "57694141-23a0-4e50-ad75-e5a3f341d2c4",
+      "runtime_seconds": 185.74
+    }
+  },
+  "brand_id": "b8c71767-c23c-4833-bcb5-1079c5ec8346",
+  "kpis": {
+    "lines_total": 36800,
+    "lines_with_positive_qty": 13423,
+    "distinct_stores_with_alloc": 184,
+    "distinct_skus_with_alloc": 145,
+    "distinct_styles_with_alloc": 25,
+    "units_received": 24486,
+    "units_allocated": 15520,
+    "alloc_received_ratio": 63.4,
+    "top10_pct_store_share": 23.7,
+    "capacity_violations_units": 0,
+    "capacity_violations_styles": 0,
+    "reasoning_coverage_pct": 100.0,
+    "confidence_distribution": {
+      "LOW": 13423
+    },
+    "demand_tier_distribution": {
+      "minimum_presentation": 9982,
+      "style_dna_analogue": 3441
+    },
+    "weeks_cover_p50": 6.9,
+    "weeks_cover_p90": 11.0
+  },
+  "total_runtime_seconds": 311.39
+}

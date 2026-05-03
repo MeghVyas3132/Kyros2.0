@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
@@ -97,7 +98,10 @@ export default function LoginPage() {
       });
       setAuthTokens(response.access_token, response.refresh_token);
       localStorage.setItem("kyros_user", JSON.stringify(response.user));
-      router.push("/dashboard");
+      // SUPER_ADMIN lands on the platform-onboarding console; tenant users
+      // go to the planning dashboard.
+      const next = response.user.role === "SUPER_ADMIN" ? "/super-admin" : "/dashboard";
+      router.push(next);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
@@ -182,6 +186,13 @@ export default function LoginPage() {
           {loading ? "Signing in..." : "Sign In"}
         </Button>
       </form>
+
+      <div className="mt-4 text-center text-sm text-slate-600">
+        New to Kyros?{" "}
+        <Link href="/signup" className="font-medium text-blue-600 hover:underline">
+          Request access
+        </Link>
+      </div>
     </div>
   );
 }

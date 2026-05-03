@@ -9,8 +9,12 @@ from app.database import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
 class SeasonStatus(str, enum.Enum):
+    DRAFT = "DRAFT"
     PLANNING = "PLANNING"
-    ACTIVE = "ACTIVE"
+    BUYING = "BUYING"
+    RECEIVING = "RECEIVING"
+    ALLOCATING = "ALLOCATING"
+    IN_SEASON = "IN_SEASON"
     CLOSED = "CLOSED"
 
 

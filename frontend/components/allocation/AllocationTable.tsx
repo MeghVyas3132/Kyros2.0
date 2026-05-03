@@ -3,8 +3,12 @@
 import { useCallback, useState } from "react";
 
 import { StatusBadge } from "@/components/shared/StatusBadge";
-import { AllocationLine } from "@/types";
-import { SimulationResult } from "@/types";
+import {
+  AllocationLine,
+  OVERRIDE_REASON_LABELS,
+  OverrideReasonCode,
+  SimulationResult,
+} from "@/types";
 
 interface Props {
   lines: AllocationLine[];
@@ -14,16 +18,13 @@ interface Props {
   onSelect: (line: AllocationLine) => void;
   onChangeQty: (line: AllocationLine, qty: number) => void;
   onCommitQty?: (line: AllocationLine, qty: number) => void;
-  onOverrideReason: (line: AllocationLine, reason: string) => void;
+  onOverrideReason: (line: AllocationLine, code: OverrideReasonCode) => void;
 }
 
-const OVERRIDE_REASONS = [
-  "STORE_REQUEST",
-  "VENDOR_CONSTRAINT",
-  "LOCAL_EVENT",
-  "GUT_FEEL",
-  "OTHER",
-];
+const OVERRIDE_REASON_ENTRIES = Object.entries(OVERRIDE_REASON_LABELS) as [
+  OverrideReasonCode,
+  string
+][];
 
 export function AllocationTable({
   lines,
@@ -131,13 +132,15 @@ export function AllocationTable({
                   {overridden ? (
                     <select
                       className="mt-1 block w-full rounded-md border border-slate-300 bg-slate-50 px-2 py-1 text-xs text-slate-800 outline-none focus:border-slate-600"
-                      value={line.override_reason ?? "STORE_REQUEST"}
+                      value={(line.override_reason_code ?? "OTHER") as OverrideReasonCode}
                       onClick={(event) => event.stopPropagation()}
-                      onChange={(event) => onOverrideReason(line, event.target.value)}
+                      onChange={(event) =>
+                        onOverrideReason(line, event.target.value as OverrideReasonCode)
+                      }
                     >
-                      {OVERRIDE_REASONS.map((reason) => (
-                        <option key={reason} value={reason}>
-                          {reason}
+                      {OVERRIDE_REASON_ENTRIES.map(([code, label]) => (
+                        <option key={code} value={code}>
+                          {label}
                         </option>
                       ))}
                     </select>

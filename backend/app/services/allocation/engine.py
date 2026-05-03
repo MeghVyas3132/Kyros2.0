@@ -7,6 +7,7 @@ from uuid import UUID
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import (
     AllocationLine,
@@ -37,6 +38,7 @@ from app.services.allocation.constants import (
     GRADE_SCORES,
     MINIMUM_ALLOCATION_QTY,
 )
+from app.services.allocation.health import AllocationHealthAnalyzer
 from app.services.allocation.demand import (
     DemandSignal,
     TrueDemandResult,
@@ -226,6 +228,49 @@ class AllocationEngine:
         preloaded_stockout_signals = await preload_stockout_signals(
             db=db, brand_id=brand_id, season_id=previous_season_id
         )
+
+        # Category × price-band bridge: lets the demand resolver fall through
+        # to "what this store sells per week in this category × price-band"
+        # when the SKU itself has no history. Without this, brand-new SS26
+        # codes resolve to minimum_presentation and the engine refuses to
+        # ship — which is the exact pathological case we're fixing.
+        from app.services.allocation.category_bridge import CategoryBridgeCache
+
+        category_bridge = CategoryBridgeCache()
+        try:
+            bridge_loaded = await category_bridge.load(db, brand_id)
+            logger.info(
+                "Category bridge loaded for brand=%s rows=%d",
+                brand_id,
+                bridge_loaded,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Category bridge load failed (non-blocking): %s", exc)
+            category_bridge = CategoryBridgeCache()  # empty cache → no-op
+
+        # Style-analogue index: per-style semantic matching against prior
+        # season SKUs. Sits ABOVE the category bridge in the cascade; for
+        # cold-start brands this is now the first place a new SS26 style
+        # finds defensible per-store demand. Failure modes (no candidates,
+        # missing attributes) are non-fatal — the cascade still runs.
+        from app.services.allocation.style_analogue import StyleAnalogueIndex
+
+        style_analogue_index = StyleAnalogueIndex()
+        try:
+            analogues_loaded = await style_analogue_index.load(db, brand_id)
+            logger.info(
+                "Style-analogue index loaded for brand=%s candidates=%d",
+                brand_id,
+                analogues_loaded,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Style-analogue index load failed (non-blocking): %s", exc)
+            style_analogue_index = StyleAnalogueIndex()
+
+        health_analyzer = AllocationHealthAnalyzer(session.id, brand_id, db)
+        season_context = await health_analyzer.get_context()
+        is_cold_start = bool(season_context.get("is_cold_start", False))
+
         brand_settings = await self._load_brand_settings(brand_id, db)
         store_profile_map = await load_store_profile_map(brand_id, db)
         inventory = await self._load_latest_inventory(brand_id, db)
@@ -361,6 +406,8 @@ class AllocationEngine:
                         previous_season_id=previous_season_id,
                         preloaded_stockout_signals=preloaded_stockout_signals,
                         style_dna_cache=style_dna_cache,
+                        category_bridge=category_bridge,
+                        style_analogue=style_analogue_index,
                     )
                 )
 
@@ -406,11 +453,66 @@ class AllocationEngine:
             if total_raw_demand <= 0:
                 continue
 
+            allocation_mode = "demand_led"
+            if is_cold_start:
+                allocation_mode = "supply_led"
+                opening_order_pct = float(brand_settings.get("allocation", {}).get("opening_order_pct", 0.65))
+                supply_target = max(1, int(style_available_units * opening_order_pct))
+                
+                # Inflate expected depth to survive downstream Grade A+ MVA (1.5x) and Cannibalization (0.65x)
+                effective_mva = max(1, int(min_presentation_qty * 1.0))
+                viable_store_count = max(1, supply_target // effective_mva)
+                
+                if viable_store_count < len(store_demands):
+                    ranked_viable = sorted(
+                        store_demands.keys(), 
+                        key=lambda sid: eligible_scores[sid].score if sid in eligible_scores else 0.0, 
+                        reverse=True
+                    )[:viable_store_count]
+                    store_demands = {sid: store_demands[sid] for sid in ranked_viable}
+                    total_raw_demand = sum(store_demands.values())
+                
+                if total_raw_demand > 0:
+                    scaled_demands: dict[UUID, int] = {}
+                    for store_id, qty in store_demands.items():
+                        scaled_demands[store_id] = max(0, round((qty / total_raw_demand) * supply_target))
+                    
+                    # Fix rounding residuals
+                    current_total = sum(scaled_demands.values())
+                    diff = supply_target - current_total
+                    if diff != 0:
+                        if diff > 0:
+                            ranked = sorted(
+                                scaled_demands.keys(), 
+                                key=lambda sid: (eligible_scores[sid].score, sid), 
+                                reverse=True
+                            )
+                            idx = 0
+                            while diff > 0 and ranked:
+                                scaled_demands[ranked[idx % len(ranked)]] += 1
+                                diff -= 1
+                                idx += 1
+                        else:
+                            removable = abs(diff)
+                            ranked = sorted(
+                                scaled_demands.keys(), 
+                                key=lambda sid: (eligible_scores[sid].score, sid)
+                            )
+                            idx = 0
+                            while removable > 0 and ranked:
+                                store_id = ranked[idx % len(ranked)]
+                                if scaled_demands[store_id] > 0:
+                                    scaled_demands[store_id] -= 1
+                                    removable -= 1
+                                idx += 1
+                    store_demands = scaled_demands
+
             store_demands, cannibalization_meta = self._apply_story_cannibalization(
                 sku=sku,
                 allocations=store_demands,
                 existing_line_map=existing_line_map,
                 sku_map=sku_map,
+                allocation_mode=allocation_mode,
             )
 
             # --- Cap at STYLE level (not per-size) ---
@@ -440,7 +542,6 @@ class AllocationEngine:
             final_allocations = guardrail_result.adjustments
 
             final_allocations = await self.apply_constraints(final_allocations, style_available_units, sku, db)
-            final_allocations = await self.filter_stores_by_size_eligibility(final_allocations, sku, brand_id, db)
             final_allocations = await self._top_up_allocations(
                 allocations=final_allocations,
                 target_demands=store_demands,
@@ -602,6 +703,11 @@ class AllocationEngine:
                         if signal.ros_source == "style_dna_analogue" and signal.matched_style_code
                         else None
                     ),
+                    style_analogue_match=(
+                        signal.analogue_match_meta
+                        if signal.ros_source == "style_analogue"
+                        else None
+                    ),
                     excluded_by_capacity=False,
                     exclusion_reason=None,
                     store_ros_attribute=f"{signal.weekly_ros:.1f} units/week ({signal.ros_source})",
@@ -616,6 +722,7 @@ class AllocationEngine:
                     stockout_risk_at_lower_qty=(weeks_cover * 0.75) < max(season_weeks_remaining * 0.7, 1),
                     climate_match=method_reasoning.get("climate_match", True),
                     data_sample_size=profile.sample_size if profile else signal.data_sample_size,
+                    allocation_mode=allocation_mode,
                 )
 
                 projections = {
@@ -646,6 +753,7 @@ class AllocationEngine:
                             existing_line_map[(store_id, size_sku.id)] = existing_line
                         else:
                             existing_line.ai_reasoning = reasoning
+                            flag_modified(existing_line, "ai_reasoning")
 
                         existing_line.ai_recommended_qty = size_qty
                         existing_line.final_qty = size_qty
@@ -667,6 +775,7 @@ class AllocationEngine:
                         existing_line_map[(store_id, sku.id)] = existing_line
                     else:
                         existing_line.ai_reasoning = reasoning
+                        flag_modified(existing_line, "ai_reasoning")
 
                     existing_line.ai_recommended_qty = style_qty
                     existing_line.final_qty = style_qty
@@ -690,6 +799,7 @@ class AllocationEngine:
                         existing_line_map[(store_id, size_sku.id)] = existing_line
                     else:
                         existing_line.ai_reasoning = reasoning
+                        flag_modified(existing_line, "ai_reasoning")
                     existing_line.ai_recommended_qty = 0
                     existing_line.final_qty = 0
                     existing_line.ai_confidence = confidence
@@ -728,6 +838,7 @@ class AllocationEngine:
                         store_ros_attribute="0.0 units/week (not eligible)",
                         cluster_avg_ros_attribute="0.0 units/week (cluster proxy)",
                         ros_vs_cluster_pct=0, current_stock_cover_days=0.0, data_sample_size=0,
+                        allocation_mode="demand_led",
                     )
                     stale_reasoning["narrative_demand"] = "This line is not eligible under current store group or constraints."
                     stale_reasoning["narrative_adjustments"] = "No adjustments applied."
@@ -1367,7 +1478,6 @@ class AllocationEngine:
             db=db,
             existing_allocations=current,
         )
-        incremental = await self.filter_stores_by_size_eligibility(incremental, sku, brand_id, db)
         if not incremental:
             return current
 
@@ -1415,6 +1525,7 @@ class AllocationEngine:
         allocations: dict[UUID, int],
         existing_line_map: dict[tuple[UUID, UUID], AllocationLine],
         sku_map: dict[UUID, SKU],
+        allocation_mode: str = "demand_led",
     ) -> tuple[dict[UUID, int], dict[UUID, dict[str, object]]]:
         if not allocations or not sku.story:
             return allocations, {}
@@ -1460,7 +1571,20 @@ class AllocationEngine:
                 if same_fabric or same_sub_story:
                     competing_count += 1
 
-            factor = 0.65 if competing_count > 0 else 1.0
+            # Tiered factor — scales with story concentration
+            if competing_count == 0:
+                factor = 1.0
+            elif competing_count <= 2:
+                factor = 0.65
+            elif competing_count <= 5:
+                factor = 0.80
+            else:
+                factor = 0.90
+
+            # In supply-led mode, pre-store-trim already handles depth — floor at 0.85
+            if allocation_mode == "supply_led":
+                factor = max(factor, 0.85)
+
             adjusted_qty = max(0, int(round(qty * factor)))
             adjusted[store_id] = adjusted_qty
 

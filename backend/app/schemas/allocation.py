@@ -3,7 +3,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from app.models import AllocationStatus
+from app.models import AllocationStatus, OverrideReasonCode
 
 
 class AllocationGenerateRequest(BaseModel):
@@ -50,7 +50,9 @@ class AllocationLineOut(BaseModel):
     final_qty: int | None
     was_overridden: bool
     override_reason: str | None
+    override_reason_code: OverrideReasonCode | None = None
     override_notes: str | None
+    ai_reasoning_human: str | None = None
     store_code: str | None = None
     store_name: str | None = None
     store_city: str | None = None
@@ -84,6 +86,7 @@ class AllocationSessionDetail(BaseModel):
 
 class AllocationLineUpdate(BaseModel):
     final_qty: int
+    override_reason_code: OverrideReasonCode | None = None
     override_reason: str | None = None
     override_notes: str | None = None
 

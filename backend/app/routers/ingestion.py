@@ -15,7 +15,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
-from app.models import Upload, UploadType, User, UserRole
+from app.models import (
+    GRN,
+    GRNLine,
+    SalesData,
+    Season,
+    SizeGuide,
+    SKU,
+    Store,
+    StoreCategoryDemand,
+    StoreProductGrade,
+    Upload,
+    UploadType,
+    User,
+    UserRole,
+)
 from app.routers._helpers import envelope
 from app.services.ingestion.mapping import (
     UPLOAD_FIELD_ALIASES,
@@ -506,3 +520,263 @@ async def get_upload_errors(
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Error report missing"})
 
     return FileResponse(path=path, media_type="text/csv", filename=path.name)
+
+
+@router.get("/data-quality")
+async def data_quality(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Pre-flight readiness probe.
+
+    Inspects the data the planner has uploaded so far and flags whether the
+    allocation engine has enough signal to produce a healthy run. We compute
+    these checks *before* allocation so the planner can fix inputs without
+    burning a full engine cycle. Each check returns ``GREEN`` / ``AMBER`` /
+    ``RED`` plus a sentence the UI can render verbatim.
+
+    Retail data is messy by definition — the bar here is "does the engine
+    have enough to produce a defensible plan?", not "is every cell perfect?"
+    """
+    bid = current_user.brand_id
+
+    # ── Counts ──────────────────────────────────────────────────────────
+    sku_count = await db.scalar(select(func.count(SKU.id)).where(SKU.brand_id == bid)) or 0
+    sku_with_band = (
+        await db.scalar(
+            select(func.count(SKU.id)).where(
+                SKU.brand_id == bid, SKU.price_band.is_not(None)
+            )
+        )
+        or 0
+    )
+    sales_rows = (
+        await db.scalar(select(func.count(SalesData.id)).where(SalesData.brand_id == bid)) or 0
+    )
+    distinct_weeks = (
+        await db.scalar(
+            select(func.count(func.distinct(SalesData.week_start_date))).where(
+                SalesData.brand_id == bid
+            )
+        )
+        or 0
+    )
+    store_count = (
+        await db.scalar(select(func.count(Store.id)).where(Store.brand_id == bid)) or 0
+    )
+    grade_rows = (
+        await db.scalar(
+            select(func.count(StoreProductGrade.id)).where(StoreProductGrade.brand_id == bid)
+        )
+        or 0
+    )
+    size_guide_rows = (
+        await db.scalar(select(func.count(SizeGuide.id)).where(SizeGuide.brand_id == bid)) or 0
+    )
+    bridge_rows = (
+        await db.scalar(
+            select(func.count(StoreCategoryDemand.id)).where(StoreCategoryDemand.brand_id == bid)
+        )
+        or 0
+    )
+
+    # SKU overlap with sales — the cold-start canary. We compare distinct
+    # SKUs in SKU master against distinct SKUs that have sales rows.
+    overlap_pct: float | None = None
+    if sku_count > 0:
+        skus_with_sales = (
+            await db.scalar(
+                select(func.count(func.distinct(SalesData.sku_id))).where(
+                    SalesData.brand_id == bid
+                )
+            )
+            or 0
+        )
+        overlap_pct = round(skus_with_sales / sku_count, 4)
+
+    # Stores covered by grades — anything missing grades will fall to default.
+    grade_store_pct: float | None = None
+    if store_count > 0:
+        stores_with_grades = (
+            await db.scalar(
+                select(func.count(func.distinct(StoreProductGrade.store_id))).where(
+                    StoreProductGrade.brand_id == bid
+                )
+            )
+            or 0
+        )
+        grade_store_pct = round(stores_with_grades / store_count, 4)
+
+    # ── Per-section verdict ─────────────────────────────────────────────
+    checks: list[dict] = []
+
+    # Sales coverage
+    if distinct_weeks == 0:
+        checks.append({
+            "key": "sales",
+            "status": "RED",
+            "title": "No sales history",
+            "detail": "Upload at least 8 weeks of weekly sales data to give the engine a real demand signal.",
+        })
+    elif distinct_weeks < 4:
+        checks.append({
+            "key": "sales",
+            "status": "AMBER",
+            "title": f"Only {distinct_weeks} week{'s' if distinct_weeks != 1 else ''} of sales",
+            "detail": "Engine will rely heavily on the category-bridge fallback. Aim for 8+ weeks for HIGH-confidence lines.",
+        })
+    elif distinct_weeks < 8:
+        checks.append({
+            "key": "sales",
+            "status": "AMBER",
+            "title": f"{distinct_weeks} weeks of sales (8+ recommended)",
+            "detail": "Bridge will fill gaps but expect some MEDIUM-confidence lines.",
+        })
+    else:
+        checks.append({
+            "key": "sales",
+            "status": "GREEN",
+            "title": f"{distinct_weeks} weeks of sales · {sales_rows:,} rows",
+            "detail": "Demand engine has enough temporal signal.",
+        })
+
+    # SKU ↔ sales overlap
+    if overlap_pct is None:
+        checks.append({
+            "key": "sku_overlap",
+            "status": "AMBER",
+            "title": "Upload a buy file to compute SKU overlap",
+            "detail": "Engine needs both sides (SKU master + sales) to know whether the bridge will be used.",
+        })
+    elif overlap_pct < 0.05:
+        checks.append({
+            "key": "sku_overlap",
+            "status": "RED",
+            "title": f"Only {overlap_pct * 100:.1f}% of SKUs have sales history",
+            "detail": (
+                "Buy file styles barely overlap with sales. Engine will lean on the "
+                "category × price-band bridge for almost every line — expect mostly "
+                "MEDIUM-confidence allocation. To get HIGH-confidence lines, ensure "
+                "buy file styles share codes with prior-season sales."
+            ),
+        })
+    elif overlap_pct < 0.30:
+        checks.append({
+            "key": "sku_overlap",
+            "status": "AMBER",
+            "title": f"{overlap_pct * 100:.1f}% SKU ↔ sales overlap",
+            "detail": "Bridge will carry the bulk of demand. Acceptable for a cold-start cycle.",
+        })
+    else:
+        checks.append({
+            "key": "sku_overlap",
+            "status": "GREEN",
+            "title": f"{overlap_pct * 100:.1f}% SKU ↔ sales overlap",
+            "detail": "Most lines will resolve to per-SKU or per-cluster history.",
+        })
+
+    # Store grades
+    if grade_store_pct is None:
+        checks.append({
+            "key": "grades",
+            "status": "AMBER",
+            "title": "No stores yet",
+            "detail": "Upload store grades — they bootstrap your stores and tier the allocation.",
+        })
+    elif grade_store_pct < 0.7:
+        checks.append({
+            "key": "grades",
+            "status": "AMBER",
+            "title": f"Only {grade_store_pct * 100:.0f}% of stores have grades",
+            "detail": "Stores without grades fall back to grade C, which dampens their allocation.",
+        })
+    else:
+        checks.append({
+            "key": "grades",
+            "status": "GREEN",
+            "title": f"{grade_store_pct * 100:.0f}% of stores graded",
+            "detail": "Grade-tier multipliers will apply across the network.",
+        })
+
+    # Size guide
+    if size_guide_rows == 0:
+        checks.append({
+            "key": "size_guide",
+            "status": "AMBER",
+            "title": "No size guide uploaded",
+            "detail": "Engine can still allocate, but size split will fall to a uniform default.",
+        })
+    else:
+        checks.append({
+            "key": "size_guide",
+            "status": "GREEN",
+            "title": f"{size_guide_rows} size-guide rows",
+            "detail": "Pivotal vs non-pivotal split will be applied per category.",
+        })
+
+    # Price-band coverage on the buy file
+    if sku_count > 0:
+        band_pct = sku_with_band / sku_count
+        if band_pct < 0.8:
+            checks.append({
+                "key": "price_bands",
+                "status": "AMBER",
+                "title": f"{band_pct * 100:.0f}% of SKUs have a price band",
+                "detail": "Bridge keys on (category × price band). SKUs without bands won't benefit from per-band signal.",
+            })
+        else:
+            checks.append({
+                "key": "price_bands",
+                "status": "GREEN",
+                "title": f"{band_pct * 100:.0f}% of SKUs have price bands",
+                "detail": "Bridge can resolve at full granularity.",
+            })
+
+    # Bridge readiness
+    if bridge_rows == 0 and (sales_rows > 0 and sku_count > 0):
+        checks.append({
+            "key": "bridge",
+            "status": "AMBER",
+            "title": "Category bridge not yet built",
+            "detail": "Re-run sales ingestion (or trigger a backfill) so the engine has the bridge ready before allocation.",
+        })
+    elif bridge_rows > 0:
+        checks.append({
+            "key": "bridge",
+            "status": "GREEN",
+            "title": f"Bridge built · {bridge_rows} (store × category × band) cells",
+            "detail": "Cold-start lines will use the bridge instead of falling to minimum-presentation.",
+        })
+
+    # ── Overall readiness ──────────────────────────────────────────────
+    statuses = {check["status"] for check in checks}
+    if "RED" in statuses:
+        readiness = "RED"
+        readiness_message = "Fix the red items before running allocation — engine will produce a low-quality result."
+    elif "AMBER" in statuses:
+        readiness = "AMBER"
+        readiness_message = (
+            "Allocation will run but expect mixed confidence. Review the amber items if you "
+            "want a HIGH-confidence plan."
+        )
+    else:
+        readiness = "GREEN"
+        readiness_message = "All inputs look healthy — allocation should land in the APPROVE band."
+
+    return envelope(
+        {
+            "readiness": readiness,
+            "readiness_message": readiness_message,
+            "checks": checks,
+            "facts": {
+                "skus": int(sku_count),
+                "sku_overlap_with_sales_pct": overlap_pct,
+                "sales_rows": int(sales_rows),
+                "distinct_weeks_of_sales": int(distinct_weeks),
+                "stores": int(store_count),
+                "grade_store_coverage_pct": grade_store_pct,
+                "size_guide_rows": int(size_guide_rows),
+                "bridge_rows": int(bridge_rows),
+            },
+        }
+    )

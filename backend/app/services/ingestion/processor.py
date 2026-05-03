@@ -124,9 +124,29 @@ def _require_columns(df: pd.DataFrame, required: list[str], sheet_name: str) -> 
 
 
 async def _resolve_ingestion_season(db: AsyncSession, brand_id: UUID) -> Season:
+    """Pick the season ingestion writes against.
+
+    Prefers any in-flight pre-season status (PLANNING / BUYING / RECEIVING /
+    ALLOCATING / IN_SEASON), then falls back to DRAFT, then to whatever exists.
+    If the brand has zero seasons (e.g. a brand-new pilot dropped their
+    workbook before creating a season), we auto-create a default 6-month
+    PLANNING season so the smart-upload flow works out of the box. The
+    planner can rename it later from ``Setup → Seasons``.
+
+    The historical name ``ACTIVE`` is no longer in the enum (see migration
+    0009_season_status_expanded) — the substitute set captures every status
+    where new buy/sales data can land legitimately.
+    """
+    preferred = (
+        SeasonStatus.PLANNING,
+        SeasonStatus.BUYING,
+        SeasonStatus.RECEIVING,
+        SeasonStatus.ALLOCATING,
+        SeasonStatus.IN_SEASON,
+    )
     season = await db.scalar(
         select(Season)
-        .where(Season.brand_id == brand_id, Season.status == SeasonStatus.ACTIVE)
+        .where(Season.brand_id == brand_id, Season.status.in_(preferred))
         .order_by(Season.start_date.desc())
         .limit(1)
     )
@@ -135,15 +155,28 @@ async def _resolve_ingestion_season(db: AsyncSession, brand_id: UUID) -> Season:
 
     season = await db.scalar(
         select(Season)
-        .where(Season.brand_id == brand_id, Season.status == SeasonStatus.PLANNING)
+        .where(Season.brand_id == brand_id, Season.status == SeasonStatus.DRAFT)
         .order_by(Season.start_date.desc())
         .limit(1)
     )
     if season is not None:
         return season
 
+    season = await db.scalar(
+        select(Season).where(Season.brand_id == brand_id).order_by(Season.start_date.desc()).limit(1)
+    )
+    if season is not None:
+        return season
+
+    # Deliberate: do NOT auto-create. Season setup is the first explicit step
+    # in the planner workflow — autocreating here would hide a missing
+    # onboarding step and confuse the user later when they wonder where the
+    # season came from. The frontend post-login redirect routes a brand-new
+    # tenant to /setup/seasons; only programmatic clients (no UI) should
+    # ever reach this branch, and they get a clear, actionable error.
     raise ValueError(
-        "No active season found for this brand. Please create a season before uploading a buy file."
+        "No season found for this brand. Create a season at "
+        "Setup → Seasons before uploading the buy file."
     )
 
 
@@ -1492,6 +1525,35 @@ async def process_upload(db: AsyncSession, upload: Upload, task_id: str | None =
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Store profile build failed (non-blocking): %s", exc)
+
+            # Refresh the category × price-band bridge so cold-start GRNs
+            # uploaded later can resolve real demand for new SKU codes. This
+            # is a no-op if SKU master is empty.
+            try:
+                from app.services.allocation.category_bridge import rebuild_bridge_for_brand
+
+                rows = await rebuild_bridge_for_brand(db, upload.brand_id)
+                logger.info(
+                    "Category bridge rebuilt for brand=%s rows=%d",
+                    upload.brand_id,
+                    rows,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Category bridge rebuild failed (non-blocking): %s", exc)
+        elif upload.upload_type.value == "BUY_FILE":
+            # The buy file introduces brand-new SKUs whose (category, price_band)
+            # didn't exist before — rebuild so they can match against existing sales.
+            try:
+                from app.services.allocation.category_bridge import rebuild_bridge_for_brand
+
+                rows = await rebuild_bridge_for_brand(db, upload.brand_id)
+                logger.info(
+                    "Category bridge rebuilt for brand=%s after buy file upload rows=%d",
+                    upload.brand_id,
+                    rows,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Category bridge rebuild failed (non-blocking): %s", exc)
 
     error_report_path: str | None = None
     if all_errors:

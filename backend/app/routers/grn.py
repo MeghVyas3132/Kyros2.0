@@ -6,9 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
-from app.models import GRN, GRNLine, User, UserRole
+from app.models import GRN, GRNLine, SeasonStatus, User, UserRole
 from app.routers._helpers import envelope
 from app.schemas.grn import GRNCreate
+from app.services.workflow_state import advance_season_if_earlier
 
 router = APIRouter(prefix="/api/v1/grns", tags=["grns"])
 
@@ -106,6 +107,14 @@ async def create_grn(
                 sku_id=line.sku_id,
                 units_received=line.units_received,
             )
+        )
+
+    if payload.season_id is not None:
+        await advance_season_if_earlier(
+            db,
+            brand_id=current_user.brand_id,
+            season_id=payload.season_id,
+            target=SeasonStatus.RECEIVING,
         )
 
     await db.commit()

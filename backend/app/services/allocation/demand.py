@@ -44,6 +44,10 @@ class DemandSignal:
     cluster_store_count: int = 0
     matched_style_code: str | None = None
     similarity_score: float | None = None
+    # Style-analogue audit trail. Carries the full top-K match list
+    # (not just the leader) so the UI can show the planner exactly which
+    # prior styles drove the inference.
+    analogue_match_meta: dict | None = None
 
 
 @dataclass
@@ -407,6 +411,8 @@ async def calculate_store_demand_details(
     previous_season_id: UUID | None = None,
     preloaded_stockout_signals: Mapping[tuple[UUID, str], list[tuple[date, int, bool | None]]] | None = None,
     style_dna_cache: MutableMapping[StyleDnaCacheKey, StyleDnaProxy | None] | None = None,
+    category_bridge: object | None = None,
+    style_analogue: object | None = None,
 ) -> DemandSignal:
     """
     Calculate demand for a store × SKU combination using four-tier fallback:
@@ -453,6 +459,49 @@ async def calculate_store_demand_details(
             base_ros = corrected_ros
             is_corrected = True
     else:
+        # TIER 1.5 (NEW): Style-analogue inference. For a cold-start SKU we
+        # ask "which prior-season styles look most like this one?" and
+        # borrow their per-store weekly ROS. This restores style-level
+        # granularity that the category bridge averages out.
+        analogue_hit = None
+        if style_analogue is not None:
+            try:
+                analogue_hit = style_analogue.infer_demand(store.id, sku)
+            except Exception:  # noqa: BLE001
+                analogue_hit = None
+        if analogue_hit is not None and analogue_hit.weekly_ros > 0:
+            multiplier = GRADE_MULTIPLIERS.get(grade, 1.00)
+            base_ros = float(analogue_hit.weekly_ros)
+            raw_demand = round(base_ros * weeks_remaining)
+            raw_demand = int(max(raw_demand, min_qty))
+            return DemandSignal(
+                demand=raw_demand,
+                weekly_ros=base_ros,
+                ros_source="style_analogue",
+                grade=grade,
+                grade_multiplier=multiplier,
+                is_corrected=False,
+                data_sample_size=int(analogue_hit.sample_size_weeks),
+                cluster_store_count=len(analogue_hit.matched_style_codes),
+                # Identify the TOP analogue for the existing reasoning fields
+                # consumed by build_allocation_reasoning. Full match list is
+                # surfaced via ai_reasoning by the explainer.
+                matched_style_code=(
+                    analogue_hit.matched_style_codes[0]
+                    if analogue_hit.matched_style_codes
+                    else None
+                ),
+                similarity_score=float(analogue_hit.best_score),
+                analogue_match_meta={
+                    "matched_style_codes": list(analogue_hit.matched_style_codes),
+                    "scores": list(analogue_hit.scores),
+                    "best_score": float(analogue_hit.best_score),
+                    "confidence_tier": analogue_hit.confidence_tier,
+                    "sample_size_weeks": int(analogue_hit.sample_size_weeks),
+                    "explanation": analogue_hit.explanation,
+                },
+            )
+
         # TIER 2: Try cluster average ROS for this specific SKU
         cluster_ros = None
         if store.cluster_id is not None and cluster_ros_averages is not None:
@@ -463,6 +512,39 @@ async def calculate_store_demand_details(
             base_ros = float(cluster_ros)
             sample_size = 0  # cluster-level, no per-store sample
         else:
+            # TIER 2.5 (NEW): Category × price-band demand bridge.
+            # When the SKU itself has no history (cold-start), borrow the
+            # weekly ROS this *store* showed in the same (category, price_band)
+            # last season. Far stronger signal than grade_average for a
+            # specific store, and the only thing that lets a brand whose
+            # SKU codes change between seasons get past minimum_presentation.
+            bridge_hit = None
+            if category_bridge is not None:
+                try:
+                    bridge_hit = category_bridge.lookup(
+                        store.id, category, getattr(sku, "price_band", None)
+                    )
+                except Exception:  # noqa: BLE001
+                    bridge_hit = None
+            if bridge_hit is not None and bridge_hit.weekly_ros > 0:
+                source = "category_bridge"
+                base_ros = float(bridge_hit.weekly_ros)
+                sample_size = int(bridge_hit.units_observed or 0)
+                # Falls through to the post-cascade common return path below.
+                multiplier = GRADE_MULTIPLIERS.get(grade, 1.00)
+                raw_demand = round(base_ros * weeks_remaining)
+                raw_demand = int(max(raw_demand, min_qty))
+                return DemandSignal(
+                    demand=raw_demand,
+                    weekly_ros=base_ros,
+                    ros_source=source,
+                    grade=grade,
+                    grade_multiplier=multiplier,
+                    is_corrected=False,
+                    data_sample_size=sample_size,
+                    cluster_store_count=int(bridge_hit.sample_skus or 0),
+                )
+
             # TIER 3: Try grade-level average for this SKU
             grade_ros = None
             if grade_ros_averages is not None:
@@ -882,8 +964,19 @@ def calculate_confidence_score(
     
     base_scores = {
         "store_historical": 0.80,
+        # Style-analogue: per-store demand inferred from semantically
+        # similar prior-season styles. The numeric similarity score is
+        # already encoded in ``data_sample_size`` / similarity_score elsewhere;
+        # we anchor the base to 0.65 so a strong analogue (≥0.70 score) lands
+        # comfortably HIGH, while a marginal analogue lands MEDIUM.
+        "style_analogue": 0.65,
         "cluster_average": 0.55,
+        # Category × price-band bridge: per-store evidence on the same
+        # (category, price_band), aggregated across many SKUs. Strong signal
+        # for cold-start; sits between cluster and grade.
+        "category_bridge": 0.50,
         "grade_average": 0.40,
+        "style_dna_analogue": 0.30,
         "style_dna": 0.30,
         "minimum_presentation": 0.10,
     }
@@ -935,6 +1028,7 @@ def build_allocation_reasoning(
     cannibalization_reason: str | None = None,
     colourways_in_story_at_store: int | None = None,
     style_dna_match: dict | None = None,
+    style_analogue_match: dict | None = None,
     excluded_by_capacity: bool = False,
     exclusion_reason: str | None = None,
     # Backward-compat fields used by frontend panel
@@ -951,6 +1045,7 @@ def build_allocation_reasoning(
     # Phase 2 
     is_synthetic_data: bool = False,
     grade_was_defaulted: bool = False,
+    allocation_mode: str = "demand_led",
 ) -> dict:
     """Build complete reasoning payload for an allocation line."""
     from app.services.allocation.constants import GRADE_MULTIPLIERS
@@ -970,6 +1065,7 @@ def build_allocation_reasoning(
         "lost_sales_estimate": demand_result.lost_sales_estimate,
         "data_sample_size": data_sample_size or demand_result.data_sample_size,
         "cluster_store_count": demand_result.cluster_store_count,
+        "allocation_mode": allocation_mode,
         # PROJECTION
         "cover_target_weeks": cover_target_weeks,
         "weeks_cover_at_recommended": round(weeks_at_final, 1),
@@ -1048,6 +1144,9 @@ def build_allocation_reasoning(
         },
         # PHASE 2 PLACEHOLDERS
         "style_dna_match": style_dna_match,
+        # Style-analogue audit trail — present iff Tier 1.5 fired. The frontend
+        # uses this to render the "based on these prior styles" panel.
+        "style_analogue_match": style_analogue_match,
         # BACKWARD COMPATIBLE FIELDS
         "store_ros_attribute": store_ros_attribute or f"{weekly_ros:.1f} units/week ({demand_result.source})",
         "cluster_avg_ros_attribute": cluster_avg_ros_attribute or f"{weekly_ros:.1f} units/week (cluster proxy)",

@@ -1,6 +1,7 @@
+from datetime import date
 from uuid import UUID
 
-from sqlalchemy import ForeignKey, Index, Integer, String, UniqueConstraint
+from sqlalchemy import Date, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -18,6 +19,7 @@ class BuyPlanFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     season_id: Mapped[UUID | None] = mapped_column(ForeignKey("seasons.id"))
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     source_filename: Mapped[str | None] = mapped_column(String(255))
+    notes: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"))
 
 
@@ -41,3 +43,9 @@ class BuyPlanLine(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     style_risk_group: Mapped[str | None] = mapped_column(String(50))
     total_buy_qty: Mapped[int | None] = mapped_column(Integer)
     expected_first_allocation_qty: Mapped[int | None] = mapped_column(Integer)
+    vendor_name: Mapped[str | None] = mapped_column(String(255))
+    expected_delivery_week: Mapped[date | None] = mapped_column(Date)
+    planned_cost_per_unit: Mapped[float | None] = mapped_column(Numeric(10, 2))
+    moq: Mapped[int | None] = mapped_column(Integer)
+    planned_price_per_unit: Mapped[float | None] = mapped_column(Numeric(10, 2))
+    planned_margin_pct: Mapped[float | None] = mapped_column(Numeric(5, 2))

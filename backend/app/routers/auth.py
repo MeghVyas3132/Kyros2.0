@@ -10,7 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models import Brand, BrandSettings, User, UserRole
+from app.models import (
+    Brand,
+    BrandSettings,
+    SignupRequest,
+    SignupRequestStatus,
+    User,
+    UserRole,
+)
 from app.routers._helpers import envelope
 from app.schemas.auth import (
     BootstrapRequest,
@@ -18,6 +25,7 @@ from app.schemas.auth import (
     LoginRequest,
     LogoutRequest,
     RefreshRequest,
+    SignupRequestCreate,
 )
 from app.utils.security import (
     create_access_token,
@@ -154,14 +162,118 @@ async def bootstrap(payload: BootstrapRequest, db: AsyncSession = Depends(get_db
     )
 
 
+@router.post("/signup")
+async def signup(payload: SignupRequestCreate, db: AsyncSession = Depends(get_db)) -> dict:
+    """Public-facing signup. Creates a PENDING ``SignupRequest`` row.
+
+    No Brand or User is created here — the platform's ``SUPER_ADMIN``
+    reviews the queue and explicitly approves before access is granted.
+    Duplicate email or brand_slug (across both pending requests AND already-
+    approved tenants) returns 409 so the applicant knows to use a different
+    address or company name.
+    """
+    email = payload.email.lower().strip()
+    brand_slug = _slugify(payload.brand_slug or payload.brand_name)
+
+    # Reject if either the email or slug is already in use, anywhere.
+    existing_user = await db.scalar(select(User.id).where(User.email == email))
+    if existing_user is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "CONFLICT", "message": "An account with this email already exists."},
+        )
+    existing_brand = await db.scalar(select(Brand.id).where(Brand.slug == brand_slug))
+    if existing_brand is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "CONFLICT", "message": "A brand with this name is already onboarded."},
+        )
+    existing_request_email = await db.scalar(
+        select(SignupRequest.id).where(
+            SignupRequest.email == email,
+            SignupRequest.status != SignupRequestStatus.REJECTED,
+        )
+    )
+    if existing_request_email is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "CONFLICT",
+                "message": "A signup request with this email is already in review.",
+            },
+        )
+    existing_request_slug = await db.scalar(
+        select(SignupRequest.id).where(
+            SignupRequest.brand_slug == brand_slug,
+            SignupRequest.status != SignupRequestStatus.REJECTED,
+        )
+    )
+    if existing_request_slug is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "CONFLICT",
+                "message": "A signup request for this brand is already in review.",
+            },
+        )
+
+    request = SignupRequest(
+        brand_name=payload.brand_name.strip(),
+        brand_slug=brand_slug,
+        full_name=payload.full_name.strip(),
+        email=email,
+        hashed_password=get_password_hash(payload.password),
+        contact_phone=(payload.contact_phone or "").strip() or None,
+        company_size=(payload.company_size or "").strip() or None,
+        notes=(payload.notes or "").strip() or None,
+        status=SignupRequestStatus.PENDING,
+    )
+    db.add(request)
+    await db.commit()
+    await db.refresh(request)
+
+    return envelope(
+        {
+            "id": str(request.id),
+            "status": request.status.value,
+            "message": "Signup received. A platform admin will review your request shortly.",
+        }
+    )
+
+
 @router.post("/login")
 async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> dict:
-    result = await db.execute(select(User).where(User.email == payload.email))
+    email = payload.email.lower().strip()
+
+    # Helpful error: tell the applicant explicitly that their request is
+    # still pending review (rather than the generic "invalid credentials"
+    # which would make them suspect a typo).
+    pending = await db.scalar(
+        select(SignupRequest).where(
+            SignupRequest.email == email,
+            SignupRequest.status == SignupRequestStatus.PENDING,
+        )
+    )
+    if pending is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "SIGNUP_PENDING",
+                "message": "Your signup is still under review. You will be able to log in once approved.",
+            },
+        )
+
+    result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
     if user is None or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "AUTH_INVALID", "message": "Invalid credentials"},
+        )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "AUTH_INACTIVE", "message": "This account has been deactivated."},
         )
 
     access_token = create_access_token(user)

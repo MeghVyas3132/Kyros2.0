@@ -1,4 +1,24 @@
-export type Role = "ADMIN" | "PLANNER" | "VIEWER";
+export type Role = "SUPER_ADMIN" | "ADMIN" | "PLANNER" | "VIEWER";
+
+export type SignupStatus = "PENDING" | "APPROVED" | "REJECTED";
+
+export interface SignupRequestRow {
+  id: string;
+  brand_name: string;
+  brand_slug: string;
+  full_name: string;
+  email: string;
+  contact_phone: string | null;
+  company_size: string | null;
+  notes: string | null;
+  status: SignupStatus;
+  reviewed_at: string | null;
+  reviewed_by: string | null;
+  created_brand_id: string | null;
+  created_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface ApiMeta {
   request_id: string;
@@ -88,7 +108,9 @@ export interface AllocationLine {
   final_qty: number | null;
   was_overridden: boolean;
   override_reason: string | null;
+  override_reason_code?: string | null;
   override_notes: string | null;
+  ai_reasoning_human?: string | null;
   store_code?: string | null;
   store_name?: string | null;
   store_city?: string | null;
@@ -282,6 +304,23 @@ export interface AllocationBenchmarkBucket {
   under_coverage_rate: number;
   grade_compliance_rate: number;
 }
+
+export type OverrideReasonCode =
+  | "GRADE_DRIFT"
+  | "LOCAL_TREND"
+  | "VENDOR_DELAY"
+  | "CATEGORY_SHIFT"
+  | "STORE_CLOSURE"
+  | "OTHER";
+
+export const OVERRIDE_REASON_LABELS: Record<OverrideReasonCode, string> = {
+  GRADE_DRIFT: "Store grade drift",
+  LOCAL_TREND: "Known local trend",
+  VENDOR_DELAY: "Vendor delay",
+  CATEGORY_SHIFT: "Category shift",
+  STORE_CLOSURE: "Store closure / issue",
+  OTHER: "Other (explain below)",
+};
 
 export interface AllocationBenchmarkReport {
   session_id: string;

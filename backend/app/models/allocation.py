@@ -8,6 +8,15 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
+class OverrideReasonCode(str, enum.Enum):
+    GRADE_DRIFT = "GRADE_DRIFT"
+    LOCAL_TREND = "LOCAL_TREND"
+    VENDOR_DELAY = "VENDOR_DELAY"
+    CATEGORY_SHIFT = "CATEGORY_SHIFT"
+    STORE_CLOSURE = "STORE_CLOSURE"
+    OTHER = "OTHER"
+
+
 class AllocationStatus(str, enum.Enum):
     DRAFT = "DRAFT"
     GENERATING = "GENERATING"
@@ -64,6 +73,9 @@ class AllocationLine(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     final_qty: Mapped[int | None] = mapped_column(Integer)
     was_overridden: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     override_reason: Mapped[str | None] = mapped_column(String(100))
+    override_reason_code: Mapped[OverrideReasonCode | None] = mapped_column(
+        Enum(OverrideReasonCode, name="override_reason_code"), nullable=True
+    )
     override_notes: Mapped[str | None] = mapped_column(Text)
     actual_sellthrough_4w: Mapped[float | None] = mapped_column(Numeric(5, 2))
     actual_sellthrough_8w: Mapped[float | None] = mapped_column(Numeric(5, 2))

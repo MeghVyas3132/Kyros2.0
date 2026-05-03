@@ -15,12 +15,15 @@ from app.models import (
     AllocationLine,
     AllocationSession,
     AllocationStatus,
+    BuyPlanFile,
     GRN,
     GRNLine,
     GRNLineReservation,
     InventoryReservationType,
     SKU,
+    SalesData,
     Store,
+    StoreProductGrade,
     User,
     UserRole,
 )
@@ -32,14 +35,169 @@ from app.schemas.allocation import (
 )
 from app.services.allocation.benchmark import BenchmarkLine, build_benchmark_report
 from app.services.allocation.engine import AllocationEngine
-from app.services.allocation.explainer import normalize_projections, normalize_reasoning
+from app.services.allocation.explainer import generate_human_reasoning, normalize_projections, normalize_reasoning
 from app.services.allocation.simulator import simulate_quantity
 from app.services.allocation.story_concentration import compute_story_concentration
+from app.services.llm.narration import narrate_allocation_line, narrate_sanity_check
+from app.services.workflow_state import advance_season_if_earlier
+from app.models import SeasonStatus
 from app.utils.date_utils import utcnow
 
 router = APIRouter(prefix="/api/v1/allocation", tags=["allocation"])
 engine = AllocationEngine()
 logger = logging.getLogger(__name__)
+
+
+# ── Track A: pre-allocation data sanity ──────────────────────────────────────
+
+
+@router.get("/sanity-check")
+async def sanity_check(
+    grn_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Pre-flight check before generating an allocation.
+
+    Returns:
+      - blockers: hard issues that should stop allocation outright
+      - warnings: amber issues the planner can acknowledge and proceed
+      - facts: raw counts for the UI to render badges
+      - narration: LLM-generated 1-2 sentence summary (template fallback)
+    """
+    grn = await db.get(GRN, grn_id)
+    if grn is None or grn.brand_id != current_user.brand_id:
+        raise HTTPException(
+            status_code=404, detail={"code": "NOT_FOUND", "message": "GRN not found"}
+        )
+
+    # Sales history depth (in weeks) anywhere in the brand
+    weeks_of_sales = await db.scalar(
+        select(func.count(func.distinct(SalesData.week_start_date))).where(
+            SalesData.brand_id == current_user.brand_id
+        )
+    ) or 0
+
+    # GRN SKUs and how many of them have a sales row (any time)
+    grn_sku_rows = (
+        await db.execute(
+            select(GRNLine.sku_id).where(GRNLine.grn_id == grn.id)
+        )
+    ).all()
+    grn_sku_ids = [r[0] for r in grn_sku_rows]
+
+    grn_skus_with_history = 0
+    if grn_sku_ids:
+        grn_skus_with_history = await db.scalar(
+            select(func.count(func.distinct(SalesData.sku_id))).where(
+                SalesData.brand_id == current_user.brand_id,
+                SalesData.sku_id.in_(grn_sku_ids),
+            )
+        ) or 0
+
+    # GRN's distinct categories from SKU master
+    grn_categories: list[str] = []
+    if grn_sku_ids:
+        cat_rows = (
+            await db.execute(
+                select(func.distinct(SKU.category))
+                .where(
+                    SKU.brand_id == current_user.brand_id,
+                    SKU.id.in_(grn_sku_ids),
+                    SKU.category.is_not(None),
+                )
+            )
+        ).all()
+        grn_categories = sorted({c[0] for c in cat_rows if c[0]})
+
+    # Active stores in brand
+    active_stores = await db.scalar(
+        select(func.count(Store.id)).where(
+            Store.brand_id == current_user.brand_id,
+            Store.is_active.is_(True),
+        )
+    ) or 0
+
+    # Stores graded for *all* GRN categories
+    stores_with_grades_for_grn_categories = 0
+    if grn_categories and active_stores:
+        graded = await db.scalar(
+            select(func.count(func.distinct(StoreProductGrade.store_id))).where(
+                StoreProductGrade.brand_id == current_user.brand_id,
+                StoreProductGrade.product_category.in_(grn_categories),
+            )
+        ) or 0
+        stores_with_grades_for_grn_categories = int(graded)
+
+    # Buy plan for the season (if season known)
+    buy_plan_count = 0
+    if grn.season_id is not None:
+        buy_plan_count = await db.scalar(
+            select(func.count(BuyPlanFile.id)).where(
+                BuyPlanFile.brand_id == current_user.brand_id,
+                BuyPlanFile.season_id == grn.season_id,
+            )
+        ) or 0
+
+    # ── Decisions ────────────────────────────────────────────────────────────
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    if int(weeks_of_sales) == 0:
+        blockers.append(
+            "No sales history loaded for this brand — allocation cannot project demand."
+        )
+    elif int(weeks_of_sales) < 8:
+        warnings.append(
+            f"Only {int(weeks_of_sales)} week(s) of sales history — recommendations will rely on grade-average and analogue fallbacks."
+        )
+
+    if grn_sku_ids and int(grn_skus_with_history) / len(grn_sku_ids) < 0.5:
+        warnings.append(
+            f"{len(grn_sku_ids) - int(grn_skus_with_history)} of {len(grn_sku_ids)} GRN SKUs have no sales history — those will use style-DNA analogues."
+        )
+
+    if active_stores == 0:
+        blockers.append("No active stores in this brand — nothing to allocate to.")
+
+    if (
+        grn_categories
+        and active_stores
+        and stores_with_grades_for_grn_categories / int(active_stores) < 0.5
+    ):
+        warnings.append(
+            f"Only {stores_with_grades_for_grn_categories} of {int(active_stores)} stores have grades for the GRN categories — most stores will fall back to default 'C'."
+        )
+
+    if grn.season_id is not None and buy_plan_count == 0:
+        warnings.append(
+            "No buy plan linked to this season — allocation will run but you lose OTB reconciliation context."
+        )
+
+    facts = {
+        "weeks_of_sales": int(weeks_of_sales),
+        "grn_sku_count": len(grn_sku_ids),
+        "grn_skus_with_history": int(grn_skus_with_history),
+        "grn_categories": grn_categories,
+        "active_stores": int(active_stores),
+        "stores_with_grades_for_grn_categories": int(stores_with_grades_for_grn_categories),
+        "buy_plan_count": int(buy_plan_count),
+        "blockers": blockers,
+        "warnings": warnings,
+    }
+    narration = await narrate_sanity_check(facts)
+
+    return envelope(
+        {
+            "grn_id": str(grn.id),
+            "ready": len(blockers) == 0,
+            "blockers": blockers,
+            "warnings": warnings,
+            "facts": facts,
+            "narration": narration,
+        }
+    )
 
 
 async def _load_session_lines(
@@ -125,6 +283,7 @@ async def _load_session_lines(
         else:
             available_for_first_allocation = None
 
+        _normalized_reasoning = normalize_reasoning(line.ai_reasoning)
         payload = {
             "id": line.id,
             "session_id": line.session_id,
@@ -133,11 +292,13 @@ async def _load_session_lines(
             "sku_id": line.sku_id,
             "ai_recommended_qty": line.ai_recommended_qty,
             "ai_confidence": line.ai_confidence,
-            "ai_reasoning": normalize_reasoning(line.ai_reasoning),
+            "ai_reasoning": _normalized_reasoning,
+            "ai_reasoning_human": generate_human_reasoning(_normalized_reasoning),
             "ai_projections": normalize_projections(line.ai_projections),
             "final_qty": line.final_qty,
             "was_overridden": line.was_overridden,
             "override_reason": line.override_reason,
+            "override_reason_code": line.override_reason_code,
             "override_notes": line.override_notes,
             "store_code": store.store_code,
             "store_name": store.store_name,
@@ -419,18 +580,49 @@ async def update_line(
                 ),
             )
 
-    line.final_qty = payload.final_qty
-    line.override_reason = payload.override_reason
-    line.override_notes = payload.override_notes
-    # Compare against the engine's post-cap final_qty, not raw ai_recommended_qty.
+    # Capture the engine's prior value BEFORE overwriting — otherwise the
+    # comparison below is always against the new value.
     # ai_recommended_qty is the raw demand before capping; final_qty is what the
     # engine actually set after inventory cap / constraints.
-    original_engine_qty = line.final_qty if line.final_qty is not None else line.ai_recommended_qty
+    original_engine_qty = (
+        line.final_qty if line.final_qty is not None else line.ai_recommended_qty
+    )
+    line.final_qty = payload.final_qty
+    line.override_reason = payload.override_reason
+    line.override_reason_code = payload.override_reason_code
+    line.override_notes = payload.override_notes
     line.was_overridden = int(payload.final_qty) != int(original_engine_qty)
 
     await db.commit()
     await db.refresh(line)
     return envelope(line)
+
+
+@router.get("/lines/{line_id}/narration")
+async def get_line_narration(
+    line_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """LLM-narrated 2-3 sentence explanation for one allocation line.
+
+    Cached process-side. Falls back to the deterministic template
+    transparently if the LLM is disabled or every Groq key fails."""
+    line = await db.get(AllocationLine, line_id)
+    if line is None or line.brand_id != current_user.brand_id:
+        raise HTTPException(
+            status_code=404, detail={"code": "NOT_FOUND", "message": "Line not found"}
+        )
+
+    normalized = normalize_reasoning(line.ai_reasoning)
+    text = await narrate_allocation_line(normalized)
+    return envelope(
+        {
+            "line_id": str(line.id),
+            "narration": text,
+            "fallback": generate_human_reasoning(normalized),
+        }
+    )
 
 
 @router.post("/simulate")
@@ -483,6 +675,15 @@ async def approve_session(
     grn = await db.get(GRN, session.grn_id)
     if grn is not None:
         grn.status = "ALLOCATED"
+
+    # Approving the allocation means inventory is committed → IN_SEASON.
+    if session.season_id is not None:
+        await advance_season_if_earlier(
+            db,
+            brand_id=current_user.brand_id,
+            season_id=session.season_id,
+            target=SeasonStatus.IN_SEASON,
+        )
 
     await db.commit()
     await db.refresh(session)
@@ -762,9 +963,15 @@ async def get_session_benchmark(
             )
         )
 
+    # Fetch season context for context-aware thresholds
+    from app.services.allocation.health import AllocationHealthAnalyzer
+    analyzer = AllocationHealthAnalyzer(session_id, current_user.brand_id, db)
+    season_context = await analyzer.get_context()
+
     report = build_benchmark_report(
         lines=benchmark_lines,
         available_units_total=available_units_total,
+        season_context=season_context,
     )
     report.update(
         {
@@ -793,3 +1000,43 @@ async def get_story_concentration(
         db=db,
     )
     return envelope(payload)
+
+
+@router.get("/sessions/{session_id}/decision-summary")
+async def get_decision_summary(
+    session_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Portfolio-level decision pack for a finished allocation.
+
+    Returns a 3-5 action recommendation list plus a one-paragraph summary
+    and a DATA / STRATEGY / HEALTHY classification. The endpoint is
+    read-only and can be hit any number of times — the actions are
+    re-derived from the stored ``health_report`` + a single per-style
+    aggregation each call. Cheap. Idempotent.
+
+    409 when the session has no ``health_report`` yet (intelligence layer
+    hasn't run, e.g. session is still GENERATING).
+    """
+    from app.services.decision import build_decision_summary
+
+    try:
+        summary = await build_decision_summary(
+            session_id=session_id,
+            brand_id=current_user.brand_id,
+            db=db,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if "not found" in message.lower():
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "NOT_FOUND", "message": message},
+            ) from exc
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "CONFLICT", "message": message},
+        ) from exc
+
+    return envelope(summary.to_dict())

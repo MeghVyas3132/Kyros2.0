@@ -104,15 +104,39 @@ def _sorted_risk_keys(keys: Sequence[str]) -> list[str]:
     return sorted(keys, key=lambda key: (_RISK_ORDER.get(key, 99), key))
 
 
+def _resolve_utilization_threshold(
+    base_threshold: float,
+    season_context: Mapping[str, object] | None,
+) -> tuple[float, str]:
+    """Return (threshold, reason) based on season maturity."""
+    if season_context is None:
+        return base_threshold, "standard"
+
+    is_cold_start = bool(season_context.get("is_cold_start", False))
+    season_week = int(season_context.get("season_week", 99))
+
+    if is_cold_start:
+        return 0.55, "cold_start_season"
+    if season_week <= 4:
+        return 0.70, "early_season"
+    return base_threshold, "standard"
+
+
 def build_benchmark_report(
     lines: Sequence[BenchmarkLine],
     available_units_total: int,
     *,
     acceptance_thresholds: Mapping[str, float] | None = None,
+    season_context: Mapping[str, object] | None = None,
 ) -> dict:
     thresholds = dict(DEFAULT_ACCEPTANCE_THRESHOLDS)
     if acceptance_thresholds:
         thresholds.update(acceptance_thresholds)
+
+    utilization_threshold, utilization_reason = _resolve_utilization_threshold(
+        base_threshold=float(thresholds["inventory_utilization_min"]),
+        season_context=season_context,
+    )
 
     if not lines:
         return {
@@ -240,9 +264,9 @@ def build_benchmark_report(
         {
             "metric": "inventory_utilization_rate",
             "operator": ">=",
-            "target": float(thresholds["inventory_utilization_min"]),
+            "target": utilization_threshold,
             "actual": inventory_utilization_rate,
-            "passed": inventory_utilization_rate >= float(thresholds["inventory_utilization_min"]),
+            "passed": inventory_utilization_rate >= utilization_threshold,
         },
         {
             "metric": "high_confidence_share",
@@ -285,6 +309,8 @@ def build_benchmark_report(
             "overall_pass": all(bool(check["passed"]) for check in checks),
             "checks": checks,
         },
+        "utilization_threshold_applied": utilization_threshold,
+        "utilization_threshold_reason": utilization_reason,
         "demand_source_mix": demand_source_mix,
         "scorecards": {
             "by_grade": by_grade,

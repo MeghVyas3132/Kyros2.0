@@ -38,6 +38,10 @@ services:
       LOCAL_STORAGE_PATH: /app/.uploads
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      GROQ_API_KEYS: ${GROQ_API_KEYS:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      LLM_ENABLED: ${LLM_ENABLED:-true}
+      GROQ_KEY_REFRESH_MINUTES: ${GROQ_KEY_REFRESH_MINUTES:-10}
     depends_on:
       - postgres
       - redis
@@ -55,6 +59,10 @@ services:
       LOCAL_STORAGE_PATH: /app/.uploads
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      GROQ_API_KEYS: ${GROQ_API_KEYS:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      LLM_ENABLED: ${LLM_ENABLED:-true}
+      GROQ_KEY_REFRESH_MINUTES: ${GROQ_KEY_REFRESH_MINUTES:-10}
     depends_on:
       - postgres
       - redis
@@ -72,6 +80,10 @@ services:
       LOCAL_STORAGE_PATH: /app/.uploads
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      GROQ_API_KEYS: ${GROQ_API_KEYS:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      LLM_ENABLED: ${LLM_ENABLED:-true}
+      GROQ_KEY_REFRESH_MINUTES: ${GROQ_KEY_REFRESH_MINUTES:-10}
     depends_on:
       - postgres
       - redis

@@ -1,5 +1,7 @@
 "use client";
 
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { FormEvent, useState } from "react";
 import useSWR from "swr";
 
@@ -18,9 +20,22 @@ type SeasonItem = {
   categories?: string[];
 };
 
-const STATUS_OPTIONS = ["PLANNING", "ACTIVE", "CLOSED"];
+const STATUS_OPTIONS = [
+  "DRAFT",
+  "PLANNING",
+  "BUYING",
+  "RECEIVING",
+  "ALLOCATING",
+  "IN_SEASON",
+  "CLOSED",
+];
+
+const ACTIVE_LIKE = new Set(["PLANNING", "BUYING", "RECEIVING", "ALLOCATING", "IN_SEASON"]);
 
 export default function SetupSeasonsPage() {
+  const searchParams = useSearchParams();
+  const isFirstRun = searchParams?.get("first") === "1";
+
   const { data, mutate } = useSWR<SeasonItem[]>("/api/v1/seasons", (path: string) =>
     apiRequest<SeasonItem[]>(path)
   );
@@ -66,26 +81,21 @@ export default function SetupSeasonsPage() {
     }
   };
 
-  const setActive = async (seasonId: string) => {
-    setSaving(true);
-    setMessage(null);
-    try {
-      await apiRequest(`/api/v1/seasons/${seasonId}`, {
-        method: "PUT",
-        body: JSON.stringify({ status: "ACTIVE" }),
-      });
-      await mutate();
-      setMessage("Season set to ACTIVE.");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Failed to update season.");
-    } finally {
-      setSaving(false);
-    }
-  };
-
   return (
     <div className="space-y-4">
       <PageHeader title="Setup · Seasons" />
+
+      {isFirstRun && (data ?? []).length === 0 ? (
+        <div className="rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm text-blue-900">
+          <p className="font-semibold">Welcome to Kyros — let&rsquo;s set up your first season.</p>
+          <p className="mt-1 text-blue-800">
+            Every plan, buy file, and allocation in Kyros is scoped to a season.
+            Define one below (e.g. <code className="rounded bg-blue-100 px-1">SS26</code> with
+            its start and end dates) and you&rsquo;ll be able to upload data and run
+            allocations from the next step.
+          </p>
+        </div>
+      ) : null}
       <SetupTabs />
 
       <form
@@ -136,22 +146,31 @@ export default function SetupSeasonsPage() {
 
       <div className="rounded-lg border border-slate-200 bg-white p-4 text-sm">
         {(data ?? []).map((season) => (
-          <div key={season.id} className="mb-2 flex items-center justify-between gap-4 rounded border border-slate-100 px-3 py-2">
+          <div
+            key={season.id}
+            className="mb-2 flex items-center justify-between gap-4 rounded border border-slate-100 px-3 py-2"
+          >
             <div>
               <div className="font-medium text-slate-900">{season.name}</div>
               <div className="text-xs text-slate-500">
-                {season.start_date} to {season.end_date} · {season.status}
+                {season.start_date} to {season.end_date} ·{" "}
+                <span
+                  className={
+                    ACTIVE_LIKE.has(season.status)
+                      ? "font-semibold text-emerald-700"
+                      : "text-slate-500"
+                  }
+                >
+                  {season.status}
+                </span>
               </div>
             </div>
-            {season.status !== "ACTIVE" ? (
-              <Button variant="secondary" onClick={() => setActive(season.id)} disabled={saving}>
-                Set ACTIVE
-              </Button>
-            ) : (
-              <span className="rounded-full bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-700">
-                ACTIVE
-              </span>
-            )}
+            <Link
+              href={`/setup/seasons/${season.id}/otb`}
+              className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+            >
+              Open OTB →
+            </Link>
           </div>
         ))}
         {(data ?? []).length === 0 ? (

@@ -12,9 +12,11 @@ from sqlalchemy.exc import IntegrityError
 
 from app.config import get_settings
 from app.routers import (
+    admin,
     alerts,
     allocation,
     auth,
+    buy_plan,
     clusters,
     grn,
     ingestion,
@@ -67,6 +69,8 @@ def create_app() -> FastAPI:
     app.include_router(allocation.router)
     app.include_router(performance.router)
     app.include_router(alerts.router)
+    app.include_router(buy_plan.router)
+    app.include_router(admin.router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

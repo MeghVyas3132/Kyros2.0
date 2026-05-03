@@ -32,7 +32,9 @@ async def _run_allocation(session_id: str, grn_id: str, brand_id: str) -> dict:
         decision = compute_decision(
             health_score=report.score,
             risks=report.risks,
-            context=analyzer.get_context()
+            context=await analyzer.get_context(),
+            sub_scores=report.sub_scores,
+            line_diagnostics=report.line_diagnostics,
         )
         session.health_score = report.score
         session.health_report = report.to_json()
@@ -74,44 +76,41 @@ def run_allocation_task(self, session_id: str, grn_id: str, brand_id: str) -> di
     start = perf_counter()
     logger.info("allocation_started grn=%s session=%s", grn_id, session_id)
 
-    try:
-        result = asyncio.run(_run_allocation(session_id, grn_id, brand_id))
-        logger.info(
-            "allocation_completed grn=%s duration=%.1fs units=%s",
-            grn_id,
-            perf_counter() - start,
-            result.get("total_units"),
-        )
-        return result
-    except SoftTimeLimitExceeded:
-        asyncio.run(
-            _mark_failed(
+    async def _handle():
+        try:
+            return await _run_allocation(session_id, grn_id, brand_id)
+        except SoftTimeLimitExceeded:
+            await _mark_failed(
                 session_id,
                 "Allocation generation timed out after 30 minutes. This usually means the dataset is unusually large. Please retry.",
             )
-        )
-        logger.exception("allocation_timeout grn=%s duration=%.1fs", grn_id, perf_counter() - start)
-        raise
-    except Exception as exc:
-        logger.exception("allocation_failed grn=%s duration=%.1fs", grn_id, perf_counter() - start)
-        retries = int(getattr(self.request, "retries", 0))
-        max_retries = int(getattr(self, "max_retries", 0) or 0)
-        if retries >= max_retries:
-            asyncio.run(
-                _mark_failed(
+            logger.exception("allocation_timeout grn=%s duration=%.1fs", grn_id, perf_counter() - start)
+            raise
+        except Exception as exc:
+            logger.exception("allocation_failed grn=%s duration=%.1fs", grn_id, perf_counter() - start)
+            retries = int(getattr(self.request, "retries", 0))
+            max_retries = int(getattr(self, "max_retries", 0) or 0)
+            if retries >= max_retries:
+                await _mark_failed(
                     session_id,
                     f"Allocation failed after {max_retries + 1} attempts. Last error: {str(exc)[:500]}",
                 )
-            )
-            raise
-        try:
-            countdown = 30 * (retries + 1)
-            raise self.retry(exc=exc, countdown=countdown)
-        except MaxRetriesExceededError:
-            asyncio.run(
-                _mark_failed(
+                raise
+            try:
+                countdown = 30 * (retries + 1)
+                raise self.retry(exc=exc, countdown=countdown)
+            except MaxRetriesExceededError:
+                await _mark_failed(
                     session_id,
                     f"Allocation failed after {max_retries + 1} attempts. Last error: {str(exc)[:500]}",
                 )
-            )
-            raise
+                raise
+
+    result = asyncio.run(_handle())
+    logger.info(
+        "allocation_completed grn=%s duration=%.1fs units=%s",
+        grn_id,
+        perf_counter() - start,
+        result.get("total_units") if result else None,
+    )
+    return result
