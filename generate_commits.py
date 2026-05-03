@@ -196,7 +196,10 @@ def run_command(cmd, ignore_error=False):
     """Run shell command and return output."""
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode != 0 and not ignore_error:
-        print(f"Error: {result.stderr}")
+        print(f"Error running: {cmd}")
+        print(f"Return code: {result.returncode}")
+        print(f"Stderr: {result.stderr}")
+        print(f"Stdout: {result.stdout}")
         sys.exit(1)
     return result.stdout.strip()
 
